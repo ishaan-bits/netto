@@ -4,6 +4,10 @@ struct StorageSnapshot: Sendable, Equatable {
     let totalCapacity: Int64
     let availableCapacity: Int64
 
+    /// A failed read yields all zeros — such a snapshot must never be rendered as a
+    /// fabricated "0 GB of 0 GB" measurement.
+    var isAvailable: Bool { totalCapacity > 0 }
+
     var usedCapacity: Int64 {
         max(0, totalCapacity - availableCapacity)
     }

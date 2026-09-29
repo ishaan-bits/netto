@@ -30,6 +30,13 @@ struct DuplicateContactsView: View {
             .onChange(of: env.contactsPermissionState) { _, _ in
                 env.startContactScanIfNeeded()
             }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                // Only reachable in the usable phases (.limited maps to a data phase above), so
+                // every count and "no duplicates" claim on screen carries the caveat.
+                if ContactsPresentation.showsLimitedAccessNotice(permission: env.contactsPermissionState) {
+                    limitedNotice
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     if case .results = phase {
@@ -37,6 +44,17 @@ struct DuplicateContactsView: View {
                     }
                 }
             }
+    }
+
+    private var limitedNotice: some View {
+        Label(
+            "Only the contacts you selected for Netto are scanned.",
+            systemImage: "info.circle"
+        )
+        .font(.caption)
+        .foregroundStyle(Theme.Palette.warning)
+        .padding(.horizontal, Theme.Spacing.lg)
+        .padding(.top, Theme.Spacing.lg)
     }
 
     // MARK: Phase dispatch

@@ -55,6 +55,9 @@ final class AppEnvironment: ObservableObject {
     let deletionSessionToken: String
     private var catalogTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
+    /// Bumped on every catalog start, cancel, and supersede. An in-flight catalog task compares
+    /// it before each state write, so a cancelled run can never overwrite a newer one's state.
+    private var catalogGeneration = 0
     /// Bumped on every start and cancel. An in-flight run compares it before each state write,
     /// so a cancelled run can never overwrite a newer one's state.
     private var analysisGeneration = 0
@@ -139,7 +142,14 @@ final class AppEnvironment: ObservableObject {
     /// Builds the metadata catalog. Enumeration runs on a detached producer task; this loop only
     /// consumes ordered events, so the main actor stays responsive while the library is read.
     func startCatalogBuild() {
+        // One library reader at a time: an analysis run owns its own catalog stage, and a
+        // rebuild started underneath an in-flight deletion would complete with pre-mutation
+        // data. Both requests are explicit user actions, so dropping this one is honest.
+        guard !analysisState.isRunning else { return }
+        guard !deletionState.isDeleting else { return }
         catalogTask?.cancel()
+        catalogGeneration += 1
+        let generation = catalogGeneration
 
         let reading: any PhotoLibraryReading
         do {
@@ -159,20 +169,26 @@ final class AppEnvironment: ObservableObject {
             guard let self else { return }
             do {
                 for try await event in builder.makeScanStream(reading: reading) {
+                    // A superseded run stops immediately: every write below would land data
+                    // from an older read on top of newer state.
+                    guard self.isCurrentCatalog(generation) else { return }
                     switch event {
                     case .progress(let progress):
                         if self.catalogState.isRunning {
                             self.catalogState = .running(progress)
                         }
                     case .completed(let result):
-                        self.noteCatalogCompleted(result)
+                        self.noteCatalogCompleted(result, standalone: true)
                     }
                 }
             } catch is CancellationError {
+                guard self.isCurrentCatalog(generation) else { return }
                 self.catalogState = .cancelled
             } catch let failure as CatalogScanFailure {
+                guard self.isCurrentCatalog(generation) else { return }
                 self.catalogState = failure == .cancelled ? .cancelled : .failed(failure)
             } catch {
+                guard self.isCurrentCatalog(generation) else { return }
                 self.catalogState = .failed(.underlying("Photos access is required to read your library."))
             }
         }
@@ -181,9 +197,14 @@ final class AppEnvironment: ObservableObject {
     func cancelCatalogBuild() {
         catalogTask?.cancel()
         catalogTask = nil
+        catalogGeneration += 1
         if catalogState.isRunning {
             catalogState = .cancelled
         }
+    }
+
+    private func isCurrentCatalog(_ generation: Int) -> Bool {
+        catalogGeneration == generation
     }
 
     // MARK: - Similarity analysis
@@ -216,6 +237,7 @@ final class AppEnvironment: ObservableObject {
 
         catalogTask?.cancel()
         catalogTask = nil
+        catalogGeneration += 1
         if catalogState.isRunning {
             catalogState = .cancelled
         }
@@ -312,9 +334,10 @@ final class AppEnvironment: ObservableObject {
                     as: failure == .cancelled ? .cancelled : .failed(failure)
                 )
             } catch {
+                // PhotoKit/underlying error descriptions never reach the user verbatim.
                 self.finishAnalysis(
                     generation,
-                    as: .failed(.underlying(String(describing: error)))
+                    as: .failed(.underlying("Similarity analysis could not finish. Please try again."))
                 )
             }
         }
@@ -473,7 +496,13 @@ final class AppEnvironment: ObservableObject {
     /// afterwards), and this source prepares exactly as from the empty phase. A plan that
     /// already belongs to `source` is kept, so re-entering the same review never re-resolves
     /// sizes.
+    ///
+    /// An in-flight mutation is untouchable: `noSelection` is universally legal, so applying
+    /// it during `.deleting` would silently wipe the executing state (the outcome would then
+    /// land outside `.deleting` and trip the state machine) and could prepare a second plan
+    /// over a library that is being changed right now.
     func reviewDidAppear(from source: DeletionSelectionSource) {
+        guard !deletionState.isDeleting else { return }
         guard planSource != source else {
             if case .noSelection = deletionState, selectionCount(for: source) > 0 {
                 prepareDeletionPlan(from: source)
@@ -603,7 +632,15 @@ final class AppEnvironment: ObservableObject {
             // PhotoKit error text never reaches the user verbatim.
             applyDeletion(.failed(DeletionPresentation.userFacingFailure(for: outcome)))
 
-        case .verificationFailed(let message), .revalidationFailed(let message):
+        case .verificationFailed(let message):
+            applyDeletion(.failed(message))
+            // The mutation was requested but could not be confirmed: the library may have
+            // changed, so every dataset-derived fact is dropped — same honesty as success.
+            resetLibraryStateAfterDeletion()
+            await refreshStorage()
+
+        case .revalidationFailed(let message):
+            // Pre-mutation refusal: nothing changed, existing datasets stay valid.
             applyDeletion(.failed(message))
 
         case .cancelled:
@@ -629,6 +666,11 @@ final class AppEnvironment: ObservableObject {
         analysisTask?.cancel()
         analysisTask = nil
         analysisState = .notStarted
+        // A catalog read started before the mutation would complete with pre-mutation data;
+        // cancel it and supersede any late write so the reset cannot be overwritten.
+        catalogTask?.cancel()
+        catalogTask = nil
+        catalogGeneration += 1
         catalogState = .notStarted
     }
 
@@ -640,10 +682,30 @@ final class AppEnvironment: ObservableObject {
 
     /// Stores a completed catalog and reconciles both catalog-filter selections against it, so
     /// a rebuilt dataset can never leave a selection pointing at vanished assets.
-    private func noteCatalogCompleted(_ result: CatalogScanResult) {
+    private func noteCatalogCompleted(_ result: CatalogScanResult, standalone: Bool = false) {
         catalogState = .completed(result)
         synchronizeScreenshotDataset()
         synchronizeVideoDataset()
+        if standalone {
+            invalidateAnalysisAfterRebuild()
+        }
+    }
+
+    /// A standalone rebuild supersedes every fact derived from the previous catalog: groups,
+    /// the photo selection, and any prepared plan were all computed over data that no longer
+    /// exists. The photo flows have no per-dataset signature check (screenshots and videos
+    /// reconcile themselves above), so the invalidation is explicit here. Cannot run during
+    /// an analysis (a standalone build is refused while one is running) or a deletion (same).
+    private func invalidateAnalysisAfterRebuild() {
+        guard !analysisState.isRunning, !deletionState.isDeleting else { return }
+        if case .notStarted = analysisState, selection.selectedIDs.isEmpty { return }
+        planBuildGeneration += 1
+        selection = PhotoSelectionModel()
+        applyDeletion(.noSelection)
+        analysisGeneration += 1
+        analysisTask?.cancel()
+        analysisTask = nil
+        analysisState = .notStarted
     }
 
     /// Reconciles the screenshot selection with the current catalog and stales any screenshot

@@ -86,6 +86,17 @@ enum SimilarPhotosPresentation {
         permission == .limited
     }
 
+    /// The "nothing to review" message. Only items the analysis actually ran over are counted:
+    /// unavailable assets could not be analyzed (the notice naming them shows alongside), so
+    /// folding them into an "Analyzed N" claim would overstate coverage.
+    static func noDuplicatesMessage(result: PhotoAnalysisResult) -> String {
+        let analyzed = max(0, result.totalRecordCount - result.unavailableAssets.count)
+        guard analyzed > 0 else {
+            return "None of the items in this scan could be analyzed, so there is nothing marked for cleanup."
+        }
+        return "Analyzed \(analyzed) items — every one is distinct, so there is nothing marked for cleanup."
+    }
+
     /// Honest, clamped progress for the determinate bar. `nil` for stages without a meaningful
     /// total — the UI then shows an indeterminate indicator instead of a fabricated percentage.
     static func barFraction(for progress: PhotoAnalysisProgress) -> Double? {
@@ -128,14 +139,22 @@ struct SimilarPhotosSummary: Sendable, Equatable {
     let similarGroupCount: Int
     let groupedAssetCount: Int
     let unavailableCount: Int
+    let totalRecords: Int
 
     init(result: PhotoAnalysisResult) {
         exactGroupCount = result.exactGroups.count
         similarGroupCount = result.similarGroups.count
         groupedAssetCount = result.totalGroupedAssetCount
         unavailableCount = result.unavailableAssets.count
+        totalRecords = result.totalRecordCount
     }
 
     /// No groups at all — the "nothing to review" result state.
     var hasNoGroups: Bool { exactGroupCount == 0 && similarGroupCount == 0 }
+
+    /// Items the analysis actually produced descriptors for — unavailable assets were never
+    /// analyzed, so counting them in an "Analyzed N" claim would overstate coverage.
+    var analyzedCount: Int {
+        max(0, totalRecords - unavailableCount)
+    }
 }

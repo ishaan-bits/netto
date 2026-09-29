@@ -77,6 +77,13 @@ enum ContactsPresentation {
         }
     }
 
+    /// Limited access still shows usable results — but only the granted contacts count, so the
+    /// screen must say that "no duplicates" means "none among the contacts Netto can see"
+    /// (mirrors `SimilarPhotosPresentation.showsLimitedAccessNotice`).
+    static func showsLimitedAccessNotice(permission: PermissionState) -> Bool {
+        permission == .limited
+    }
+
     /// "Same phone number · Same email address" — human-readable evidence, never a score.
     static func reasonsText(_ reasons: [ContactDuplicateReason]) -> String {
         guard !reasons.isEmpty else { return "Likely duplicates" }

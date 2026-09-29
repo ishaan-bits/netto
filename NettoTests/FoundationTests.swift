@@ -9,12 +9,15 @@ struct StorageSnapshotTests {
         #expect(snapshot.usedCapacity == 60)
         #expect(snapshot.usedFraction == 0.6)
         #expect(snapshot.freeFraction == 0.4)
+        #expect(snapshot.isAvailable)
     }
 
     @Test func zeroCapacityDoesNotDivideByZero() {
         let snapshot = StorageSnapshot(totalCapacity: 0, availableCapacity: 0)
         #expect(snapshot.usedFraction == 0)
         #expect(snapshot.freeFraction == 1)
+        // A failed read yields zeros — it must never render as a fabricated measurement.
+        #expect(!snapshot.isAvailable)
     }
 
     @Test func negativeAvailableClampsToZeroUsed() {

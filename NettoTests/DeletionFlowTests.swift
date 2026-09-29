@@ -290,6 +290,13 @@ struct DeletionFlowTests {
             return
         }
         #expect(message.contains("could not be verified"))
+        // Requested-but-unverified: the library may have changed, so every dataset-derived
+        // fact is dropped — identical to the success path's reset.
+        #expect(env.analysisState == .notStarted)
+        #expect(env.selection.selectedCount == 0)
+        if case .completed = env.catalogState {
+            Issue.record("stale catalog survived an unverified deletion")
+        }
     }
 
     // MARK: Cross-feature invalidation
@@ -320,6 +327,58 @@ struct DeletionFlowTests {
 
         #expect(env.analysisState == before)
         #expect(env.deletionState == .deleting(plan))
+    }
+
+    @Test func reviewDidAppearDuringADeletionIsANoOp() {
+        let (env, _) = makeEnv()
+        selectBoth(in: env)
+        let plan = makePlan(ids: ["a"])
+        env.deletionState = .deleting(plan)
+
+        // A foreign review screen appearing mid-mutation must not run its universal reset:
+        // `noSelection` is legal from `.deleting`, so without the guard the in-flight state
+        // was silently wiped (the outcome then landed outside `.deleting` and tripped the
+        // state machine) and a second plan could be prepared over a changing library.
+        env.reviewDidAppear(from: .screenshots)
+
+        #expect(env.deletionState == .deleting(plan))
+        #expect(env.selection.selectedCount == 2)
+    }
+
+    @Test func reviewDidAppearDuringADeletionAlsoRefusesSameSourceEntry() {
+        let (env, _) = makeEnv()
+        selectBoth(in: env)
+        let plan = makePlan(ids: ["a"])
+        env.deletionState = .deleting(plan)
+
+        env.reviewDidAppear(from: .similarPhotos)
+
+        #expect(env.deletionState == .deleting(plan))
+    }
+
+    @Test func standaloneCatalogRebuildInvalidatesACompletedAnalysis() async {
+        let (env, _) = makeEnv()
+        selectBoth(in: env)
+        guard case .completed = env.analysisState else {
+            Issue.record("setup: expected a completed analysis, got \(env.analysisState)")
+            return
+        }
+
+        env.startCatalogBuild()
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(5_000))
+        while env.catalogState.isRunning, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        guard case .completed = env.catalogState else {
+            Issue.record("expected the rebuild to complete, got \(env.catalogState)")
+            return
+        }
+
+        // Groups, selection, and any prepared plan were computed from the previous catalog —
+        // a rebuilt catalog must never keep presenting them as current.
+        #expect(env.analysisState == .notStarted)
+        #expect(env.selection.selectedCount == 0)
+        #expect(env.deletionState == .noSelection)
     }
 
     @Test func dismissReturnsEveryTerminalStateToNoSelection() async {

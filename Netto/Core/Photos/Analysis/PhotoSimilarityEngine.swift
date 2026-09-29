@@ -100,7 +100,8 @@ struct PhotoSimilarityEngine: Sendable {
         } catch is CancellationError {
             throw PhotoAnalysisFailure.cancelled
         } catch {
-            throw PhotoAnalysisFailure.underlying(String(describing: error))
+            // System error descriptions never reach the user verbatim.
+            throw PhotoAnalysisFailure.underlying("Similarity analysis could not finish. Please try again.")
         }
         guard let finalResult else { throw PhotoAnalysisFailure.cancelled }
         return finalResult

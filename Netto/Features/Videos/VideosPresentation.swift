@@ -121,7 +121,13 @@ enum VideosPresentation {
                 return "\(countText) · \(sizeText)"
             }
             let pending = measurement.total - measurement.measuredCount
-            return "\(countText) · \(sizeText) · \(pending) \(pending == 1 ? "size" : "sizes") pending"
+            let pendingText = "\(pending) \(pending == 1 ? "size" : "sizes") pending"
+            // Nothing measured yet: naming a zero total would claim a measurement that never
+            // happened — the pending count alone is the honest state.
+            guard measurement.measuredCount > 0 else {
+                return "\(countText) · \(pendingText)"
+            }
+            return "\(countText) · \(sizeText) · \(pendingText)"
         }
     }
 

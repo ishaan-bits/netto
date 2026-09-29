@@ -88,7 +88,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                 Text("Metadata enumeration")
                     .font(.headline)
-                Text("Reads asset metadata only — no image data is decoded and nothing is downloaded. Sizes stay unknown until you pick items for review.")
+                Text("Reads asset metadata only — no image data is decoded and nothing is downloaded. Sizes stay unknown until you open Large Videos or pick items for review.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
 
@@ -128,7 +128,7 @@ struct DashboardView: View {
                     Text("\(result.scannedAssetCount) assets · \(result.imageCount) photos · \(result.videoCount) videos · \(result.screenshotCount) screenshots")
                         .font(.subheadline)
                         .monospacedDigit()
-                    Text("Access: \(result.accessLevel.displayName) · sizes unknown until review")
+                    Text("Access: \(result.accessLevel.displayName) · sizes unknown until measured")
                         .font(.caption)
                         .foregroundStyle(Theme.Palette.secondaryLabel)
                 }
@@ -191,9 +191,12 @@ struct DashboardView: View {
             return SimilarPhotosPresentation.stageMessage(for: progress)
         case .results(let result):
             let summary = SimilarPhotosSummary(result: result)
-            return summary.hasNoGroups
-                ? "Analyzed · no duplicates found"
-                : "\(summary.exactGroupCount + summary.similarGroupCount) groups ready to review"
+            if summary.hasNoGroups {
+                return summary.unavailableCount > 0
+                    ? "No duplicates found · \(summary.unavailableCount) not analyzed"
+                    : "Analyzed · no duplicates found"
+            }
+            return "\(summary.exactGroupCount + summary.similarGroupCount) groups ready to review"
         case .emptyLibrary:
             return "No photos visible to Netto"
         case .cancelled:
@@ -290,6 +293,25 @@ struct StorageCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.md) {
+            if snapshot.isAvailable {
+                measuredContent
+            } else {
+                // A failed read yields zeros; "0 GB of 0 GB total" would fabricate a
+                // measurement. Say what is unknown instead.
+                Text("Storage")
+                    .font(.caption)
+                    .foregroundStyle(Theme.Palette.secondaryLabel)
+                Text("Storage size unavailable")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.Palette.secondaryLabel)
+            }
+        }
+        .padding(Theme.Spacing.lg)
+        .background(Theme.Palette.secondaryBackground, in: RoundedRectangle(cornerRadius: Theme.Radius.lg))
+    }
+
+    private var measuredContent: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.md) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Used")
@@ -326,8 +348,6 @@ struct StorageCardView: View {
                 .font(.caption)
                 .foregroundStyle(Theme.Palette.secondaryLabel)
         }
-        .padding(Theme.Spacing.lg)
-        .background(Theme.Palette.secondaryBackground, in: RoundedRectangle(cornerRadius: Theme.Radius.lg))
     }
 }
 

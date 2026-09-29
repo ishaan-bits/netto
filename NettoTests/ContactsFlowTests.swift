@@ -343,6 +343,39 @@ struct ContactsFlowTests {
             return
         }
         #expect(message == "The change was requested, but not confirmed.")
+        // Requested-but-unverified: the store may have changed, so the scan and the group
+        // selection are dropped — identical to the success path's reset.
+        if case .notStarted = env.contactScanState {
+            // expected
+        } else {
+            Issue.record("stale contact scan survived an unverified mutation, got \(env.contactScanState)")
+        }
+        #expect(env.contactSelection.isEmpty)
+    }
+
+    @Test func contactReviewDidAppearDuringExecutionIsANoOp() {
+        let (env, _) = makeEnv()
+        let plan = makeDeletePlan(ids: ["a", "b"])
+        env.contactActionState = .executing(plan)
+
+        // A foreign review choice appearing mid-mutation must not run its universal reset:
+        // `noSelection` is legal from `.executing`, so without the guard the in-flight state
+        // was silently wiped (the outcome then landed outside `.executing`) and a second plan
+        // could be prepared while Contacts is being written right now.
+        env.contactReviewDidAppear(.merge)
+
+        guard case .executing(let still) = env.contactActionState else {
+            Issue.record("in-flight contacts execution was wiped, got \(env.contactActionState)")
+            return
+        }
+        #expect(still == plan)
+    }
+
+    @Test func limitedAccessShowsItsCaveatOnlyWhenLimited() {
+        #expect(ContactsPresentation.showsLimitedAccessNotice(permission: .limited))
+        #expect(!ContactsPresentation.showsLimitedAccessNotice(permission: .authorized))
+        #expect(!ContactsPresentation.showsLimitedAccessNotice(permission: .denied))
+        #expect(!ContactsPresentation.showsLimitedAccessNotice(permission: .notDetermined))
     }
 
     @Test func dismissedResultsReturnToTheUniversalReset() {
@@ -431,6 +464,18 @@ struct ContactsFlowTests {
     private func isReadyForReview(_ state: ContactActionState) -> Bool {
         if case .readyForReview = state { return true }
         return false
+    }
+
+    private func makeDeletePlan(ids: [String]) -> ContactActionPlan {
+        let records = ids.sorted().map { ContactRecord(identifier: $0, givenName: "Name" + $0) }
+        return ContactActionPlan(
+            schemaVersion: ContactActionPlan.currentVersion,
+            items: records.map(ContactPlanItem.init(record:)),
+            kind: .delete,
+            authorization: .authorized,
+            sessionToken: "session-1",
+            datasetSignature: "sig-1"
+        )
     }
 
     private func isAwaitingConfirmation(_ state: ContactActionState) -> Bool {

@@ -235,7 +235,7 @@ struct SimilarPhotosView: View {
             PhaseMessage(
                 systemImage: "checkmark.seal",
                 title: "No duplicates found",
-                message: "Analyzed \(result.totalRecordCount) items — every one is distinct, so there is nothing marked for cleanup.",
+                message: SimilarPhotosPresentation.noDuplicatesMessage(result: result),
                 buttonTitle: "Analyze Again"
             ) {
                 env.startSimilarityAnalysis()

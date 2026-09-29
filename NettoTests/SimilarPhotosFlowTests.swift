@@ -29,6 +29,49 @@ struct SimilarPhotosPresentationTests {
         candidatePairCount: 0
     )
 
+    @Test func analyzedCountExcludesAssetsThatWereNeverAnalyzed() {
+        let partial = PhotoAnalysisResult(
+            exactGroups: [],
+            similarGroups: [],
+            unavailableAssets: [
+                PhotoAnalysisUnavailable(assetID: "x", reason: .contentOnlyInICloud),
+                PhotoAnalysisUnavailable(assetID: "y", reason: .assetNotFound),
+            ],
+            descriptorKind: nil,
+            visionAvailable: false,
+            similarityThreshold: nil,
+            totalRecordCount: 42,
+            candidateBucketCount: 3,
+            candidatePairCount: 6
+        )
+        let summary = SimilarPhotosSummary(result: partial)
+        #expect(summary.unavailableCount == 2)
+        #expect(summary.analyzedCount == 40)
+        #expect(SimilarPhotosPresentation.noDuplicatesMessage(result: partial)
+            .contains("Analyzed 40 items"))
+
+        // Everything unavailable: no "Analyzed 0 items" claim is made at all.
+        let nothingAnalyzed = PhotoAnalysisResult(
+            exactGroups: [],
+            similarGroups: [],
+            unavailableAssets: [PhotoAnalysisUnavailable(assetID: "x", reason: .permissionUnavailable)],
+            descriptorKind: nil,
+            visionAvailable: false,
+            similarityThreshold: nil,
+            totalRecordCount: 1,
+            candidateBucketCount: 0,
+            candidatePairCount: 0
+        )
+        #expect(SimilarPhotosSummary(result: nothingAnalyzed).analyzedCount == 0)
+        #expect(SimilarPhotosPresentation.noDuplicatesMessage(result: nothingAnalyzed)
+            == "None of the items in this scan could be analyzed, so there is nothing marked for cleanup.")
+
+        // A fully analyzed run keeps the original wording.
+        #expect(SimilarPhotosSummary(result: fixture).analyzedCount == 42)
+        #expect(SimilarPhotosPresentation.noDuplicatesMessage(result: fixture)
+            == "Analyzed 42 items — every one is distinct, so there is nothing marked for cleanup.")
+    }
+
     @Test func permissionGatesEvenAFinishedResult() {
         let completed = PhotoAnalysisState.completed(fixture)
 

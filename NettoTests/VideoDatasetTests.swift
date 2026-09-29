@@ -355,6 +355,24 @@ struct VideoDatasetTests {
         #expect(!fullText.contains("pending"))
     }
 
+    @Test func statusTextNeverClaimsAZeroMeasurement() {
+        let catalog = CatalogScanState.completed(VideosFixture.completed)
+        // Settled but nothing measured (a run cancelled before its first batch landed):
+        // naming a zero total would claim a measurement that never happened.
+        let nothingMeasured = VideoSizeResolution.settled(
+            VideoSizeResolution.Measurement(
+                datasetSignature: VideoDataset.signature(in: VideosFixture.completed),
+                bytes: [:],
+                total: VideosFixture.videos.count
+            )
+        )
+        let text = VideosPresentation.statusText(
+            permission: .authorized, catalog: catalog, resolution: nothingMeasured
+        )
+        #expect(text == "6 videos · 6 sizes pending")
+        #expect(!text.contains("measured"))
+    }
+
     @Test func statusTextCoversEmptyPermissionAndScanStates() {
         #expect(
             VideosPresentation.statusText(

@@ -544,12 +544,13 @@ never re-enter execution. Changing the selection after review immediately stales
 (`selectionChanged`). Starting a new analysis resets the deletion state (plans are bound to
 their dataset), and analysis cannot start while a deletion is executing.
 
-**Outcome handling.** One handler maps `DeletionOutcome` to states: success/partial reset
-selection, invalidate the analysis generation, mark catalog + analysis `notStarted` (the
-library changed, so nothing read before may be reused), and refresh the storage snapshot;
-stale → plan review again; permission → Settings recovery; failures → friendly messages
-(PhotoKit's raw error text never reaches the UI); cancellation → back to review with the
-plan intact.
+**Outcome handling.** One handler maps `DeletionOutcome` to states: success/partial — and
+requested-but-unverified outcomes, where the library may have changed — reset selection,
+invalidate the analysis generation, mark catalog + analysis `notStarted` (the library changed,
+so nothing read before may be reused), and refresh the storage snapshot; a pre-mutation
+revalidation refusal keeps the datasets (nothing changed); stale → plan review again;
+permission → Settings recovery; failures → friendly messages (PhotoKit's raw error text never
+reaches the UI); cancellation → back to review with the plan intact.
 
 **Current state:** implemented for photos — review screen → confirmation dialog → PhotoKit
 deletion → post-verification, all unit-tested against fakes (no test mutates a real library).
@@ -640,8 +641,10 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   staleness for the whole plan, localized-description propagation, cancellation, full vs
   partial post-verification, and post-verify failures never claimed as success.
   `AppEnvironment` orchestration: confirmation gating (no confirmation ⇒ service never
-  called), every outcome mapped, success resetting selection + invalidating analysis + storage
-  refresh, analysis-start invalidation, and plan preparation guarded during deletion.
+  called), every outcome mapped, success *and* requested-but-unverified failure resetting
+  selection + invalidating analysis + storage refresh, analysis-start invalidation, plan
+  preparation guarded during deletion, a review re-appearance never wiping an in-flight
+  deletion, and a standalone catalog rebuild invalidating a completed analysis.
 - The screenshots pipeline is tested as pure logic + orchestration, with `analysisState`
   deliberately `.notStarted` to prove the feature never waits on it: `ScreenshotDataset`
   (subtype-only filter in catalog order, id dedupe, order-independent membership-sensitive
@@ -697,8 +700,10 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   idempotence, permission gating, a fresh scan dropping selection and prepared plan, group
   open + snapshot preparation, merge precondition refusals, foreign-choice plans rebuilt
   never reused, confirmation gating with zero service calls, every outcome mapped to its
-  state, and the universal reset on dismissal).
-  **Current total: 432 tests in 43 suites** (zero compiler warnings other than the allowed
+  state (including the verification failure dropping the stale scan and selection), an
+  executing mutation never wiped by a review re-appearance, and the universal reset on
+  dismissal).
+  **Current total: 439 tests in 43 suites** (zero compiler warnings other than the allowed
   `appintentsmetadataprocessor` notice).
 - **On-device matrix** (real iPhone, real library): empty library, small, 10k+ library,
   screenshots, large videos, exact dupes, near-dupes, no dupes, limited Photos access, denied
@@ -798,6 +803,16 @@ cancelled so the library is never read twice at once, catalog progress is report
 to `.completed` when the read finishes, and `analysisGeneration` invalidates cancelled runs so
 no late event can overwrite newer state. `cancelSimilarityAnalysis()` bumps the generation and
 lands `.cancelled` synchronously.
+
+`startCatalogBuild()` (Dashboard Build/Rebuild/Resume/Retry) obeys the same single-reader rule
+from the other side: it refuses to start while an analysis is running or a deletion is
+executing, and every start/cancel bumps `catalogGeneration`, which the catalog task checks
+before each state write — a superseded run stops immediately instead of landing stale data on
+newer state (the generation pattern shared with `analysisGeneration`). A *standalone* rebuild
+that completes additionally invalidates analysis-derived facts (groups, photo selection, any
+prepared plan) because they were computed from the previous catalog; `resetLibraryStateAfterDeletion`
+cancels an in-flight catalog read and bumps the same generation so pre-mutation data can never
+re-populate `catalogState` after the reset.
 
 Screens (Dashboard → "Similar Photos"):
 
@@ -909,7 +924,10 @@ carrying them into a plan. A missing dataset (catalog reset, deletion success) c
   any foreign state — a plan, stale record, failure, permission notice, or in-flight build from
   the *other* selection — is discarded through the universal `noSelection` reset (an in-flight
   build is invalidated first so it can never land) before this source prepares, so one
-  source's review can never display or confirm the other source's plan.
+  source's review can never display or confirm the other source's plan. During an in-flight
+  deletion the function is a no-op: `noSelection` is universally legal, so without that guard
+  a re-appearing review could silently wipe `.deleting` (the outcome would then land outside
+  `.deleting`) and prepare a second plan over a library being changed at that moment.
 
 ### 14.5 Screen
 
@@ -1201,7 +1219,11 @@ kept"), safety labels ("deleted contacts are removed immediately — this cannot
 from Netto"; "only the contacts listed above are touched"), `Change Selection` vs the
 destructive action → confirmation dialog naming the exact count → executing copy → result
 states (`Deleted`/`Merged`, `Some contacts remain`, failure, permission) with `Done`
-returning through the universal reset.
+returning through the universal reset. On appear `contactReviewDidAppear(_:)` mirrors the
+photos rule: foreign choices are dropped through the universal reset before this choice
+prepares — except while `.executing`, where the function is a no-op so an in-flight mutation
+can never be wiped or given a second plan (the requested-but-unverified failure outcome
+drops the scan and selection exactly like success, because the store may have changed).
 
 ### 16.8 Fixtures, validation, and its limits
 

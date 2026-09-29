@@ -26,6 +26,7 @@ final class VideoPreviewModel: ObservableObject {
 
     private let loader: any VideoPreviewLoading
     private var generation = 0
+    private var loadTask: Task<Void, Never>?
     private(set) var presentedAssetID: String?
 
     init(loader: any VideoPreviewLoading = PhotoKitVideoPreviewLoader()) {
@@ -39,8 +40,9 @@ final class VideoPreviewModel: ObservableObject {
         presentedAssetID = assetID
         releasePlayer()
         stage = .loading
+        loadTask?.cancel()
 
-        Task { [weak self] in
+        loadTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let url = try await self.loader.playbackURL(for: assetID)
@@ -59,6 +61,8 @@ final class VideoPreviewModel: ObservableObject {
     /// Leaves the preview and releases every playback resource. Safe to call repeatedly.
     func close() {
         generation += 1
+        loadTask?.cancel()
+        loadTask = nil
         presentedAssetID = nil
         releasePlayer()
         stage = .idle

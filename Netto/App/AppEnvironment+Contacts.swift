@@ -163,7 +163,12 @@ extension AppEnvironment {
     /// A contact review screen appeared with the given choice. A plan built for the *other*
     /// choice can never be shown or confirmed under this screen, so foreign state is dropped
     /// first; a matching plan is kept so re-entering the same review is stable.
+    /// Mirrors `reviewDidAppear`: a foreign review entry resets via the universal `noSelection`
+    /// transition — except during an in-flight mutation, where that same reset would wipe the
+    /// `.executing` state (the outcome would then land outside `.executing` and trip the state
+    /// machine) and could prepare a second plan while Contacts is being written right now.
     func contactReviewDidAppear(_ choice: ContactActionChoice) {
+        guard !contactActionState.isExecuting else { return }
         if contactReviewChoice != choice {
             if case .noSelection = contactActionState {
                 // Already empty; nothing foreign to drop.
@@ -345,7 +350,14 @@ extension AppEnvironment {
         case .mutationFailed:
             applyContactAction(.failed(ContactsPresentation.userFacingFailure(for: outcome)))
 
-        case .verificationFailed(let message), .revalidationFailed(let message):
+        case .verificationFailed(let message):
+            applyContactAction(.failed(message))
+            // The change was requested but could not be confirmed: the store may have
+            // changed, so every dataset-derived fact is dropped — same honesty as success.
+            resetContactsStateAfterMutation()
+
+        case .revalidationFailed(let message):
+            // Pre-mutation refusal: nothing changed, the existing scan stays valid.
             applyContactAction(.failed(message))
 
         case .cancelled:
