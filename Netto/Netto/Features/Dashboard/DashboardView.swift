@@ -11,6 +11,7 @@ struct DashboardView: View {
                 storageSection
                 permissionsSection
                 catalogSection
+                similarPhotosSection
                 statusSection
             }
             .navigationTitle("Netto")
@@ -151,12 +152,60 @@ struct DashboardView: View {
         }
     }
 
+    private var similarPhotosSection: some View {
+        Section("Similar Photos") {
+            NavigationLink {
+                SimilarPhotosView()
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Review duplicates & similar shots")
+                        .font(.body.weight(.medium))
+                    Text(similarPhotosStatusText)
+                        .font(.caption)
+                        .foregroundStyle(Theme.Palette.secondaryLabel)
+                        .lineLimit(2)
+                }
+            }
+        }
+    }
+
+    private var similarPhotosStatusText: String {
+        let phase = SimilarPhotosPresentation.phase(
+            permission: env.photoPermissionState,
+            catalog: env.catalogState,
+            analysis: env.analysisState
+        )
+        switch phase {
+        case .permissionRequired:
+            return "Photos access needed"
+        case .permissionDenied:
+            return "Photos access is off"
+        case .idle:
+            return "Not analyzed yet"
+        case .buildingCatalog:
+            return "Reading your library…"
+        case .analyzing(let progress):
+            return SimilarPhotosPresentation.stageMessage(for: progress)
+        case .results(let result):
+            let summary = SimilarPhotosSummary(result: result)
+            return summary.hasNoGroups
+                ? "Analyzed · no duplicates found"
+                : "\(summary.exactGroupCount + summary.similarGroupCount) groups ready to review"
+        case .emptyLibrary:
+            return "No photos visible to Netto"
+        case .cancelled:
+            return "Last run cancelled"
+        case .failed(let message):
+            return message
+        }
+    }
+
     private var statusSection: some View {
         Section("Scan") {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                 Text("Scan → Review → Clean")
                     .font(.headline)
-                Text("Analysis pipeline lands in the next milestone. Nothing is ever deleted without your explicit confirmation on the review screen.")
+                Text("Similar Photos analysis runs entirely on this iPhone. You review every group before anything changes — nothing is deleted without your explicit confirmation on the review screen, and cleanup itself ships in a later milestone.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
             }

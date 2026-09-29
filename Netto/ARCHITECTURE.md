@@ -20,14 +20,18 @@ Netto/
     Permissions/  Photos + Contacts permission services (protocols + live impls)
     Storage/      Device storage snapshot provider
     Scanning/     Scan phases, progress, result summary (state types)
-    Photos/       Asset catalog (done), sizing policy, Content/Photos/Analysis/ similarity engine
+    Photos/       Asset catalog (done), sizing policy, selection model, thumbnail store, and
+                  Content/Photos/Analysis/ similarity engine
                   (done: candidate buckets, fingerprinting, descriptors, grouping, scoring)
     Contacts/     (next milestone) normalization + duplicate matching
     Deletion/     (next milestone) deletion plan + PhotoKit/Contacts mutations
   Models/         Shared value types (CleanupCategory, later: PhotoItem, VideoItem…)
   Features/
     Dashboard/    Storage + permission status + scan entry + catalog verification
-    Photos/ Screenshots/ Videos/ Contacts/ Review/   (later milestones)
+    Photos/SimilarPhotos/  Review UI: phase dispatch, group list, detail sheet,
+                  selection bar, review-selection placeholder                    ← done
+    Screenshots/ Videos/ Contacts/   (later milestones)
+    Review/       (next milestone) cleanup confirmation
   UI/Theme/       Design tokens: color, spacing, radius
   Resources/      PrivacyInfo.xcprivacy
 NettoTests/       Unit tests for pure logic (Swift Testing)
@@ -62,6 +66,10 @@ Explicit enums instead of boolean soup:
   empty / failed(ScanFailure)`
 - `CatalogScanState` — `notStarted / running(CatalogScanProgress) / completed(CatalogScanResult) /
   cancelled / failed(CatalogScanFailure)`
+- `PhotoAnalysisState` — `notStarted / running(PhotoAnalysisProgress) /
+  completed(PhotoAnalysisResult) / cancelled / failed(PhotoAnalysisFailure)`
+- `SimilarPhotosPhase` — **derived, never stored**: the pure `(permission, catalog, analysis)`
+  mapping that decides what the review screen renders (§13.1)
 - `PermissionState` — `notDetermined / authorized / limited / denied / restricted`
 - `PermissionPrompt` — pre-prompt and denied/limited sheet routing
 - `ScanProgress` — `stage + completedUnits + totalUnits` (fraction is derived, clamped by use)
@@ -83,9 +91,9 @@ PhotoKit fetch (metadata only, chunked)          ← IMPLEMENTED: Core/Photos
   → in-bucket pair comparison, relations ≤ threshold
   → exact groups by fingerprint + near groups by complete-linkage         ← §5.3/§5.5
   → best-photo scoring (documented heuristic, recommendation only)       ← §4.4
-  → PhotoAnalysisResult (engine stops here this milestone)
-  → [later] ScanResultSummary → user selections → Review screen → exact
-      DeletionPlan → confirm → mutation
+  → PhotoAnalysisResult
+  → review UI: phases, group list, thumbnails, selection model           ← §13 (this milestone)
+  → [later] exact DeletionPlan → confirm → mutation
 ```
 
 ### 4.1 Catalog stage (implemented)
@@ -434,6 +442,9 @@ scan results → user selections → Review screen → DeletionPlan (exact IDs +
 
 - Analysis code has **no import** of mutation APIs; only `Core/Deletion` calls
   `PHAssetChangeRequest.deleteAssets` or `CNContactStore` mutations.
+- Current state: the review *selection* screen exists (§13); `DeletionPlan`, the confirmation
+  step, and every mutation API do not — cleanup is still unimplemented, so the pipeline cannot
+  reach Photos-write code from anywhere in the app.
 - The Review screen always shows: item thumbnails, count, and exact recoverable bytes for the
   current selection. Changing a selection recomputes the plan before confirmation.
 - Selecting nothing → confirm is disabled.
@@ -488,9 +499,23 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   zero-byte files, byte counts, same-length files hashing differently), and the
   `ContentFingerprinting` contract (unreadable → `.unavailable`, never a key; cancellation
   propagates; streaming digest equals `ContentHasher` direct output); plus the engine's
-  permission/asset-not-found/CPU-fallback reason mapping, a hostile mixed-kind extractor that
-  must not corrupt grouping, and `AnalysisMetrics` completeness on success and
-  `.total`-on-abort. **Current total: 148 tests in 19 suites** (zero compiler warnings).
+   permission/asset-not-found/CPU-fallback reason mapping, a hostile mixed-kind extractor that
+   must not corrupt grouping, and `AnalysisMetrics` completeness on success and
+   `.total`-on-abort.
+- The review layer is tested as pure logic + orchestration: `PhotoSelectionModel` (deterministic
+  defaults, cross-group protection of recommendations, exact outcomes of the three labelled
+  group actions, unknown-id rejection, `GroupSelectionState`/counts, inert empty model, init
+  from a result); the full `SimilarPhotosPresentation` mapping (permission gating even over a
+  finished result, running-analysis and running-catalog precedence, zero-record → emptyLibrary,
+  catalog idle/empty, failure messages, cancelled states, clamped/nil bar fractions, every
+  stage's copy, summary counts, limited-access notice); `ThumbnailStore` (cache hits,
+  size-partitioned keys, negative caching with the original error on first failure, cancellation
+  never cached, LRU and byte-budget eviction, concurrent-request coalescing); and
+  `AppEnvironment` orchestration against an injected factory — permission fail-fast without
+  touching the library, factory-failure message mapping, empty and distinct-library runs
+  through the **real** engine, selection reset on start / persistence across unrelated state
+  changes, cancellation beating a late completion (generation guard), and the denied-access
+  catalog path. **Current total: 188 tests in 23 suites** (zero compiler warnings).
 - **On-device matrix** (real iPhone, real library): empty library, small, 10k+ library,
   screenshots, large videos, exact dupes, near-dupes, no dupes, limited Photos access, denied
   Photos/Contacts, cancellation mid-scan, deletion failure, empty selection, changed selection
@@ -514,9 +539,102 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
 | Permission status read before every fetch | An empty fetch alone would misreport every asset as deleted when the real answer is "Photos access is off"; the pre-check keeps `.permissionDenied` and `.assetNotFound` distinguishable |
 | ObservableObject/`@Published` (not `@Observable`) | Already working under Swift 6; migration optional and low-value |
 | No persistence framework yet | Cache will use a small SQLite/JSON file store; adding SwiftData would be speculative before scan exists |
+| Selection is its own model, not fields on analysis results | Analysis says "these photos belong together", selection says "the user wants this one considered" — keeping them apart means neither can corrupt the other, and the future cleanup layer consumes a plain id set |
+| Review screen state derived by one pure phase function | The dashboard status line, review header, and every placeholder render from the same tested mapping instead of hand-rolled conditionals drifting apart |
+| Thumbnail store bounds by count *and* bytes | Entry count alone would let detail-sized images blow the budget; 96 entries / 48 MB keeps review scrolling flat in memory |
 
 ## 12. Out of scope (enforced)
 
 No payments/subscriptions/paywalls, no email cleaning, no cache/junk clearing, no login, no cloud
 sync, no iPad/Watch/Mac targets, no external AI APIs, no network calls of any kind.
 `PrivacyInfo.xcprivacy` declares no tracking, no collected data, no required-reason APIs.
+
+## 13. Similar photos review UI (implemented)
+
+`Features/Photos/SimilarPhotos/` surfaces the analysis result. The milestone is **read-only with
+respect to the photo library**: no `PHPhotoLibrary.performChanges`, `PHAssetChangeRequest`, or
+`PHAssetCollectionChangeRequest` exists anywhere in the app; the only writes the review UI
+performs are to the in-memory selection model. Deletion is still unimplemented (§7).
+
+### 13.1 One derived phase, no stored UI state
+
+`SimilarPhotosPresentation.phase(permission:catalog:analysis:)` is the single pure mapping from
+the three real state machines to `SimilarPhotosPhase` (`permissionRequired / permissionDenied /
+buildingCatalog / analyzing / results / idle / emptyLibrary / cancelled / failed`). Views store
+nothing but the open detail sheet. Ordering rules (documented at the function): permission gates
+everything — a result from an earlier grant must not render after revocation; a running analysis
+outranks everything; then a running catalog build; then analysis outcomes; then catalog
+outcomes; then the resting states. A completed run over a zero-record catalog maps to
+`emptyLibrary`, because "nothing was visible" must never read as "no duplicates". The dashboard
+status line uses the same function, so entry-point copy and screen content cannot diverge.
+
+### 13.2 Selection model, separate from analysis
+
+`PhotoSelectionModel` (Core/Photos) answers only *"which photos has the user marked for
+cleanup?"* — a `Set<String>` of asset ids, never conflated with `PhotoAnalysisResult` (which
+carries no selection; the model carries no analysis). Defaults are deterministic: every group
+member starts selected **except** any asset recommended as the keep in at least one group it
+belongs to. Group actions do exactly their labels and only touch that group's members —
+"select all except recommended" even deselects a recommendation the user had overridden, so
+its outcome is reproducible; per-asset overrides always win afterwards; unknown ids are
+ignored rather than silently entering the cleanup set. `GroupSelectionState`
+(`none / some(selected:total:) / all`) is what each row renders. The default selection is
+rebuilt only when a new run completes; it survives unrelated state changes.
+
+### 13.3 Thumbnail pipeline
+
+`ThumbnailStore` (actor, Core/Photos) is the single door to review thumbnails:
+
+- **Bounded twice**: at most 96 entries *and* 48 MB resident (LRU evicted until both hold), so
+  neither a long strip scroll nor repeated detail sheets can grow memory without limit.
+- **Coalesced**: concurrent requests for one `pixelSize|assetID` key share a single in-flight
+  load; strip (96 px) and detail (300 px) budgets are partitioned by key and can never serve
+  each other's bitmap.
+- **Negatively cached**: a failed thumbnail (deleted/iCloud-only/permission) is remembered so
+  scrolling does not hammer PhotoKit; cancellation is never cached because it says nothing
+  about the asset.
+- The seam underneath is the existing `PhotoThumbnailLoading` / `PhotoKitThumbnailLoader`
+  (local-only, no network, orientation baked, `.current` version). `PhotoThumbnailView` requests
+  `pointSize × displayScale` pixels — never full-resolution — and renders explicit
+  loading/ready/failed states, so a missing thumbnail degrades to a placeholder, not a blank
+  cell. Cells use sibling (never nested) buttons: tap opens the detail sheet, the corner control
+  toggles selection.
+
+### 13.4 Orchestration & screens
+
+`AppEnvironment.startSimilarityAnalysis()` runs catalog read → engine stream as one visible
+run: permission is checked first (fail fast, factory untouched), a standalone catalog build is
+cancelled so the library is never read twice at once, catalog progress is reported through
+`analysisState`'s `preparing` stage (single continuous progress UI) with `catalogState` written
+to `.completed` when the read finishes, and `analysisGeneration` invalidates cancelled runs so
+no late event can overwrite newer state. `cancelSimilarityAnalysis()` bumps the generation and
+lands `.cancelled` synchronously.
+
+Screens (Dashboard → "Similar Photos"):
+
+- Non-results phases: permission priming (Allow), denied (Open Settings), idle (Analyze Photo
+  Library), building/analysing (honest stage copy + determinate bar only when the stage reports
+  a real total + Cancel), cancelled, failed (message + Try Again), empty library.
+- Results: lazy list of exact groups then similar groups. Group header carries the evidence
+  numbers recorded by analysis (content byte length, or distance range vs threshold) — no
+  re-derivation, no fabrication; horizontal **lazy** strip of per-asset cells; "KEEP" badge on
+  the recommendation; group `Menu` with the three labelled actions; selection summary per row;
+  bottom safe-area bar with "N photos selected · Nothing is deleted yet" and the Review link
+  (disabled at zero).
+- Detail sheet: 300 px thumbnail plus the metadata the analysis already recorded (creation
+  date, resolution from pixel count, favorite/edited/burst), recommended badge, one
+  select/keep toggle.
+- `ReviewSelectionView` (placeholder for the future cleanup step): every selected asset exactly
+  once with group context — the row count always equals `selectedCount` — and explicit copy
+  that cleanup is not implemented yet.
+- Limited access shows a standing notice ("only the photos you selected for Netto are
+  analyzed"); assets the engine could not analyze are surfaced as a count with reasons, never
+  silently dropped.
+
+### 13.5 Previews and honesty
+
+Previews run on `PreviewData`: deterministic `CGImage`s synthesized from the asset id (a stable
+hash — no personal photos, stable across launches), fixture groups/results including a
+8-member group to exercise strip scrolling, and an `AppEnvironment` whose library factory
+always throws, so tapping Analyze in a preview lands on the honest failure state. No screen in
+this milestone computes or claims space savings, and no screen offers a delete control.
