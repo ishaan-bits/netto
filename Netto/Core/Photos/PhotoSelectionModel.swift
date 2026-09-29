@@ -28,8 +28,8 @@ enum GroupSelectionState: Sendable, Equatable {
 ///   cleanup; only an explicit per-asset override can do that.
 /// - Group-level actions implement exactly their labels and nothing more: they touch only the
 ///   members of the named group. Individual overrides always win afterwards.
-/// - Nothing here touches the photo library. This is an in-memory value; deletion does not
-///   exist yet.
+/// - Nothing here touches the photo library. This is an in-memory value; the deletion pipeline
+///   only reads it as plan input.
 struct PhotoSelectionModel: Sendable, Equatable {
     /// Asset identifiers the user has marked for cleanup. Unique by construction.
     private(set) var selectedIDs: Set<String>

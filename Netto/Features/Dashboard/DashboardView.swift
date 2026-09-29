@@ -205,7 +205,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
                 Text("Scan → Review → Clean")
                     .font(.headline)
-                Text("Similar Photos analysis runs entirely on this iPhone. You review every group before anything changes — nothing is deleted without your explicit confirmation on the review screen, and cleanup itself ships in a later milestone.")
+                Text("Similar Photos analysis runs entirely on this iPhone. You review every group before anything changes — nothing is deleted without your explicit confirmation on the final review screen.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
             }

@@ -63,7 +63,7 @@ struct SimilarPhotosView: View {
             PhaseMessage(
                 systemImage: "square.stack.3d.up",
                 title: "Find duplicates and similar shots",
-                message: "Analysis runs entirely on this iPhone: exact copies by content hash, near-duplicates by visual similarity. Nothing is ever deleted — every group is yours to review.",
+                message: "Analysis runs entirely on this iPhone: exact copies by content hash, near-duplicates by visual similarity. Nothing is deleted until you confirm it on the final review screen.",
                 buttonTitle: "Analyze Photo Library"
             ) {
                 env.startSimilarityAnalysis()
@@ -269,10 +269,18 @@ struct SimilarPhotosView: View {
             group: group,
             selection: env.selection,
             store: env.thumbnails,
-            onToggle: { env.selection.toggle($0) },
-            onSelectAllExceptRecommended: { env.selection.selectAllExceptRecommended(inGroup: group.id) },
-            onClear: { env.selection.clearGroup(group.id) },
-            onKeepRecommended: { env.selection.keepRecommended(inGroup: group.id) },
+            onToggle: { assetID in
+                env.mutateSelection { $0.toggle(assetID) }
+            },
+            onSelectAllExceptRecommended: {
+                env.mutateSelection { $0.selectAllExceptRecommended(inGroup: group.id) }
+            },
+            onClear: {
+                env.mutateSelection { $0.clearGroup(group.id) }
+            },
+            onKeepRecommended: {
+                env.mutateSelection { $0.keepRecommended(inGroup: group.id) }
+            },
             onOpenDetail: { assetID in
                 detailTarget = DetailTarget(group: group, assetID: assetID)
             }

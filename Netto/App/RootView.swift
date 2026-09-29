@@ -8,6 +8,10 @@ final class AppEnvironment: ObservableObject {
     let contactsPermission: any ContactsPermissionServicing
     /// Review thumbnails: bounded, coalesced, pixel-capped (never full-resolution pixels).
     let thumbnails: ThumbnailStore
+    /// Real byte measurement for the reviewed selection (bounded, never during enumeration).
+    let sizeProvider: any AssetSizeProviding
+    /// The deletion boundary — the only path from this app to Photos mutation.
+    let deletionService: any PhotoDeleting
 
     @Published var flowState: AppFlowState = .launching
     @Published var prompt: PermissionPrompt = .none
@@ -17,13 +21,19 @@ final class AppEnvironment: ObservableObject {
     @Published var catalogState: CatalogScanState = .notStarted
     @Published var analysisState: PhotoAnalysisState = .notStarted
     @Published var selection = PhotoSelectionModel()
+    /// The deletion state machine (§16). Every change goes through `applyDeletion`.
+    @Published var deletionState: DeletionState = .noSelection
 
     private let makePhotoLibrary: @Sendable () throws -> any PhotoLibraryReading
+    /// Identity of this app session; plans from another session can never execute.
+    private let deletionSessionToken: String
     private var catalogTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
     /// Bumped on every start and cancel. An in-flight run compares it before each state write,
     /// so a cancelled run can never overwrite a newer one's state.
     private var analysisGeneration = 0
+    /// Bumped on every plan build; a superseded build discards its result instead of writing it.
+    private var planBuildGeneration = 0
 
     init(
         storageProvider: any StorageProviding = SystemStorageProvider(),
@@ -32,13 +42,19 @@ final class AppEnvironment: ObservableObject {
         makePhotoLibrary: @escaping @Sendable () throws -> any PhotoLibraryReading = {
             try SystemPhotoLibrary()
         },
-        thumbnailLoader: any PhotoThumbnailLoading = PhotoKitThumbnailLoader()
+        thumbnailLoader: any PhotoThumbnailLoading = PhotoKitThumbnailLoader(),
+        sizeProvider: any AssetSizeProviding = PhotoKitAssetSizeProvider(),
+        deletionService: any PhotoDeleting = PhotoDeletionService(),
+        sessionToken: String = UUID().uuidString
     ) {
         self.storageProvider = storageProvider
         self.photoPermission = photoPermission
         self.contactsPermission = contactsPermission
         self.makePhotoLibrary = makePhotoLibrary
         self.thumbnails = ThumbnailStore(loader: thumbnailLoader)
+        self.sizeProvider = sizeProvider
+        self.deletionService = deletionService
+        self.deletionSessionToken = sessionToken
     }
 
     func bootstrap() async {
@@ -127,17 +143,24 @@ final class AppEnvironment: ObservableObject {
 
     /// Runs the full review pipeline: metadata catalog read, then similarity analysis over it.
     ///
-    /// Analysis reads only — no photo-library mutation of any kind exists in this app yet. The
-    /// catalog phase reports through `analysisState`'s `preparing` stage so the review screen
-    /// shows one continuous run; `catalogState` is updated to `.completed` when the read finishes
-    /// (never left running: a standalone build is cancelled first, because two concurrent reads
-    /// of the same library would only double the work).
+    /// Analysis reads only — it never mutates the photo library. The catalog phase reports
+    /// through `analysisState`'s `preparing` stage so the review screen shows one continuous
+    /// run; `catalogState` is updated to `.completed` when the read finishes (never left
+    /// running: a standalone build is cancelled first, because two concurrent reads of the same
+    /// library would only double the work). Starting a new analysis also invalidates any
+    /// prepared deletion review: plans are bound to the dataset they were built from.
     func startSimilarityAnalysis() {
         guard !analysisState.isRunning else { return }
+        // Never rebuild datasets underneath an in-flight Photos mutation.
+        guard !deletionState.isDeleting else { return }
         guard photoPermissionState.isUsable else {
             analysisState = .failed(.underlying("Photos access is required to read your library."))
             return
         }
+
+        // A fresh analysis supersedes any prepared plan.
+        planBuildGeneration += 1
+        applyDeletion(.noSelection)
 
         analysisTask?.cancel()
         analysisGeneration += 1
@@ -277,6 +300,228 @@ final class AppEnvironment: ObservableObject {
         case .underlying(let detail):
             return .underlying(detail)
         }
+    }
+
+    // MARK: - Deletion (plan → confirmation → mutation → verification)
+
+    /// Builds an immutable deletion plan from the current selection.
+    ///
+    /// Never runs while a build, a confirmed deletion, or a result is on screen; requires a
+    /// completed catalog and completed analysis; resolves real sizes through `sizeProvider`
+    /// (never during enumeration); then validates the fresh plan against the *current*
+    /// context before presenting it for review.
+    func prepareDeletionPlan() {
+        switch deletionState {
+        case .preparingPlan, .resolvingSizes, .awaitingConfirmation, .deleting, .succeeded,
+             .needsReview:
+            return
+        default:
+            break
+        }
+
+        guard !selection.selectedIDs.isEmpty else {
+            applyDeletion(.noSelection)
+            return
+        }
+
+        applyDeletion(.preparingPlan)
+
+        guard case .completed(let catalogResult) = catalogState else {
+            applyDeletion(.failed("Your library scan has not finished. Scan your library, then review again."))
+            return
+        }
+        guard case .completed(let analysisResult) = analysisState else {
+            applyDeletion(.failed("Similarity analysis has not finished. Run analysis, then review again."))
+            return
+        }
+
+        let selectedIDs = selection.selectedIDs
+        let recordsByID = Dictionary(
+            catalogResult.records.map { ($0.localIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        applyDeletion(.resolvingSizes)
+        planBuildGeneration += 1
+        let generation = planBuildGeneration
+
+        Task { [weak self] in
+            guard let self else { return }
+
+            // Sizes resolve for the reviewed subset only — bounded, after enumeration.
+            let selectedRecords = selectedIDs.compactMap { recordsByID[$0] }
+            let resolvedRecords = await selectedRecords.resolvingSizes(using: self.sizeProvider)
+            let resolvedSizes: [String: Int64] = resolvedRecords.reduce(into: [:]) { partial, record in
+                guard let bytes = record.sizeInBytes else { return }
+                partial[record.localIdentifier] = bytes
+            }
+            guard self.isCurrentPlanBuild(generation) else { return }
+
+            // Fresh authorization at the moment the plan is stamped.
+            let authorization = self.photoPermission.currentStatus()
+            let plan: DeletionPlan
+            do {
+                plan = try DeletionPlanner().makePlan(
+                    selectedIDs: selectedIDs,
+                    recordsByID: recordsByID,
+                    result: analysisResult,
+                    resolvedSizes: resolvedSizes,
+                    authorization: authorization,
+                    sessionToken: self.deletionSessionToken
+                )
+            } catch {
+                guard self.isCurrentPlanBuild(generation) else { return }
+                self.applyDeletion(.failed("This selection could not be prepared for review. Select photos again."))
+                return
+            }
+
+            guard self.isCurrentPlanBuild(generation) else { return }
+            // Self-check against the context as it is *now*: a selection or analysis change
+            // during size resolution lands the plan in `.planStale`, never in `.readyForReview`.
+            let reasons = DeletionPlanValidator.stalenessReasons(
+                plan: plan,
+                context: PlanExecutionContext(
+                    selectionIDs: self.selection.selectedIDs,
+                    sessionToken: self.deletionSessionToken,
+                    analysisSignature: self.currentAnalysisSignature
+                ),
+                freshAuthorization: authorization
+            )
+            if reasons.isEmpty {
+                self.applyDeletion(.readyForReview(plan))
+            } else {
+                self.applyDeletion(.planStale(plan, reasons))
+            }
+        }
+    }
+
+    /// User changed the selection after a plan was shown — the plan is immediately stale.
+    func mutateSelection(_ mutation: (inout PhotoSelectionModel) -> Void) {
+        mutation(&selection)
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            applyDeletion(.planStale(plan, [.selectionChanged]))
+        default:
+            break
+        }
+    }
+
+    /// First step of the destructive confirmation — the only route to `.awaitingConfirmation`.
+    func beginConfirmation() {
+        guard case .readyForReview(let plan) = deletionState else { return }
+        applyDeletion(.awaitingConfirmation(plan))
+    }
+
+    /// Second step: the confirmation dialog was cancelled. No mutation has happened.
+    func cancelConfirmation() {
+        guard case .awaitingConfirmation(let plan) = deletionState else { return }
+        applyDeletion(.readyForReview(plan))
+    }
+
+    /// Executes a confirmed deletion. No confirmation ⇒ no mutation: the guard makes it
+    /// impossible to reach the service from any state other than `.awaitingConfirmation`.
+    func confirmDeletion() async {
+        guard case .awaitingConfirmation(let plan) = deletionState else { return }
+        applyDeletion(.deleting(plan))
+
+        let confirmed: ConfirmedDeletionPlan
+        do {
+            confirmed = try plan.confirmed()
+        } catch {
+            await handleDeletionOutcome(.rejected(.emptyPlan))
+            return
+        }
+
+        // The final context is read here — the same moment the service re-reads authorization —
+        // so a selection/session/analysis change invalidates the plan before any mutation.
+        let outcome = await deletionService.execute(
+            confirmed,
+            in: PlanExecutionContext(
+                selectionIDs: selection.selectedIDs,
+                sessionToken: deletionSessionToken,
+                analysisSignature: currentAnalysisSignature
+            )
+        )
+        await handleDeletionOutcome(outcome)
+    }
+
+    /// Leaves a terminal result state (also used to leave `.planStale`).
+    func dismissDeletionResult() {
+        applyDeletion(.noSelection)
+    }
+
+    private func handleDeletionOutcome(_ outcome: DeletionOutcome) async {
+        switch outcome {
+        case .succeeded(let success):
+            if success.isFullyRemoved {
+                applyDeletion(.succeeded(success))
+            } else {
+                applyDeletion(.needsReview(success))
+            }
+            // Photos changed: drop every dataset-derived fact so nothing stale is shown again.
+            resetLibraryStateAfterDeletion()
+            await refreshStorage()
+
+        case .stale(let reasons):
+            if case .deleting(let plan) = deletionState {
+                applyDeletion(.planStale(plan, reasons))
+            } else {
+                assertionFailure("stale outcome outside .deleting")
+            }
+
+        case .permissionDenied(let state):
+            applyDeletion(.permissionRequired(state))
+
+        case .rejected:
+            applyDeletion(.noSelection)
+
+        case .mutationFailed:
+            // PhotoKit error text never reaches the user verbatim.
+            applyDeletion(.failed(DeletionPresentation.userFacingFailure(for: outcome)))
+
+        case .verificationFailed(let message), .revalidationFailed(let message):
+            applyDeletion(.failed(message))
+
+        case .cancelled:
+            if case .deleting(let plan) = deletionState {
+                applyDeletion(.readyForReview(plan))
+            } else {
+                assertionFailure("cancelled outcome outside .deleting")
+            }
+        }
+    }
+
+    /// Selection is reset, in-flight analysis invalidated, and both datasets marked for a fresh
+    /// read — the library changed, so nothing read before the deletion may be reused.
+    private func resetLibraryStateAfterDeletion() {
+        planBuildGeneration += 1
+        selection = PhotoSelectionModel()
+        analysisGeneration += 1
+        analysisTask?.cancel()
+        analysisTask = nil
+        analysisState = .notStarted
+        catalogState = .notStarted
+    }
+
+    private func isCurrentPlanBuild(_ generation: Int) -> Bool {
+        planBuildGeneration == generation
+    }
+
+    /// Fingerprint of the dataset currently driving the selection; `""` when there is none,
+    /// which never matches a plan built from a real analysis (so such a plan is stale).
+    private var currentAnalysisSignature: String {
+        guard case .completed(let result) = analysisState else { return "" }
+        return DeletionPlanner.analysisSignature(for: result)
+    }
+
+    /// Single gate for every deletion state change: legal transitions are applied, illegal ones
+    /// trip an assertion in debug instead of silently corrupting the machine.
+    private func applyDeletion(_ target: DeletionState) {
+        guard DeletionState.canTransition(from: deletionState, to: target) else {
+            assertionFailure("Illegal deletion transition \(deletionState) -> \(target)")
+            return
+        }
+        deletionState = target
     }
 }
 

@@ -143,6 +143,6 @@ struct PhotoDetailView: View {
     }
 
     private func toggle() {
-        env.selection.toggle(assetID)
+        env.mutateSelection { $0.toggle(assetID) }
     }
 }

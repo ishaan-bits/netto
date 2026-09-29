@@ -24,14 +24,15 @@ Netto/
                   Content/Photos/Analysis/ similarity engine
                   (done: candidate buckets, fingerprinting, descriptors, grouping, scoring)
     Contacts/     (next milestone) normalization + duplicate matching
-    Deletion/     (next milestone) deletion plan + PhotoKit/Contacts mutations
+    Deletion/     Safe photo deletion pipeline: plan/validator/state machine + the only
+                  Photos mutation code in the app (§7)
   Models/         Shared value types (CleanupCategory, later: PhotoItem, VideoItem…)
   Features/
     Dashboard/    Storage + permission status + scan entry + catalog verification
     Photos/SimilarPhotos/  Review UI: phase dispatch, group list, detail sheet,
-                  selection bar, review-selection placeholder                    ← done
+                  selection bar, destructive review + confirmation (DeletionPresentation) ← done
     Screenshots/ Videos/ Contacts/   (later milestones)
-    Review/       (next milestone) cleanup confirmation
+    Review/       (reserved; the cleanup confirmation lives under SimilarPhotos)
   UI/Theme/       Design tokens: color, spacing, radius
   Resources/      PrivacyInfo.xcprivacy
 NettoTests/       Unit tests for pure logic (Swift Testing)
@@ -45,7 +46,9 @@ Rules of thumb applied throughout:
   genuine external-system seam:
   `StorageProviding`, `PhotoLibraryPermissionServicing`, `ContactsPermissionServicing`,
   `PhotoLibraryReading` (chunked enumeration: progress, ordering, cancellation from a fake),
-  `AssetSizeProviding` (sizing step), and the similarity engine's four seams —
+  `AssetSizeProviding` (sizing step), `PhotoMutationBacking` + `PhotoDeleting` (deletion
+  execution seam: fresh authorization read, existence revalidation, exact-id mutation — faked
+  in tests so no test ever mutates a real library), and the similarity engine's four seams —
   `ContentFingerprinting`, `PhotoThumbnailLoading`, `PhotoFeatureExtracting`, and
   `PhotoAnalysisStageObserving` — because each talks to a system whose failure and timing the
   tests must control (PhotoKit, Vision, and the stage/abort instrumentation respectively).
@@ -70,6 +73,15 @@ Explicit enums instead of boolean soup:
   completed(PhotoAnalysisResult) / cancelled / failed(PhotoAnalysisFailure)`
 - `SimilarPhotosPhase` — **derived, never stored**: the pure `(permission, catalog, analysis)`
   mapping that decides what the review screen renders (§13.1)
+- `DeletionState` — the explicit deletion machine (§7): `noSelection / preparingPlan /
+  resolvingSizes / readyForReview(DeletionPlan) / planStale(DeletionPlan, [PlanStalenessReason]) /
+  awaitingConfirmation(DeletionPlan) / deleting(DeletionPlan) / succeeded(DeletionSuccess) /
+  needsReview(DeletionSuccess) / failed(String) / permissionRequired(PermissionState)`. Every
+  change passes `DeletionState.canTransition(from:to:)`; illegal sequences (deleting without
+  confirmation, a result without execution, re-executing a finished plan) are assertion
+  failures, and `noSelection` is the one universal safe reset (it removes capability only).
+- `DeletionReviewPhase` — **derived, never stored**: the pure `DeletionState` → review-screen
+  projection (§13.5)
 - `PermissionState` — `notDetermined / authorized / limited / denied / restricted`
 - `PermissionPrompt` — pre-prompt and denied/limited sheet routing
 - `ScanProgress` — `stage + completedUnits + totalUnits` (fraction is derived, clamped by use)
@@ -431,27 +443,79 @@ Nothing below is estimated or faked; each is either a documented boundary or an 
   local content URL for a bounded, user-selected subset (§4.2) — a metadata/file-attribute read,
   not a content read.
 
-## 7. Deletion safety model
+## 7. Deletion safety model (implemented — photos only)
 
-Deletion is strictly separated from analysis:
+Deletion is strictly separated from analysis, and the pipeline is explicit about every
+hand-off:
 
 ```
-scan results → user selections → Review screen → DeletionPlan (exact IDs + exact byte total)
-→ explicit confirm → Core/Deletion mutator → PhotoKit change request / CNContactStore
+ANALYSIS (read-only) → SELECTION (in-memory) → PLAN (immutable snapshot)
+→ CONFIRMATION (explicit, destructive) → MUTATION (Core/Deletion only) → VERIFICATION
 ```
 
-- Analysis code has **no import** of mutation APIs; only `Core/Deletion` calls
-  `PHAssetChangeRequest.deleteAssets` or `CNContactStore` mutations.
-- Current state: the review *selection* screen exists (§13); `DeletionPlan`, the confirmation
-  step, and every mutation API do not — cleanup is still unimplemented, so the pipeline cannot
-  reach Photos-write code from anywhere in the app.
-- The Review screen always shows: item thumbnails, count, and exact recoverable bytes for the
-  current selection. Changing a selection recomputes the plan before confirmation.
-- Selecting nothing → confirm is disabled.
-- Mutations run in a `PHPhotoLibrary.performChanges` block; failures are caught and surfaced as
-  `deletionFailed(message)` with the plan intact for retry.
-- Contacts merge/delete is a separate workflow with its own confirmation, never batched with
-  photo deletion.
+**The plan (`DeletionPlan`, Core/Deletion).** Selecting photos never mutates anything. The
+plan is an immutable value built from the reviewed selection: exactly the selected stable
+local identifiers (sorted, deduped — set semantics make duplicates impossible), each asset's
+media classification, exact byte sizes where measured (`nil` = unknown, **never** coerced to
+zero), a category label (exact beats similar, deterministic), plus the creation context used
+to detect staleness: the authorization status at creation, the app session token, and a
+structural fingerprint of the analysis dataset. The mutation service does not accept raw
+identifiers — only a `ConfirmedDeletionPlan` obtained through `DeletionPlan.confirmed()`,
+which refuses an empty plan by type.
+
+**Sizes.** Sizes resolve only for the reviewed subset through `AssetSizeProviding`, after
+enumeration. The summary distinguishes three states: **exact** (every item measured — the
+total is real), **partial** (measured bytes are a lower bound — the UI says "at least … · N
+sizes unavailable"), and **fully unresolved** (UI says "Measured size unavailable", never
+"0 GB"). Confirmation copy never promises that device free space will change: iOS moves
+deleted items to Recently Deleted and reclaims space on its own schedule.
+
+**Staleness (`DeletionPlanValidator`, pure).** Before any mutation, the plan is compared —
+in a fixed, deterministic reason order — against the current context: session token,
+analysis fingerprint, selection set, and **freshly read** authorization. Any mismatch means
+`.planStale`: the plan goes back for review, nothing is touched. A missing asset is the
+special `.assetsMissing` reason: if even one planned identifier no longer resolves in the
+library, the whole plan is stale — the set is never silently shrunk to what remains.
+
+**Fresh authorization, checked in the mutation path itself.** Immediately before mutating,
+the service re-reads `PHPhotoLibrary` authorization status (a plan's stored result is never
+trusted), verifies it still permits read-write, and confirms the live library still contains
+exactly the planned identifiers — all inside the same final pre-mutation path. If
+authorization changed (e.g. limited → denied, or any other state change), the plan is
+invalidated; if the fresh status does not permit deletion, a structured permission error is
+returned with **zero mutations** and no automatic re-prompt. The pipeline never requests
+broader access on its own.
+
+**Mutation + verification.** The delete runs in `PHPhotoLibrary.performChanges` inside
+`Core/Deletion` (the only Photos write code in the app) with exactly the plan's identifiers —
+re-fetched by identifier inside the change block, so no other asset can enter the request.
+Cancellation returns `.cancelled`, PhotoKit errors map to `.mutationFailed`. After the
+request, identifiers are re-fetched and compared: all gone → `.succeeded`; some remain →
+`needsReview` with the remaining ids (never reported as full success); verification itself
+failing → `.failed` with a message that does not claim success.
+
+**State machine.** `DeletionState` (§3) gates the whole flow: `readyForReview →
+awaitingConfirmation → deleting → succeeded/needsReview/failed/…`, with every transition
+checked by `canTransition`. Confirmation is reversible (dialog cancel returns to review) and
+mandatory — there is no edge into `deleting` from any other state, and a finished plan can
+never re-enter execution. Changing the selection after review immediately stales the plan
+(`selectionChanged`). Starting a new analysis resets the deletion state (plans are bound to
+their dataset), and analysis cannot start while a deletion is executing.
+
+**Outcome handling.** One handler maps `DeletionOutcome` to states: success/partial reset
+selection, invalidate the analysis generation, mark catalog + analysis `notStarted` (the
+library changed, so nothing read before may be reused), and refresh the storage snapshot;
+stale → plan review again; permission → Settings recovery; failures → friendly messages
+(PhotoKit's raw error text never reaches the UI); cancellation → back to review with the
+plan intact.
+
+**Current state:** implemented for photos — review screen → confirmation dialog → PhotoKit
+deletion → post-verification, all unit-tested against fakes (no test mutates a real library).
+Contacts merge/delete remains a separate, unimplemented workflow with its own confirmation,
+never batched with photo deletion.
+
+**Device validation: NOT PERFORMED** (no physical iPhone connected; simulator cannot host a
+real mutating photo-library session) — the on-device deletion matrix in §10 remains pending.
 
 ## 8. Permission model
 
@@ -515,7 +579,28 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   touching the library, factory-failure message mapping, empty and distinct-library runs
   through the **real** engine, selection reset on start / persistence across unrelated state
   changes, cancellation beating a late completion (generation guard), and the denied-access
-  catalog path. **Current total: 188 tests in 23 suites** (zero compiler warnings).
+  catalog path.
+- The deletion pipeline is tested end-to-end against fakes — no test ever mutates a real photo
+  library. Planner/plan: exact id set with deterministic order and dedupe, empty selection and
+  missing-record refusals (the plan never silently shrinks), `nil` sizes staying `nil`,
+  exact-vs-partial-vs-unresolved summaries, category precedence (exact wins), and
+  analysis-signature sensitivity to membership changes. Validator: staleness in both
+  authorization directions plus session/analysis/selection drift, in the documented reason
+  order. Confirmation boundary: a non-empty plan confirms with identical contents; an empty
+  plan can never reach the mutation type. State machine: every legal edge, no path into
+  `deleting` without confirmation, results require execution, finished plans are dead, and
+  `noSelection` is a universal safe reset. `DeletionPresentation`: phase mapping for every
+  state, destructive titles naming count, size wording per completeness (never zero, never an
+  unqualified promise), category parts summing to the count, and raw error text never reaching
+  the user. Service (lock-guarded fake `PhotoMutationBacking`): exact plan identifiers only,
+  fresh authorization read on every execution, empty/selection/session refusals, fresh-deny
+  with zero mutations, authorization-change staleness in both directions, vanished-asset
+  staleness for the whole plan, localized-description propagation, cancellation, full vs
+  partial post-verification, and post-verify failures never claimed as success.
+  `AppEnvironment` orchestration: confirmation gating (no confirmation ⇒ service never
+  called), every outcome mapped, success resetting selection + invalidating analysis + storage
+  refresh, analysis-start invalidation, and plan preparation guarded during deletion.
+  **Current total: 258 tests in 30 suites** (zero compiler warnings).
 - **On-device matrix** (real iPhone, real library): empty library, small, 10k+ library,
   screenshots, large videos, exact dupes, near-dupes, no dupes, limited Photos access, denied
   Photos/Contacts, cancellation mid-scan, deletion failure, empty selection, changed selection
@@ -549,12 +634,17 @@ No payments/subscriptions/paywalls, no email cleaning, no cache/junk clearing, n
 sync, no iPad/Watch/Mac targets, no external AI APIs, no network calls of any kind.
 `PrivacyInfo.xcprivacy` declares no tracking, no collected data, no required-reason APIs.
 
+Deletion scope (this milestone): **photos only**, one asset at a time from an explicit review.
+Still out of scope: contacts/video/screenshot/calendar deletion, delete-all, automatic or
+background cleanup, cloud sync of any kind.
+
 ## 13. Similar photos review UI (implemented)
 
-`Features/Photos/SimilarPhotos/` surfaces the analysis result. The milestone is **read-only with
-respect to the photo library**: no `PHPhotoLibrary.performChanges`, `PHAssetChangeRequest`, or
-`PHAssetCollectionChangeRequest` exists anywhere in the app; the only writes the review UI
-performs are to the in-memory selection model. Deletion is still unimplemented (§7).
+`Features/Photos/SimilarPhotos/` surfaces the analysis result and hosts the final deletion
+review. Analysis and selection remain read-only: no `PHPhotoLibrary.performChanges`,
+`PHAssetChangeRequest`, or `PHAssetCollectionChangeRequest` exists anywhere outside
+`Core/Deletion`; the review UI's only direct writes are to the in-memory selection model, and
+its destructive action funnels through the confirmation + mutation pipeline in §7.
 
 ### 13.1 One derived phase, no stored UI state
 
@@ -624,17 +714,35 @@ Screens (Dashboard → "Similar Photos"):
 - Detail sheet: 300 px thumbnail plus the metadata the analysis already recorded (creation
   date, resolution from pixel count, favorite/edited/burst), recommended badge, one
   select/keep toggle.
-- `ReviewSelectionView` (placeholder for the future cleanup step): every selected asset exactly
-  once with group context — the row count always equals `selectedCount` — and explicit copy
-  that cleanup is not implemented yet.
+- `ReviewSelectionView` (the destructive review): renders the immutable plan — count,
+  category summary, size wording chosen by completeness (exact / "at least" + unavailable
+  count / "size unavailable", never a fabricated total), one thumbnail row per planned item
+  with measured size or "Size unavailable", and honesty facts (Recently Deleted, only the
+  listed items are touched, storage may not change right away). `Change Selection` pops back;
+  the red `Delete N Photos` button only opens a system confirmation dialog — the dialog's
+  confirm action is the sole path into `AppEnvironment.confirmDeletion()`. Building, deleting,
+  stale ("Review Again"), success/partial, failure, and permission (Settings deep link)
+  phases each render explicitly.
 - Limited access shows a standing notice ("only the photos you selected for Netto are
   analyzed"); assets the engine could not analyze are surfaced as a count with reasons, never
   silently dropped.
 
-### 13.5 Previews and honesty
+### 13.5 Deletion presentation (derived, never stored)
+
+`DeletionPresentation` (Features/Photos/SimilarPhotos) is the pure projection from
+`DeletionState` to `DeletionReviewPhase` (`empty / building / ready(plan) / stale(reasons) /
+deleting / succeeded / needsReview / failed / permissionRequired`) plus every fact the screen
+displays: the destructive title names the exact action and count ("Delete 12 Photos"), size
+wording is chosen by completeness, category summary parts always add up to the plan count,
+stale copy calls out vanished assets, success copy names Recently Deleted, and outcome error
+text is mapped to friendly messages — raw PhotoKit error strings never reach the UI. All of
+it is unit-tested as pure functions.
+
+### 13.6 Previews and honesty
 
 Previews run on `PreviewData`: deterministic `CGImage`s synthesized from the asset id (a stable
 hash — no personal photos, stable across launches), fixture groups/results including a
 8-member group to exercise strip scrolling, and an `AppEnvironment` whose library factory
-always throws, so tapping Analyze in a preview lands on the honest failure state. No screen in
-this milestone computes or claims space savings, and no screen offers a delete control.
+always throws, so tapping Analyze in a preview lands on the honest failure state. Byte totals
+appear only where sizes were actually measured (§7); no screen claims space savings, and the
+only destructive control is gated behind explicit confirmation.
