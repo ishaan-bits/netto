@@ -12,6 +12,7 @@ struct DashboardView: View {
                 permissionsSection
                 catalogSection
                 similarPhotosSection
+                screenshotsSection
                 statusSection
             }
             .navigationTitle("Netto")
@@ -197,6 +198,28 @@ struct DashboardView: View {
             return "Last run cancelled"
         case .failed(let message):
             return message
+        }
+    }
+
+    private var screenshotsSection: some View {
+        Section("Screenshots") {
+            NavigationLink {
+                ScreenshotsView()
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Review screenshots")
+                        .font(.body.weight(.medium))
+                    Text(
+                        ScreenshotsPresentation.statusText(
+                            permission: env.photoPermissionState,
+                            catalog: env.catalogState
+                        )
+                    )
+                    .font(.caption)
+                    .foregroundStyle(Theme.Palette.secondaryLabel)
+                    .lineLimit(2)
+                }
+            }
         }
     }
 

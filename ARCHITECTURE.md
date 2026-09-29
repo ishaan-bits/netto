@@ -20,7 +20,8 @@ Netto/
     Permissions/  Photos + Contacts permission services (protocols + live impls)
     Storage/      Device storage snapshot provider
     Scanning/     Scan phases, progress, result summary (state types)
-    Photos/       Asset catalog (done), sizing policy, selection model, thumbnail store, and
+    Photos/       Asset catalog (done), sizing policy, photo + screenshot selection models,
+                  screenshot dataset filter, thumbnail store, and
                   Content/Photos/Analysis/ similarity engine
                   (done: candidate buckets, fingerprinting, descriptors, grouping, scoring)
     Contacts/     (next milestone) normalization + duplicate matching
@@ -31,7 +32,8 @@ Netto/
     Dashboard/    Storage + permission status + scan entry + catalog verification
     Photos/SimilarPhotos/  Review UI: phase dispatch, group list, detail sheet,
                   selection bar, destructive review + confirmation (DeletionPresentation) ← done
-    Screenshots/ Videos/ Contacts/   (later milestones)
+    Screenshots/  Screenshots cleanup: phase dispatch, selection grid, shared review entry ← done
+    Videos/ Contacts/   (later milestones)
     Review/       (reserved; the cleanup confirmation lives under SimilarPhotos)
   UI/Theme/       Design tokens: color, spacing, radius
   Resources/      PrivacyInfo.xcprivacy
@@ -73,6 +75,8 @@ Explicit enums instead of boolean soup:
   completed(PhotoAnalysisResult) / cancelled / failed(PhotoAnalysisFailure)`
 - `SimilarPhotosPhase` — **derived, never stored**: the pure `(permission, catalog, analysis)`
   mapping that decides what the review screen renders (§13.1)
+- `ScreenshotsPhase` — **derived, never stored**: the pure `(permission, catalog)` mapping for
+  the screenshots screen — analysis state never participates (§14)
 - `DeletionState` — the explicit deletion machine (§7): `noSelection / preparingPlan /
   resolvingSizes / readyForReview(DeletionPlan) / planStale(DeletionPlan, [PlanStalenessReason]) /
   awaitingConfirmation(DeletionPlan) / deleting(DeletionPlan) / succeeded(DeletionSuccess) /
@@ -443,7 +447,7 @@ Nothing below is estimated or faked; each is either a documented boundary or an 
   local content URL for a bounded, user-selected subset (§4.2) — a metadata/file-attribute read,
   not a content read.
 
-## 7. Deletion safety model (implemented — photos only)
+## 7. Deletion safety model (implemented — photos + screenshots)
 
 Deletion is strictly separated from analysis, and the pipeline is explicit about every
 hand-off:
@@ -459,7 +463,9 @@ local identifiers (sorted, deduped — set semantics make duplicates impossible)
 media classification, exact byte sizes where measured (`nil` = unknown, **never** coerced to
 zero), a category label (exact beats similar, deterministic), plus the creation context used
 to detect staleness: the authorization status at creation, the app session token, and a
-structural fingerprint of the analysis dataset. The mutation service does not accept raw
+structural fingerprint of the dataset the selection came from — the analysis result for the
+similar-photos source, the screenshot subset of the catalog for the screenshots source (§14).
+The mutation service does not accept raw
 identifiers — only a `ConfirmedDeletionPlan` obtained through `DeletionPlan.confirmed()`,
 which refuses an empty plan by type.
 
@@ -600,7 +606,22 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   `AppEnvironment` orchestration: confirmation gating (no confirmation ⇒ service never
   called), every outcome mapped, success resetting selection + invalidating analysis + storage
   refresh, analysis-start invalidation, and plan preparation guarded during deletion.
-  **Current total: 258 tests in 30 suites** (zero compiler warnings).
+- The screenshots pipeline is tested as pure logic + orchestration, with `analysisState`
+  deliberately `.notStarted` to prove the feature never waits on it: `ScreenshotDataset`
+  (subtype-only filter in catalog order, id dedupe, order-independent membership-sensitive
+  signature), `ScreenshotSelectionModel` (dataset-scoped toggle, select-all covering exactly
+  the dataset, reconcile dropping vanished selections, reset), the full
+  `ScreenshotsPresentation` mapping (permission gating over a finished catalog, analysis
+  invisibility by construction, scan/running/failed/empty phases, limited notice, dashboard
+  status copy), and `AppEnvironment` orchestration — prepare-without-analysis, similar-photos
+  still gated on analysis, deterministic plan order, partial/unresolved sizes never zero,
+  source-gated staleness (screenshot mutations stale only screenshot plans, and vice versa),
+  cross-source review entry (a foreign plan or in-flight build is dropped, a same-source plan
+  is kept), confirmation gating with zero service calls, execution context stamped with the
+  screenshot dataset fingerprint, dataset-change invalidation (selection drift vs
+  signature-only drift), catalog-gone reset, superseded builds discarded, stale-plan
+  repreparation, and deletion success clearing the screenshot selection and catalog.
+  **Current total: 295 tests in 35 suites** (zero compiler warnings).
 - **On-device matrix** (real iPhone, real library): empty library, small, 10k+ library,
   screenshots, large videos, exact dupes, near-dupes, no dupes, limited Photos access, denied
   Photos/Contacts, cancellation mid-scan, deletion failure, empty selection, changed selection
@@ -634,9 +655,9 @@ No payments/subscriptions/paywalls, no email cleaning, no cache/junk clearing, n
 sync, no iPad/Watch/Mac targets, no external AI APIs, no network calls of any kind.
 `PrivacyInfo.xcprivacy` declares no tracking, no collected data, no required-reason APIs.
 
-Deletion scope (this milestone): **photos only**, one asset at a time from an explicit review.
-Still out of scope: contacts/video/screenshot/calendar deletion, delete-all, automatic or
-background cleanup, cloud sync of any kind.
+Deletion scope (this milestone): **photos and screenshots only**, one asset at a time from an
+explicit review. Still out of scope: contacts/video/calendar deletion, delete-all, automatic
+or background cleanup, cloud sync of any kind.
 
 ## 13. Similar photos review UI (implemented)
 
@@ -746,3 +767,105 @@ hash — no personal photos, stable across launches), fixture groups/results inc
 always throws, so tapping Analyze in a preview lands on the honest failure state. Byte totals
 appear only where sizes were actually measured (§7); no screen claims space savings, and the
 only destructive control is gated behind explicit confirmation.
+
+## 14. Screenshots cleanup (implemented)
+
+`Features/Screenshots/` is the SCREENSHOTS milestone: discover → select → review → confirm →
+delete, built entirely on the existing pipeline. It adds no deletion path, no PhotoKit
+enumeration, and no identification heuristic of its own.
+
+### 14.1 Identification: subtype only, catalog only
+
+A screenshot is whatever the catalog already recorded as one: `PhotoLibraryProvider` bridges
+`PHAssetMediaSubtype.photoScreenshot` into `PhotoMediaSubtypes.screenshot` (the only bridge,
+unchanged), `PhotoAssetRecord.isScreenshot` exposes it, and `ScreenshotDataset` (Core/Photos)
+filters `CatalogScanResult.records` by that flag — in catalog order, deduplicated by set
+semantics. There is no filename/OCR/Vision/EXIF/date/dimension guessing anywhere. The
+dataset's structural fingerprint (`ScreenshotDataset.signature` — membership + count,
+order-independent) is what screenshot plans are validated against.
+
+### 14.2 One derived phase — permission + catalog, never analysis
+
+`ScreenshotsPresentation.phase(permission:catalog:)` maps to `ScreenshotsPhase`
+(`permissionRequired / permissionDenied / buildingCatalog / scanRequired / failed / empty /
+results`). Analysis state is not a parameter: a running or failed similarity analysis changes
+nothing on this screen, and screenshots never wait for it. Permission gates everything (a
+finished result must not render after revocation). The dashboard's Screenshots section shows
+`statusText` from the same mapping.
+
+### 14.3 Dataset-bound selection
+
+`ScreenshotSelectionModel` (Core/Photos) is `datasetIDs` + `selectedIDs`: mutations are
+validated against the dataset it was last reconciled with (unknown ids are ignored),
+`selectAll` covers exactly the dataset, and `reconcile(with:)` — run whenever the catalog
+completes (`noteCatalogCompleted`) and whenever the screen appears
+(`synchronizeScreenshotDataset`) — drops selections whose assets left the dataset instead of
+carrying them into a plan. A missing dataset (catalog reset, deletion success) clears both sets.
+
+### 14.4 Same pipeline, source-aware orchestration
+
+`DeletionSelectionSource { similarPhotos, screenshots }` tags which selection a plan came from:
+
+- `prepareDeletionPlan(from:)` guards catalog `.completed` for both sources, requires
+  completed analysis only for `.similarPhotos`, and stamps the plan with the source's dataset
+  fingerprint — the screenshot signature flows through the existing
+  `DeletionPlanner.makePlan(analysisSignature:)` override (default `nil` keeps the
+  similar-photos path byte-identical). Sizes still resolve through `AssetSizeProviding` for the
+  reviewed subset only; exact/partial/unresolved wording is unchanged (`nil` never becomes 0).
+- The prepare self-check and `confirmDeletion` build `PlanExecutionContext` from the *source's*
+  selection and fingerprint (`currentDatasetSignature`), so a screenshot plan is invalidated by
+  screenshot-selection/dataset drift — and unaffected by similar-photos changes, and vice
+  versa: `mutateScreenshotSelection` / `mutateSelection` stale only same-source plans.
+- `synchronizeScreenshotDataset` stales a prepared screenshot plan the moment the dataset
+  diverges: a shrunk selection → `.selectionChanged`; an unchanged selection over a changed
+  dataset → `.analysisChanged`.
+- Everything downstream is shared unchanged: `DeletionPlanValidator` → confirmation dialog →
+  `PhotoDeletionService` (sole mutation boundary; fresh authorization, existence
+  revalidation, post-verification) → `resetLibraryStateAfterDeletion` (which now also clears
+  the screenshot selection). Exactly one production mutation boundary, still
+  `PhotoDeletionService` only.
+- `ReviewSelectionView` takes a `source` (default `.similarPhotos` — the similar-photos link is
+  untouched) and prepares / re-prepares from it; the empty-state copy names screenshots when
+  the source is screenshots. On appear it calls `reviewDidAppear(from:)`: a live plan that
+  already belongs to the source is kept (re-entering a review never re-resolves sizes), while
+  any foreign state — a plan, stale record, failure, permission notice, or in-flight build from
+  the *other* selection — is discarded through the universal `noSelection` reset (an in-flight
+  build is invalidated first so it can never land) before this source prepares, so one
+  source's review can never display or confirm the other source's plan.
+
+### 14.5 Screen
+
+Dashboard section (status from the same phase mapping) → `ScreenshotsView`: adaptive
+`LazyVGrid` of bounded `PhotoThumbnailView` cells (100 pt, same `ThumbnailStore` as the review
+strip — never full resolution), tap toggles selection with a checkmark and `.isSelected`
+trait, a `Select All` / `Deselect All` toolbar action (dataset-scoped), and a bottom bar
+("N of M screenshots selected · Nothing is deleted yet") with the Review link (disabled at
+zero) into the shared review. Non-results phases reuse the shared `PhaseMessage`; limited
+access shows a standing notice, and the empty state distinguishes "no screenshots" from "none
+among the photos you granted Netto" under limited access.
+
+### 14.6 Validation and its limits
+
+Simulator: the DEBUG `-fixtureLibrary` launch argument (`AppEnvironment.live()`) swaps the
+`PhotoLibraryReading` seam for `FixturePhotoLibrary` (thumbnails and sizes injected through
+the existing seams), so the whole flow — scan, grid, selection, select-all, review, sizes,
+confirmation, staleness — can be exercised where the Simulator's real Photos library contains
+no screenshot-flagged assets. Fixture identifiers never exist in Photos, so a confirmed
+deletion over them stops at the service's existence revalidation with **zero mutation** — the
+same guard real runs rely on. Unit tests cover the dataset filter and signature, the
+dataset-bound selection, every phase mapping, and the orchestration (prepare without
+analysis, source-gated staleness, cross-source review entry, confirmation gating, execution
+context fingerprints, dataset invalidation, superseded builds, post-deletion reset).
+
+**Simulator validation: PERFORMED.** The fixture build was driven end-to-end in Simulator as a
+single automated UI test — permission grant → Build Catalog → 10-cell grid → tap-select →
+Select All / Deselect All with zero-selection gating → shared review (exact count, measurement
+wording, "Size unavailable" row, recovery footers) → destructive confirmation dialog →
+zero-mutation stale outcome ("Some planned photos are no longer available") → reprepare with
+the selection preserved → dashboard status and catalog lines — with every state captured as a
+test attachment. The UI-test harness existed only for this validation run and was removed
+before commit, so the committed test surface remains the unit suite (the harness is described
+in the validation report and can be re-added). What Simulator validation **cannot** show:
+interaction with real screenshot-flagged assets or a real Photos mutation.
+**Real-device validation (real screenshot flags, real deletion of real screenshots): NOT
+PERFORMED — no device connected (§5.9 item 9).**

@@ -13,6 +13,11 @@ struct ReviewSelectionView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showConfirmation = false
 
+    /// Which selection this review was opened from. Both sources share the same plan →
+    /// confirmation → mutation pipeline; the source only steers plan preparation and the
+    /// empty-selection copy.
+    var source: DeletionSelectionSource = .similarPhotos
+
     private var phase: DeletionReviewPhase {
         DeletionPresentation.phase(for: env.deletionState)
     }
@@ -22,9 +27,7 @@ struct ReviewSelectionView: View {
             .navigationTitle("Review & Delete")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
-                if case .empty = phase, env.selection.selectedCount > 0 {
-                    env.prepareDeletionPlan()
-                }
+                env.reviewDidAppear(from: source)
             }
     }
 
@@ -34,11 +37,13 @@ struct ReviewSelectionView: View {
     private var content: some View {
         switch phase {
         case .empty:
-            if env.selection.selectedCount == 0 {
+            if env.selectionCount(for: source) == 0 {
                 ReviewPhaseMessage(
                     systemImage: "checkmark.circle",
                     title: "Nothing is marked",
-                    message: "No photos are selected for cleanup. Pick photos inside a group first."
+                    message: source == .screenshots
+                        ? "No screenshots are selected. Choose screenshots first, then come back to review them."
+                        : "No photos are selected for cleanup. Pick photos inside a group first."
                 )
             } else {
                 buildingState
@@ -234,7 +239,7 @@ struct ReviewSelectionView: View {
             message: DeletionPresentation.staleMessage(reasons),
             primaryTitle: "Review Again"
         ) {
-            env.prepareDeletionPlan()
+            env.prepareDeletionPlan(from: source)
         }
     }
 
@@ -260,7 +265,7 @@ struct ReviewSelectionView: View {
             message: message,
             primaryTitle: "Review Again"
         ) {
-            env.prepareDeletionPlan()
+            env.prepareDeletionPlan(from: source)
         }
     }
 

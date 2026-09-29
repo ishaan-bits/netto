@@ -50,13 +50,18 @@ struct DeletionPlanner {
     ///   - recordsByID: catalog records for identity/media lookup; every selected ID must be
     ///     present or the whole build fails with `missingRecords`.
     ///   - resolvedSizes: measured bytes by identifier; **absent means unknown, never zero**.
+    ///   - analysisSignature: overrides the dataset fingerprint stamped on the plan. The
+    ///     screenshot flow passes its screenshot-dataset signature (its selection derives from
+    ///     the catalog, not from analysis groups); `nil` derives the fingerprint from `result`
+    ///     as before, so existing callers are unchanged.
     func makePlan(
         selectedIDs: Set<String>,
         recordsByID: [String: PhotoAssetRecord],
         result: PhotoAnalysisResult,
         resolvedSizes: [String: Int64],
         authorization: PermissionState,
-        sessionToken: String
+        sessionToken: String,
+        analysisSignature: String? = nil
     ) throws -> DeletionPlan {
         guard !selectedIDs.isEmpty else { throw DeletionPlannerError.emptySelection }
 
@@ -78,7 +83,7 @@ struct DeletionPlanner {
             items: items,
             authorization: authorization,
             sessionToken: sessionToken,
-            analysisSignature: Self.analysisSignature(for: result)
+            analysisSignature: analysisSignature ?? Self.analysisSignature(for: result)
         )
     }
 }

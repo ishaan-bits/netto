@@ -1,6 +1,14 @@
 import Combine
 import SwiftUI
 
+/// Which selection produced a deletion plan. Both sources share the one plan → confirmation →
+/// mutation → verification pipeline — the source only decides which selection model a plan is
+/// built from and which dataset fingerprint it is validated against.
+enum DeletionSelectionSource: Sendable, Equatable {
+    case similarPhotos
+    case screenshots
+}
+
 @MainActor
 final class AppEnvironment: ObservableObject {
     let storageProvider: any StorageProviding
@@ -21,6 +29,8 @@ final class AppEnvironment: ObservableObject {
     @Published var catalogState: CatalogScanState = .notStarted
     @Published var analysisState: PhotoAnalysisState = .notStarted
     @Published var selection = PhotoSelectionModel()
+    /// Screenshots marked for cleanup — a filter over the catalog, not a second enumeration.
+    @Published var screenshotSelection = ScreenshotSelectionModel()
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
     @Published var deletionState: DeletionState = .noSelection
 
@@ -34,6 +44,8 @@ final class AppEnvironment: ObservableObject {
     private var analysisGeneration = 0
     /// Bumped on every plan build; a superseded build discards its result instead of writing it.
     private var planBuildGeneration = 0
+    /// Which source the current/last plan was built from; confirmation validates against it.
+    private var planSource: DeletionSelectionSource = .similarPhotos
 
     init(
         storageProvider: any StorageProviding = SystemStorageProvider(),
@@ -118,7 +130,7 @@ final class AppEnvironment: ObservableObject {
                             self.catalogState = .running(progress)
                         }
                     case .completed(let result):
-                        self.catalogState = .completed(result)
+                        self.noteCatalogCompleted(result)
                     }
                 }
             } catch is CancellationError {
@@ -208,7 +220,7 @@ final class AppEnvironment: ObservableObject {
                         ))
                     case .completed(let result):
                         built = result
-                        self.catalogState = .completed(result)
+                        self.noteCatalogCompleted(result)
                     }
                 }
             } catch is CancellationError {
@@ -304,13 +316,14 @@ final class AppEnvironment: ObservableObject {
 
     // MARK: - Deletion (plan → confirmation → mutation → verification)
 
-    /// Builds an immutable deletion plan from the current selection.
+    /// Builds an immutable deletion plan from `source`'s current selection.
     ///
     /// Never runs while a build, a confirmed deletion, or a result is on screen; requires a
-    /// completed catalog and completed analysis; resolves real sizes through `sizeProvider`
-    /// (never during enumeration); then validates the fresh plan against the *current*
-    /// context before presenting it for review.
-    func prepareDeletionPlan() {
+    /// completed catalog — plus a completed analysis for the similar-photos source (screenshots
+    /// are a subtype filter recorded during enumeration, so they never wait on analysis);
+    /// resolves real sizes through `sizeProvider` (never during enumeration); then validates
+    /// the fresh plan against the *current* context before presenting it for review.
+    func prepareDeletionPlan(from source: DeletionSelectionSource = .similarPhotos) {
         switch deletionState {
         case .preparingPlan, .resolvingSizes, .awaitingConfirmation, .deleting, .succeeded,
              .needsReview:
@@ -318,8 +331,10 @@ final class AppEnvironment: ObservableObject {
         default:
             break
         }
+        planSource = source
 
-        guard !selection.selectedIDs.isEmpty else {
+        let selectedIDs = selectionIDs(for: source)
+        guard !selectedIDs.isEmpty else {
             applyDeletion(.noSelection)
             return
         }
@@ -330,12 +345,27 @@ final class AppEnvironment: ObservableObject {
             applyDeletion(.failed("Your library scan has not finished. Scan your library, then review again."))
             return
         }
-        guard case .completed(let analysisResult) = analysisState else {
-            applyDeletion(.failed("Similarity analysis has not finished. Run analysis, then review again."))
-            return
+
+        let analysisResult: PhotoAnalysisResult
+        switch source {
+        case .screenshots:
+            analysisResult = .empty
+        case .similarPhotos:
+            guard case .completed(let completed) = analysisState else {
+                applyDeletion(.failed("Similarity analysis has not finished. Run analysis, then review again."))
+                return
+            }
+            analysisResult = completed
         }
 
-        let selectedIDs = selection.selectedIDs
+        // The fingerprint is derived from the inputs captured *now*; the self-check below
+        // compares it against the context as it is *then*, so a dataset change during size
+        // resolution lands the plan in `.planStale`, never in `.readyForReview`.
+        let datasetSignature = Self.datasetSignature(
+            for: source,
+            catalog: catalogResult,
+            analysis: analysisResult
+        )
         let recordsByID = Dictionary(
             catalogResult.records.map { ($0.localIdentifier, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -367,7 +397,8 @@ final class AppEnvironment: ObservableObject {
                     result: analysisResult,
                     resolvedSizes: resolvedSizes,
                     authorization: authorization,
-                    sessionToken: self.deletionSessionToken
+                    sessionToken: self.deletionSessionToken,
+                    analysisSignature: datasetSignature
                 )
             } catch {
                 guard self.isCurrentPlanBuild(generation) else { return }
@@ -376,14 +407,14 @@ final class AppEnvironment: ObservableObject {
             }
 
             guard self.isCurrentPlanBuild(generation) else { return }
-            // Self-check against the context as it is *now*: a selection or analysis change
+            // Self-check against the context as it is *now*: a selection or dataset change
             // during size resolution lands the plan in `.planStale`, never in `.readyForReview`.
             let reasons = DeletionPlanValidator.stalenessReasons(
                 plan: plan,
                 context: PlanExecutionContext(
-                    selectionIDs: self.selection.selectedIDs,
+                    selectionIDs: self.selectionIDs(for: source),
                     sessionToken: self.deletionSessionToken,
-                    analysisSignature: self.currentAnalysisSignature
+                    analysisSignature: self.currentDatasetSignature(for: source)
                 ),
                 freshAuthorization: authorization
             )
@@ -395,9 +426,55 @@ final class AppEnvironment: ObservableObject {
         }
     }
 
-    /// User changed the selection after a plan was shown — the plan is immediately stale.
+    /// Items currently marked in `source`'s selection (review-entry gating).
+    func selectionCount(for source: DeletionSelectionSource) -> Int {
+        selectionIDs(for: source).count
+    }
+
+    /// A review screen for `source` appeared. A live plan built from the *other* selection must
+    /// never be shown or confirmed under this screen, so any foreign deletion state — plan,
+    /// stale record, failure, permission notice, or in-flight build — is dropped via the
+    /// universal `noSelection` reset (an in-flight build is discarded first so it cannot land
+    /// afterwards), and this source prepares exactly as from the empty phase. A plan that
+    /// already belongs to `source` is kept, so re-entering the same review never re-resolves
+    /// sizes.
+    func reviewDidAppear(from source: DeletionSelectionSource) {
+        guard planSource != source else {
+            if case .noSelection = deletionState, selectionCount(for: source) > 0 {
+                prepareDeletionPlan(from: source)
+            }
+            return
+        }
+        if deletionState.isBuildingPlan {
+            planBuildGeneration += 1 // the other source's build can never become current
+        }
+        if case .noSelection = deletionState {
+            // Already empty; nothing foreign to drop.
+        } else {
+            applyDeletion(.noSelection)
+        }
+        if selectionCount(for: source) > 0 {
+            prepareDeletionPlan(from: source)
+        }
+    }
+
+    /// User changed the similar-photos selection after a plan was shown — the plan is
+    /// immediately stale. Only plans built from that source are affected.
     func mutateSelection(_ mutation: (inout PhotoSelectionModel) -> Void) {
         mutation(&selection)
+        guard planSource == .similarPhotos else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            applyDeletion(.planStale(plan, [.selectionChanged]))
+        default:
+            break
+        }
+    }
+
+    /// Same, for the screenshot selection — only stales a plan built from that source.
+    func mutateScreenshotSelection(_ mutation: (inout ScreenshotSelectionModel) -> Void) {
+        mutation(&screenshotSelection)
+        guard planSource == .screenshots else { return }
         switch deletionState {
         case .readyForReview(let plan), .awaitingConfirmation(let plan):
             applyDeletion(.planStale(plan, [.selectionChanged]))
@@ -433,13 +510,13 @@ final class AppEnvironment: ObservableObject {
         }
 
         // The final context is read here — the same moment the service re-reads authorization —
-        // so a selection/session/analysis change invalidates the plan before any mutation.
+        // so a selection/session/dataset change invalidates the plan before any mutation.
         let outcome = await deletionService.execute(
             confirmed,
             in: PlanExecutionContext(
-                selectionIDs: selection.selectedIDs,
+                selectionIDs: selectionIDs(for: planSource),
                 sessionToken: deletionSessionToken,
-                analysisSignature: currentAnalysisSignature
+                analysisSignature: currentDatasetSignature(for: planSource)
             )
         )
         await handleDeletionOutcome(outcome)
@@ -496,6 +573,8 @@ final class AppEnvironment: ObservableObject {
     private func resetLibraryStateAfterDeletion() {
         planBuildGeneration += 1
         selection = PhotoSelectionModel()
+        screenshotSelection.reset()
+        planSource = .similarPhotos
         analysisGeneration += 1
         analysisTask?.cancel()
         analysisTask = nil
@@ -507,11 +586,72 @@ final class AppEnvironment: ObservableObject {
         planBuildGeneration == generation
     }
 
-    /// Fingerprint of the dataset currently driving the selection; `""` when there is none,
-    /// which never matches a plan built from a real analysis (so such a plan is stale).
-    private var currentAnalysisSignature: String {
-        guard case .completed(let result) = analysisState else { return "" }
-        return DeletionPlanner.analysisSignature(for: result)
+    // MARK: - Dataset synchronization (screenshot subset of the catalog)
+
+    /// Stores a completed catalog and reconciles the screenshot selection against it, so a
+    /// rebuilt dataset can never leave the selection pointing at vanished assets.
+    private func noteCatalogCompleted(_ result: CatalogScanResult) {
+        catalogState = .completed(result)
+        synchronizeScreenshotDataset()
+    }
+
+    /// Reconciles the screenshot selection with the current catalog and stales any screenshot
+    /// plan built over a previous dataset. Called whenever the catalog completes and whenever
+    /// the screenshots screen appears (previews and tests set `catalogState` directly).
+    func synchronizeScreenshotDataset() {
+        switch catalogState {
+        case .completed(let result):
+            screenshotSelection.reconcile(with: ScreenshotDataset.identifiers(in: result))
+        case .notStarted, .cancelled, .failed:
+            screenshotSelection.reset()
+        case .running:
+            break // A rebuild is in flight; reconcile again when it completes.
+        }
+
+        guard planSource == .screenshots else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            if screenshotSelection.selectedIDs != plan.selectionSnapshot {
+                applyDeletion(.planStale(plan, [.selectionChanged]))
+            } else if currentDatasetSignature(for: .screenshots) != plan.analysisSignature {
+                applyDeletion(.planStale(plan, [.analysisChanged]))
+            }
+        default:
+            break
+        }
+    }
+
+    /// The identifiers `source`'s selection is drawn from right now.
+    private func selectionIDs(for source: DeletionSelectionSource) -> Set<String> {
+        switch source {
+        case .similarPhotos: return selection.selectedIDs
+        case .screenshots: return screenshotSelection.selectedIDs
+        }
+    }
+
+    /// Dataset fingerprint a plan of `source` must match at execution time; `""` when there is
+    /// no dataset (never matches a real plan's stamp, so such a plan is stale).
+    private func currentDatasetSignature(for source: DeletionSelectionSource) -> String {
+        switch source {
+        case .similarPhotos:
+            guard case .completed(let result) = analysisState else { return "" }
+            return DeletionPlanner.analysisSignature(for: result)
+        case .screenshots:
+            guard case .completed(let result) = catalogState else { return "" }
+            return ScreenshotDataset.signature(in: result)
+        }
+    }
+
+    /// The fingerprint stamped at build time, derived from the inputs captured with the plan.
+    private static func datasetSignature(
+        for source: DeletionSelectionSource,
+        catalog: CatalogScanResult,
+        analysis: PhotoAnalysisResult
+    ) -> String {
+        switch source {
+        case .similarPhotos: return DeletionPlanner.analysisSignature(for: analysis)
+        case .screenshots: return ScreenshotDataset.signature(in: catalog)
+        }
     }
 
     /// Single gate for every deletion state change: legal transitions are applied, illegal ones
@@ -525,8 +665,31 @@ final class AppEnvironment: ObservableObject {
     }
 }
 
+extension AppEnvironment {
+    /// Production environment.
+    ///
+    /// A DEBUG build launched with `-fixtureLibrary` swaps the PhotoKit reader for a synthetic
+    /// fixture library (with synthesized thumbnails and deterministic sizes), so the whole
+    /// flow can be exercised in Simulator — where the real library contains no screenshot-flagged
+    /// assets. Fixture identifiers do not exist in Photos, so a deletion attempt over them is
+    /// stopped by the service's existence revalidation with zero mutation. Release builds, and
+    /// DEBUG runs without the argument, always use the real library.
+    static func live() -> AppEnvironment {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-fixtureLibrary") {
+            return AppEnvironment(
+                makePhotoLibrary: { FixturePhotoLibrary() },
+                thumbnailLoader: PreviewData.ThumbnailLoader(),
+                sizeProvider: FixtureSizeProvider()
+            )
+        }
+        #endif
+        return AppEnvironment()
+    }
+}
+
 struct RootView: View {
-    @StateObject private var env = AppEnvironment()
+    @StateObject private var env = AppEnvironment.live()
 
     var body: some View {
         Group {

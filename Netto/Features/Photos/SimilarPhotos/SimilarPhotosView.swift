@@ -328,8 +328,8 @@ struct SimilarPhotosView: View {
     }
 }
 
-/// Shared full-screen state view for the non-results phases.
-private struct PhaseMessage: View {
+/// Shared full-screen state view for the non-results phases (also used by ScreenshotsView).
+struct PhaseMessage: View {
     let systemImage: String
     let title: String
     let message: String
