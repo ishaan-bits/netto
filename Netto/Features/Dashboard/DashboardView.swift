@@ -14,6 +14,7 @@ struct DashboardView: View {
                 similarPhotosSection
                 screenshotsSection
                 largeVideosSection
+                duplicateContactsSection
                 statusSection
             }
             .navigationTitle("Netto")
@@ -244,6 +245,29 @@ struct DashboardView: View {
                     .lineLimit(2)
                 }
             }
+        }
+    }
+
+    private var duplicateContactsSection: some View {
+        Section("Duplicate Contacts") {
+            NavigationLink {
+                DuplicateContactsView()
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Review likely duplicate contacts")
+                        .font(.body.weight(.medium))
+                    Text(
+                        ContactsPresentation.statusText(
+                            permission: env.contactsPermissionState,
+                            scan: env.contactScanState
+                        )
+                    )
+                    .font(.caption)
+                    .foregroundStyle(Theme.Palette.secondaryLabel)
+                    .lineLimit(2)
+                }
+            }
+            .accessibilityIdentifier("duplicateContactsRow")
         }
     }
 

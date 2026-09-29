@@ -39,10 +39,20 @@ final class AppEnvironment: ObservableObject {
     @Published var videoSizeResolution: VideoSizeResolution = .idle
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
     @Published var deletionState: DeletionState = .noSelection
+    /// Duplicate Contacts: read + local duplicate detection state.
+    @Published var contactScanState: ContactScanState = .notStarted
+    /// Selection over the duplicate group currently open.
+    @Published var contactSelection = ContactGroupSelection()
+    /// The contacts action state machine (§16). Every change goes through `applyContactAction`.
+    @Published var contactActionState: ContactActionState = .noSelection
 
     private let makePhotoLibrary: @Sendable () throws -> any PhotoLibraryReading
+    /// Contact enumeration seam (real store by default; fixtures in DEBUG/preview/tests).
+    let makeContactReader: @Sendable () -> any ContactReading
+    /// The contacts mutation boundary — the only path from this app to Contacts writes.
+    let contactMutationService: any ContactMutating
     /// Identity of this app session; plans from another session can never execute.
-    private let deletionSessionToken: String
+    let deletionSessionToken: String
     private var catalogTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
     /// Bumped on every start and cancel. An in-flight run compares it before each state write,
@@ -55,6 +65,14 @@ final class AppEnvironment: ObservableObject {
     /// Bumped on every measurement start and cancel. Each batch compares it before writing, so
     /// a cancelled run can never overwrite newer state.
     private var videoSizeGeneration = 0
+    /// In-flight contacts scan (read + duplicate detection), if any.
+    var contactScanTask: Task<Void, Never>?
+    /// Bumped on every contacts scan start and cancel. A late completion compares it before
+    /// writing, so a cancelled scan can never overwrite newer state.
+    var contactScanGeneration = 0
+    /// Which action (delete/merge) the current/last contact review was opened with; a stale
+    /// review re-prepares the same choice, never a different one.
+    var contactReviewChoice: ContactActionChoice?
     /// Which source the current/last plan was built from; confirmation validates against it.
     private var planSource: DeletionSelectionSource = .similarPhotos
 
@@ -65,18 +83,24 @@ final class AppEnvironment: ObservableObject {
         makePhotoLibrary: @escaping @Sendable () throws -> any PhotoLibraryReading = {
             try SystemPhotoLibrary()
         },
+        makeContactReader: @escaping @Sendable () -> any ContactReading = {
+            ContactStoreReader()
+        },
         thumbnailLoader: any PhotoThumbnailLoading = PhotoKitThumbnailLoader(),
         sizeProvider: any AssetSizeProviding = PhotoKitAssetSizeProvider(),
         deletionService: any PhotoDeleting = PhotoDeletionService(),
+        contactMutationService: any ContactMutating = ContactMutationService(),
         sessionToken: String = UUID().uuidString
     ) {
         self.storageProvider = storageProvider
         self.photoPermission = photoPermission
         self.contactsPermission = contactsPermission
         self.makePhotoLibrary = makePhotoLibrary
+        self.makeContactReader = makeContactReader
         self.thumbnails = ThumbnailStore(loader: thumbnailLoader)
         self.sizeProvider = sizeProvider
         self.deletionService = deletionService
+        self.contactMutationService = contactMutationService
         self.deletionSessionToken = sessionToken
     }
 
@@ -843,15 +867,35 @@ extension AppEnvironment {
     /// assets. Fixture identifiers do not exist in Photos, so a deletion attempt over them is
     /// stopped by the service's existence revalidation with zero mutation. Release builds, and
     /// DEBUG runs without the argument, always use the real library.
+    ///
+    /// `-fixtureContacts` serves synthetic contact fixtures instead of the store (reads only —
+    /// a mutation over fixture identifiers is refused by existence revalidation). 
+    /// `-seedFixtureContacts` (DEBUG Simulator builds only) seeds the *simulator's* store with
+    /// those fixtures so the full contacts pipeline can be validated against a real
+    /// `CNContactStore`; `-wipeFixtureContacts` removes them again. None of these exist in
+    /// Release builds.
     static func live() -> AppEnvironment {
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("-fixtureLibrary") {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-fixtureLibrary") {
             return AppEnvironment(
                 makePhotoLibrary: { FixturePhotoLibrary() },
                 thumbnailLoader: PreviewData.ThumbnailLoader(),
                 sizeProvider: FixtureSizeProvider()
             )
         }
+        if arguments.contains("-fixtureContacts") {
+            return AppEnvironment(
+                makeContactReader: { FixtureContactReader() }
+            )
+        }
+        #if targetEnvironment(simulator)
+        if arguments.contains("-seedFixtureContacts") {
+            try? ContactFixtureSeeder.seed()
+        } else if arguments.contains("-wipeFixtureContacts") {
+            try? ContactFixtureSeeder.wipe()
+        }
+        #endif
         #endif
         return AppEnvironment()
     }

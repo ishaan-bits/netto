@@ -25,10 +25,13 @@ Netto/
                   video size-resolution state + video preview loader, thumbnail store, and
                   Content/Photos/Analysis/ similarity engine
                   (done: candidate buckets, fingerprinting, descriptors, grouping, scoring)
-    Contacts/     (next milestone) normalization + duplicate matching
+    Contacts/     Duplicate contacts: normalization + match keys, duplicate detector with
+                  documented bounds, dataset + scan state, group selection, action plan +
+                  merge planner, contacts action state machine, mutation service, and the
+                  store reader/backing (the only Contacts write API calls) (§16)
     Deletion/     Safe photo deletion pipeline: plan/validator/state machine + the only
                   Photos mutation code in the app (§7)
-  Models/         Shared value types (CleanupCategory, later: PhotoItem, VideoItem…)
+  Models/         Shared value types (CleanupCategory)
   Features/
     Dashboard/    Storage + permission status + scan entry + catalog verification
     Photos/SimilarPhotos/  Review UI: phase dispatch, group list, detail sheet,
@@ -36,7 +39,8 @@ Netto/
     Screenshots/  Screenshots cleanup: phase dispatch, selection grid, shared review entry ← done
     Videos/       Large videos cleanup: phase dispatch, measured-size list (largest first),
                   video preview, shared review entry ← done
-    Contacts/     (later milestone)
+    Contacts/     Duplicate contacts cleanup: phase dispatch, group list, group detail with
+                  selection, review + confirmation (shared destructive-review pattern) ← done
     Review/       (reserved; the cleanup confirmation lives under SimilarPhotos)
   UI/Theme/       Design tokens: color, spacing, radius
   Resources/      PrivacyInfo.xcprivacy
@@ -53,7 +57,11 @@ Rules of thumb applied throughout:
   `PhotoLibraryReading` (chunked enumeration: progress, ordering, cancellation from a fake),
   `AssetSizeProviding` (sizing step), `PhotoMutationBacking` + `PhotoDeleting` (deletion
   execution seam: fresh authorization read, existence revalidation, exact-id mutation — faked
-  in tests so no test ever mutates a real library), and the similarity engine's four seams —
+  in tests so no test ever mutates a real library), `ContactReading` (read-only contact
+  enumeration: lightweight records, never `CNContact`), `ContactMutationBacking` +
+  `ContactMutating` (the contacts mutation seam: fresh authorization, fresh field reads for
+  revalidation/verification, exact-request application — faked in tests so no test ever
+  writes a real contact), and the similarity engine's four seams —
   `ContentFingerprinting`, `PhotoThumbnailLoading`, `PhotoFeatureExtracting`, and
   `PhotoAnalysisStageObserving` — because each talks to a system whose failure and timing the
   tests must control (PhotoKit, Vision, and the stage/abort instrumentation respectively).
@@ -94,6 +102,18 @@ Explicit enums instead of boolean soup:
   failures, and `noSelection` is the one universal safe reset (it removes capability only).
 - `DeletionReviewPhase` — **derived, never stored**: the pure `DeletionState` → review-screen
   projection (§13.5)
+- `ContactScanState` — **stored, but explicit**: `notStarted / running / completed(ContactDataset) /
+  cancelled / failed(String)` over one contacts scan; the dataset carries the records plus the
+  detector's groups (§16)
+- `ContactsPhase` — **derived, never stored**: the pure `(permission, scan)` mapping the
+  Duplicate Contacts screen and its dashboard status render from (§16.2)
+- `ContactActionState` — the explicit contacts action machine (§16.5): `noSelection /
+  preparingPlan / readyForReview(ContactActionPlan) / planStale(…) / awaitingConfirmation(…) /
+  executing(…) / succeeded(ContactMutationSuccess) / needsReview(ContactMutationSuccess) /
+  failed(String) / permissionRequired(PermissionState)`. Every change passes
+  `ContactActionState.canTransition(from:to:)`; illegal sequences (mutating without
+  confirmation, re-running a finished plan) are assertion-level unrepresentable, and
+  `noSelection` is the universal safe reset — mirroring `DeletionState` for the same reasons.
 - `PermissionState` — `notDetermined / authorized / limited / denied / restricted`
 - `PermissionPrompt` — pre-prompt and denied/limited sheet routing
 - `ScanProgress` — `stage + completedUnits + totalUnits` (fraction is derived, clamped by use)
@@ -650,7 +670,35 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   result mapping — cancellation, in-cloud, Photos-error translation, file-backed requirement —
   plus the preview model's loading/ready/unavailable state machine with a generation guard
   proven by out-of-order scripted responses, and player release on close).
-  **Current total: 364 tests in 38 suites** (zero compiler warnings other than the allowed
+- The duplicate-contacts pipeline is tested as pure logic + orchestration against fakes — no
+  test ever reads or writes a real contact store: `ContactNormalizationTests` (strict phone
+  keys ignoring formatting and leading plus, the national-format tolerance rule bounded to
+  bare 10-digit and long international forms, trunk-zero/country variants never rewritten
+  into false matches, unusable phones yielding nil or no keys, Indic-digit folding with
+  fullwidth digits outside the policy, email trim/lowercase keeping plus-tags, name keys
+  collapsing case but keeping diacritics, empty values never indexed);
+  `ContactDuplicateDetectorTests` (the fixture set producing exactly its four expected
+  groups with the evidence that actually matched, name pairs requiring the same
+  organization, the cardinality cap skipping a mass-shared key rather than pairing it,
+  transitive chains landing in one group, byte-identical groups across input orders, stable
+  digest group ids, unrelated singles and fieldless records excluded);
+  `ContactActionPlanTests` (merge union deduped on the same keys detection used,
+  destination-wins conflicts recorded not dropped, empty-destination fill, snapshot items,
+  deterministic plan identity, the confirmation boundary rejecting empty/invalid plans,
+  staleness reasons in the documented session/dataset/selection/authorization order, and
+  the full transition table incl. everything bypassing confirmation); the mutation service
+  against a fake `ContactMutationBacking` (exact plan identifiers verified gone, merge
+  decisions applied then sources removed, fresh authorization every run, fresh-deny and
+  context-drift stopping before any store read, missing/drifted live contacts reported
+  stale and never shrunk, store failure / silent non-application / partial removal reported
+  as failure or `needsReview` — never success, verification failures incl. read failures
+  never claiming success); and `ContactsFlowTests` (the `AppEnvironment` orchestration:
+  fixture scan computing its four groups, cancellation staying cancelled, scan-start
+  idempotence, permission gating, a fresh scan dropping selection and prepared plan, group
+  open + snapshot preparation, merge precondition refusals, foreign-choice plans rebuilt
+  never reused, confirmation gating with zero service calls, every outcome mapped to its
+  state, and the universal reset on dismissal).
+  **Current total: 432 tests in 43 suites** (zero compiler warnings other than the allowed
   `appintentsmetadataprocessor` notice).
 - **On-device matrix** (real iPhone, real library): empty library, small, 10k+ library,
   screenshots, large videos, exact dupes, near-dupes, no dupes, limited Photos access, denied
@@ -1032,3 +1080,170 @@ real Photos video sizes, real HEVC playback, or a real Photos mutation.
 
 **Real-device validation (real video sizes, real playback, real deletion of real videos): NOT
 PERFORMED — no device connected (§5.9 item 9).**
+
+## 16. Duplicate contacts cleanup (implemented)
+
+`Features/Contacts/` is the DUPLICATE CONTACTS milestone: a purely local scan → group list →
+group detail → review → confirm → merge/delete flow over the contacts store. It adds no
+Photos code and no network of any kind; detection and every decision run on-device.
+
+### 16.1 Identification: normalization with a documented policy
+
+`ContactNormalization` (Core/Contacts) is pure, total, locale-independent, and identical
+across runs:
+
+- **Phones** are formatting-insensitive but never country-code-assuming. Separators are
+  stripped and Unicode digits in the ASCII+Indic ranges fold to ASCII; a leading `+` is kept
+  as the international marker. Every phone yields a **strict key** (`s:` + digits, leading
+  `+` ignored), so `+91 98765 43210` and `919876543210` match as pure formatting. A bounded
+  **national-tolerance key** (`n:`) is added only where it is well-defined: a bare exactly
+  10-digit number yields its digits, and a `+`-number longer than 10 digits yields its last
+  10 digits — which is what lets `(98765) 43210` pair with `+91 98765 43210` without ever
+  claiming arbitrary numbers are equivalent. Trunk-zero and other country arrangements are
+  deliberately not rewritten (they simply do not match); fewer than 4 digits is meaningless →
+  `nil`.
+- **Emails** must be exactly one address shape (one `@`, non-empty sides), then trimmed and
+  lowercased. Plus-tags are never stripped — they change delivery identity.
+- **Names / organization** are trimmed, whitespace-collapsed, lowercased; diacritics are
+  **kept** (fuzzy accent folding could merge unrelated people, and every group here is only
+  ever "likely"). Empty results are `nil` and never indexed as `""`.
+
+### 16.2 Detection: bounded, disjoint, deterministic
+
+`ContactDuplicateDetector` builds three exact-key indexes (phone → ids, email → ids,
+name → org → ids) in one O(F) pass, then enumerates candidate pairs **only for keys shared
+by 2…50 contacts** (`maxKeyCardinality`) — a mass-shared switchboard number or broadcast
+address is skipped rather than paired, which is what keeps the detector from ever
+degenerating into an all-pairs scan of the address book. Name pairs additionally require the
+same organization, so two unrelated "John Smith"s at different companies never pair.
+Union-find merges pairs into connected components: every contact lands in at most one group
+(disjoint by construction), components of ≥2 become `ContactDuplicateGroup`s with sorted
+members, sorted evidence `reasons` (each reason is a fact the detector observed — there is
+deliberately no numeric confidence score), and a stable digest id over the sorted member set.
+Sorted key order makes output byte-identical across runs and input orders.
+
+### 16.3 One derived phase — permission + scan
+
+`ContactsPresentation.phase(permission:scan:)` maps to `ContactsPhase`
+(`permissionRequired / permissionDenied / scanRequired / scanning / failed / empty /
+noDuplicates / results`). The dashboard's Duplicate Contacts status is `statusText` from the
+same mapping — actual state only, with no invented counts and no "space freed" (contacts
+have no storage-savings value and none is ever shown).
+
+### 16.4 Dataset, scan, and a group-bound selection
+
+`ContactScanState` is the stored machine (`notStarted / running / completed(dataset) /
+cancelled / failed`); a scan generation counter makes late completions of superseded scans
+no-ops, and cancellation stays cancelled. `ContactDataset` carries the lightweight records
+plus the groups — no `CNContact` graph ever escapes the reader (`ContactStoreReader` fetches
+only identifier, names, organization, phones, emails; unified cards surface once; records are
+sorted by identifier so store enumeration order cannot leak into results).
+
+`ContactGroupSelection` is bound to exactly one group: `begin` adopts its members as the
+dataset, unknown identifiers are ignored (a selection can never point outside its group),
+nothing is ever pre-selected, and no "master" contact is pre-chosen — a merge destination
+must be an explicitly selected member. `synchronizeContactDataset` (screen appear, scan
+complete, scan-state change) reconciles vanished members away and stales any prepared plan
+whose selection or dataset fingerprint no longer matches.
+
+### 16.5 Plan, merge policy, and the confirmation boundary
+
+`ContactActionPlan` is an immutable snapshot: every grouping-relevant field of every involved
+contact (with per-field digests), the exact removal order, and — for a merge — a fully
+precomputed `ContactMergePlan`. Merge policy (`ContactMergePlanner`, pure):
+
+- **Phones / emails**: union. The destination keeps everything it has; source values whose
+  match key is not already present are appended with their original labels, deduplicated on
+  the *same keys detection grouped on*, so a national-format variant the detector paired does
+  not reappear as a second entry.
+- **Names / organization**: the destination's non-empty value wins; a differing non-empty
+  source value becomes a recorded `ContactMergeConflict` — shown in review, never silently
+  dropped. An empty destination field is filled from the first source (sorted order) that has
+  one.
+
+Only `ConfirmedContactActionPlan` (produced by the structurally-checked `confirmed()` —
+non-empty plan, internally valid merge) can reach the mutation service; raw identifiers from
+UI code have no path to Contacts writes. `ContactActionState` mirrors the Photos
+`DeletionState` design: every transition goes through `canTransition`, so mutating without
+confirmation, executing a stale plan, or re-running a finished plan are unrepresentable, and
+`noSelection` is the universal safe reset. Staleness reasons are checked in the documented
+order — session, dataset, selection, authorization — plus live per-contact revalidation
+(missing or field-drifted contacts stale the *whole* plan; it is never shrunk to fit).
+
+### 16.6 Mutation path: revalidate, apply exactly, verify
+
+`ContactMutationService` runs one final pre-mutation path with no way to mutate earlier:
+structural guard → **fresh** authorization read (never a cached one) → authorization-must-
+permit → pure context staleness (session/dataset/selection/authorization) → re-fetch every
+planned contact (missing/drifted → stale, zero mutation) → apply exactly the plan's request →
+post-mutation verification against the live store (deletions gone; merge destination present
+with every appended value). `ContactStoreMutationBacking` is the only place in the app that
+calls Contacts write APIs; merges are one atomic save request. Outcomes are distinct cases of
+`ContactActionOutcome` — a partial result maps to `needsReview` (never `succeeded`), a
+verification failure deliberately does not claim success, and permission/stale/rejected paths
+report zero contact changes.
+
+### 16.7 Screen
+
+Dashboard section (status from the phase mapping) → `DuplicateContactsView`: phase dispatch
+(permission priming copy, scan entry with the on-device promise, cancellable scan, empty /
+no-duplicates states, `Rescan` once results exist) and the group list
+("N groups of likely duplicates" header, per-group evidence, a footer stating Netto can't be
+certain — nothing changes until you review and confirm, accessibility id per row for the
+validation harness). `ContactGroupDetailView`: evidence section with per-reason labels,
+member rows (tap toggles selection; a "Keep" star sets the merge destination and is disabled
+until the member is selected), and a bottom bar ("N of M selected / Nothing is changed yet",
+Merge enabled only with ≥2 selected + destination, prominent destructive Delete).
+`ContactReviewView` builds the plan for exactly the choice it was opened with (a delete plan
+can never show under a merge review): summary + exact count, "To be deleted"/"To be merged"
+rows with roles, merge transparency sections (added values, kept as-is, "Different values
+kept"), safety labels ("deleted contacts are removed immediately — this cannot be undone
+from Netto"; "only the contacts listed above are touched"), `Change Selection` vs the
+destructive action → confirmation dialog naming the exact count → executing copy → result
+states (`Deleted`/`Merged`, `Some contacts remain`, failure, permission) with `Done`
+returning through the universal reset.
+
+### 16.8 Fixtures, validation, and its limits
+
+Three DEBUG **simulator-only** launch arguments (`AppEnvironment.live()`): `-fixtureContacts`
+swaps `ContactReading` for the synthetic `FixtureContactReader` (reads only — a mutation over
+fixture identifiers stops at the service's existence revalidation with **zero mutation**);
+`-seedFixtureContacts` seeds the simulator's real `CNContactStore` with the fixture set and
+`-wipeFixtureContacts` removes it. Seeding is idempotent (created identifiers are tracked and
+wiped before reseeding — repeated runs never accumulate) and only ever touches contacts it
+created itself. The fixture set is personal-data-free: invented names, reserved `example.com`
+emails, the reserved fictional `+1 555 010-xxxx` range, and deliberately contains four
+likely-duplicate groups (shared phone in strict and national formats, shared email across
+differently-spelled names, shared name + organization), two unrelated singles, and one record
+with no grouping-relevant field (never seeded).
+
+Unit tests (`ContactNormalizationTests`, `ContactDuplicateDetectorTests`,
+`ContactActionPlanTests`, `ContactMutationServiceTests`, `ContactsFlowTests` — enumerated in
+§10) cover the policy, the detector's bounds and determinism, the merge policy, the state
+machine's transition table, the confirmation boundary, the service's revalidate → apply →
+verify path against a fake backing, and the `AppEnvironment` orchestration. No test reads or
+writes a real contact store.
+
+**Simulator validation: PERFORMED.** The fixture build was driven end-to-end in Simulator as
+a single automated UI test against the **real seeded contacts store** — dashboard section →
+scan finding exactly **4 groups** in the live store → group detail (both members selected,
+"2 of 2 selected") → delete review (exact count, "cannot be undone from Netto" copy) →
+confirmation dialog ("Delete 2 contacts?" — on iOS 27 the `.confirmationDialog` renders as a
+tap-outside-dismiss popover showing only the destructive action, the platform omitting the
+`role: .cancel` label; "Go Back" remains in the product code) → confirmed delete verified by
+a fresh scan finding exactly **3 groups** (the deleted pair gone from the live store) → next
+group → selection + Keep destination → merge review ("1 contact will be merged into …",
+Kept-as-is, and the "Different values kept" conflict transparency) → confirmation → fresh
+scan finding exactly **2 groups** (the merged pair collapsed to one contact) → honest
+dashboard after — twelve states captured as test attachments. The run surfaced and fixed a
+real defect: `.accessibilityIdentifier("contactReviewList")` applied *after*
+`.safeAreaInset` propagated outward and overwrote the inset action buttons' own identifiers
+(the list was marked, but the destructive button reported the list's id) — the modifier now
+sits on the `List` itself, before the inset. The UI-test harness existed only for this
+validation run and was removed before commit, so the committed test surface remains the unit
+suite (the harness is described here and can be re-added). What Simulator validation
+**cannot** show: iCloud-synced contacts, linked-card behavior beyond the store's Simulator
+unification, or changes arriving from other devices.
+
+**Real-device validation (real iCloud contacts, a real device's store): NOT PERFORMED — no
+device connected (§5.9 item 9).**

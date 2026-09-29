@@ -189,4 +189,60 @@ enum PreviewData {
         )
         return env
     }
+
+    #if DEBUG
+    // MARK: Contacts preview environment
+
+    /// An `AppEnvironment` preloaded with synthetic contact state — previews never touch the
+    /// real contact store. The reader is `FixtureContactReader` (deterministic fixture
+    /// records) and the mutation service writes nothing.
+    @MainActor
+    static func contactsEnvironment(
+        permission: PermissionState = .authorized,
+        noDuplicates: Bool = false
+    ) -> AppEnvironment {
+        let env = AppEnvironment(
+            contactsPermission: PreviewContactsPermission(state: permission),
+            makeContactReader: { FixtureContactReader() },
+            contactMutationService: ContactMutationService(
+                backing: PreviewContactMutationBacking()
+            ),
+            sessionToken: "preview-contacts"
+        )
+        env.contactsPermissionState = permission
+        env.contactScanState = .completed(
+            ContactDataset(
+                records: ContactFixture.records,
+                groups: noDuplicates
+                    ? []
+                    : ContactDuplicateDetector().findDuplicates(in: ContactFixture.records)
+            )
+        )
+        env.storageSnapshot = StorageSnapshot(
+            totalCapacity: 128_000_000_000,
+            availableCapacity: 41_000_000_000
+        )
+        return env
+    }
+    #endif
 }
+
+#if DEBUG
+/// Preview-only contacts permission: returns the requested state and never prompts, so
+/// previews stay deterministic regardless of the host machine's real Contacts authorization.
+struct PreviewContactsPermission: ContactsPermissionServicing {
+    let state: PermissionState
+    func currentStatus() -> PermissionState { state }
+    func requestAccess() async -> PermissionState { state }
+}
+
+/// Preview-only contacts backing: refuses every write (previews must never mutate anything).
+struct PreviewContactMutationBacking: ContactMutationBacking {
+    func currentAuthorization() -> PermissionState { .authorized }
+    func existingRecords(_ identifiers: [String]) async throws -> [ContactRecord] { [] }
+    func apply(_ request: ContactMutationRequest) async throws {
+        throw ContactMutationError.destinationMissing
+    }
+}
+
+#endif
