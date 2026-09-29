@@ -31,8 +31,33 @@ struct FixturePhotoLibrary: PhotoLibraryReading {
                 ))
             }
         }
-        records.append(Self.record(id: "fixture-video-01", mediaType: .video, duration: 14, daysAgo: 40))
-        records.append(Self.record(id: "fixture-video-02", mediaType: .video, duration: 63, daysAgo: 60))
+        // Videos for the Large Videos screen: varied durations, resolutions, and ages so the
+        // largest-first ordering is meaningful in Simulator. One id contains "nosize", so
+        // `FixtureSizeProvider` leaves it unmeasured and the unknown-size state is reachable.
+        records.append(Self.record(
+            id: "fixture-video-01", mediaType: .video, duration: 14,
+            width: 1080, height: 1920, daysAgo: 40
+        ))
+        records.append(Self.record(
+            id: "fixture-video-02", mediaType: .video, duration: 63,
+            width: 1920, height: 1080, daysAgo: 60
+        ))
+        records.append(Self.record(
+            id: "fixture-video-03", mediaType: .video, duration: 321,
+            width: 3840, height: 2160, daysAgo: 5
+        ))
+        records.append(Self.record(
+            id: "fixture-video-04", mediaType: .video, duration: 7,
+            width: 720, height: 1280, daysAgo: 90
+        ))
+        records.append(Self.record(
+            id: "fixture-video-05", mediaType: .video, duration: 756,
+            width: 1920, height: 1080, daysAgo: 15
+        ))
+        records.append(Self.record(
+            id: "fixture-video-06-nosize", mediaType: .video, duration: 42,
+            width: 1280, height: 720, daysAgo: 3
+        ))
         return records
     }()
 
@@ -58,14 +83,16 @@ struct FixturePhotoLibrary: PhotoLibraryReading {
         mediaType: PhotoMediaType = .image,
         mediaSubtypes: PhotoMediaSubtypes = [],
         duration: TimeInterval = 0,
+        width: Int = 1290,
+        height: Int = 2796,
         daysAgo: Double
     ) -> PhotoAssetRecord {
         PhotoAssetRecord(
             localIdentifier: id,
             mediaType: mediaType,
             mediaSubtypes: mediaSubtypes,
-            pixelWidth: 1290,
-            pixelHeight: 2796,
+            pixelWidth: width,
+            pixelHeight: height,
             creationDate: baseDate.addingTimeInterval(-daysAgo * 86_400),
             modificationDate: nil,
             duration: duration,
@@ -85,7 +112,13 @@ struct FixtureSizeProvider: AssetSizeProviding {
     func sizes(for localIdentifiers: [String]) async -> [String: Int64] {
         var sizes: [String: Int64] = [:]
         for id in localIdentifiers where !id.contains("nosize") {
-            sizes[id] = Int64(2_000_000 + (PreviewData.stableHash(id) % 30_000_000))
+            // DJB2 outputs for near-identical ids differ by only a few units, which would make
+            // every fixture video round to the same displayed size. Fold with a multiplicative
+            // hash and xor-shift so largest-first ordering is actually visible in the fixture.
+            let base = UInt64(PreviewData.stableHash(id))
+            let mixed = base &* 2_654_435_761
+            let spread = mixed ^ (mixed >> 15)
+            sizes[id] = Int64(2_000_000 + (spread % 30_000_000))
         }
         return sizes
     }

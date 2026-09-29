@@ -13,6 +13,7 @@ struct DashboardView: View {
                 catalogSection
                 similarPhotosSection
                 screenshotsSection
+                largeVideosSection
                 statusSection
             }
             .navigationTitle("Netto")
@@ -213,6 +214,29 @@ struct DashboardView: View {
                         ScreenshotsPresentation.statusText(
                             permission: env.photoPermissionState,
                             catalog: env.catalogState
+                        )
+                    )
+                    .font(.caption)
+                    .foregroundStyle(Theme.Palette.secondaryLabel)
+                    .lineLimit(2)
+                }
+            }
+        }
+    }
+
+    private var largeVideosSection: some View {
+        Section("Large Videos") {
+            NavigationLink {
+                VideosView()
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Review largest videos first")
+                        .font(.body.weight(.medium))
+                    Text(
+                        VideosPresentation.statusText(
+                            permission: env.photoPermissionState,
+                            catalog: env.catalogState,
+                            resolution: env.videoSizeResolution
                         )
                     )
                     .font(.caption)

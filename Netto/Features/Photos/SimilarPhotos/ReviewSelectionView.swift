@@ -13,13 +13,25 @@ struct ReviewSelectionView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showConfirmation = false
 
-    /// Which selection this review was opened from. Both sources share the same plan →
+    /// Which selection this review was opened from. Every source shares the same plan →
     /// confirmation → mutation pipeline; the source only steers plan preparation and the
     /// empty-selection copy.
     var source: DeletionSelectionSource = .similarPhotos
 
     private var phase: DeletionReviewPhase {
         DeletionPresentation.phase(for: env.deletionState)
+    }
+
+    /// Empty-phase copy steered by where the review was opened from.
+    private var emptySelectionMessage: String {
+        switch source {
+        case .screenshots:
+            return "No screenshots are selected. Choose screenshots first, then come back to review them."
+        case .videos:
+            return "No videos are selected. Choose videos on the Large Videos screen first, then come back to review them."
+        case .similarPhotos:
+            return "No photos are selected for cleanup. Pick photos inside a group first."
+        }
     }
 
     var body: some View {
@@ -41,9 +53,7 @@ struct ReviewSelectionView: View {
                 ReviewPhaseMessage(
                     systemImage: "checkmark.circle",
                     title: "Nothing is marked",
-                    message: source == .screenshots
-                        ? "No screenshots are selected. Choose screenshots first, then come back to review them."
-                        : "No photos are selected for cleanup. Pick photos inside a group first."
+                    message: emptySelectionMessage
                 )
             } else {
                 buildingState
@@ -78,7 +88,8 @@ struct ReviewSelectionView: View {
     // MARK: Review
 
     private func reviewContent(_ plan: DeletionPlan) -> some View {
-        List {
+        let noun = DeletionPresentation.noun(for: plan)
+        return List {
             Section {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                     Text("\(plan.count) \(plan.count == 1 ? "item" : "items") selected for deletion")
@@ -119,7 +130,7 @@ struct ReviewSelectionView: View {
             actionBar(plan)
         }
         .confirmationDialog(
-            "Delete \(plan.count) \(plan.count == 1 ? "photo" : "photos")?",
+            "Delete \(plan.count) \(plan.count == 1 ? noun.one.lowercased() : noun.many.lowercased())?",
             isPresented: $showConfirmation,
             titleVisibility: .visible
         ) {
@@ -129,7 +140,7 @@ struct ReviewSelectionView: View {
             } label: {
                 Text(DeletionPresentation.destructiveTitle(for: plan))
             }
-            Button("Keep Photos", role: .cancel) { }
+            Button("Keep \(noun.many)", role: .cancel) { }
         } message: {
             Text(DeletionPresentation.sizeMessage(for: plan)
                  + " — moved to Recently Deleted, not erased immediately.")

@@ -42,10 +42,20 @@ enum DeletionPresentation {
         }
     }
 
+    /// What kind of asset this plan deletes: videos when every item is a video (the Large
+    /// Videos flow), photos otherwise — including mixed analysis groups, which keep the photo
+    /// wording they have always had.
+    static func noun(for plan: DeletionPlan) -> (one: String, many: String) {
+        plan.items.allSatisfy { $0.mediaType == .video }
+            ? (one: "Video", many: "Videos")
+            : (one: "Photo", many: "Photos")
+    }
+
     /// The destructive button title names the actual action and the exact count — never
     /// "Clean" or other ambiguous wording.
     static func destructiveTitle(for plan: DeletionPlan) -> String {
-        "Delete \(plan.count) \(plural(plan.count, one: "Photo", many: "Photos"))"
+        let noun = noun(for: plan)
+        return "Delete \(plan.count) \(plural(plan.count, one: noun.one, many: noun.many))"
     }
 
     /// Size wording that is honest about completeness:

@@ -1,12 +1,13 @@
 import Combine
 import SwiftUI
 
-/// Which selection produced a deletion plan. Both sources share the one plan → confirmation →
+/// Which selection produced a deletion plan. Every source shares the one plan → confirmation →
 /// mutation → verification pipeline — the source only decides which selection model a plan is
 /// built from and which dataset fingerprint it is validated against.
 enum DeletionSelectionSource: Sendable, Equatable {
     case similarPhotos
     case screenshots
+    case videos
 }
 
 @MainActor
@@ -31,6 +32,11 @@ final class AppEnvironment: ObservableObject {
     @Published var selection = PhotoSelectionModel()
     /// Screenshots marked for cleanup — a filter over the catalog, not a second enumeration.
     @Published var screenshotSelection = ScreenshotSelectionModel()
+    /// Videos marked for cleanup — a filter over the catalog, not a second enumeration.
+    @Published var videoSelection = DatasetSelectionModel()
+    /// Measured bytes for the video list: explicit resolution state the photo flows don't need
+    /// (they resolve sizes only at review time), so the largest-first ordering can be honest.
+    @Published var videoSizeResolution: VideoSizeResolution = .idle
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
     @Published var deletionState: DeletionState = .noSelection
 
@@ -44,6 +50,11 @@ final class AppEnvironment: ObservableObject {
     private var analysisGeneration = 0
     /// Bumped on every plan build; a superseded build discards its result instead of writing it.
     private var planBuildGeneration = 0
+    /// In-flight video size measurement, if any (bounded sequential batches).
+    private var videoSizeTask: Task<Void, Never>?
+    /// Bumped on every measurement start and cancel. Each batch compares it before writing, so
+    /// a cancelled run can never overwrite newer state.
+    private var videoSizeGeneration = 0
     /// Which source the current/last plan was built from; confirmation validates against it.
     private var planSource: DeletionSelectionSource = .similarPhotos
 
@@ -320,7 +331,7 @@ final class AppEnvironment: ObservableObject {
     ///
     /// Never runs while a build, a confirmed deletion, or a result is on screen; requires a
     /// completed catalog — plus a completed analysis for the similar-photos source (screenshots
-    /// are a subtype filter recorded during enumeration, so they never wait on analysis);
+    /// and videos are filters recorded during enumeration, so they never wait on analysis);
     /// resolves real sizes through `sizeProvider` (never during enumeration); then validates
     /// the fresh plan against the *current* context before presenting it for review.
     func prepareDeletionPlan(from source: DeletionSelectionSource = .similarPhotos) {
@@ -348,7 +359,7 @@ final class AppEnvironment: ObservableObject {
 
         let analysisResult: PhotoAnalysisResult
         switch source {
-        case .screenshots:
+        case .screenshots, .videos:
             analysisResult = .empty
         case .similarPhotos:
             guard case .completed(let completed) = analysisState else {
@@ -483,6 +494,18 @@ final class AppEnvironment: ObservableObject {
         }
     }
 
+    /// Same, for the video selection — only stales a plan built from that source.
+    func mutateVideoSelection(_ mutation: (inout DatasetSelectionModel) -> Void) {
+        mutation(&videoSelection)
+        guard planSource == .videos else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            applyDeletion(.planStale(plan, [.selectionChanged]))
+        default:
+            break
+        }
+    }
+
     /// First step of the destructive confirmation — the only route to `.awaitingConfirmation`.
     func beginConfirmation() {
         guard case .readyForReview(let plan) = deletionState else { return }
@@ -574,6 +597,9 @@ final class AppEnvironment: ObservableObject {
         planBuildGeneration += 1
         selection = PhotoSelectionModel()
         screenshotSelection.reset()
+        videoSelection.reset()
+        cancelVideoSizeResolution()
+        videoSizeResolution = .idle
         planSource = .similarPhotos
         analysisGeneration += 1
         analysisTask?.cancel()
@@ -588,11 +614,12 @@ final class AppEnvironment: ObservableObject {
 
     // MARK: - Dataset synchronization (screenshot subset of the catalog)
 
-    /// Stores a completed catalog and reconciles the screenshot selection against it, so a
-    /// rebuilt dataset can never leave the selection pointing at vanished assets.
+    /// Stores a completed catalog and reconciles both catalog-filter selections against it, so
+    /// a rebuilt dataset can never leave a selection pointing at vanished assets.
     private func noteCatalogCompleted(_ result: CatalogScanResult) {
         catalogState = .completed(result)
         synchronizeScreenshotDataset()
+        synchronizeVideoDataset()
     }
 
     /// Reconciles the screenshot selection with the current catalog and stales any screenshot
@@ -621,11 +648,47 @@ final class AppEnvironment: ObservableObject {
         }
     }
 
+    /// Reconciles the video selection with the current catalog, drops size measurements that
+    /// belong to a previous dataset, and stales any video plan built over a previous dataset.
+    /// Called whenever the catalog completes and whenever the videos screen appears (previews
+    /// and tests set `catalogState` directly).
+    func synchronizeVideoDataset() {
+        switch catalogState {
+        case .completed(let result):
+            videoSelection.reconcile(with: VideoDataset.identifiers(in: result))
+            let signature = VideoDataset.signature(in: result)
+            if !videoSizeResolution.isCurrent(for: signature) {
+                // Bytes measured against another dataset are dropped, never mixed in.
+                cancelVideoSizeResolution()
+                videoSizeResolution = .idle
+            }
+        case .notStarted, .cancelled, .failed:
+            videoSelection.reset()
+            cancelVideoSizeResolution()
+            videoSizeResolution = .idle
+        case .running:
+            break // A rebuild is in flight; reconcile again when it completes.
+        }
+
+        guard planSource == .videos else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            if videoSelection.selectedIDs != plan.selectionSnapshot {
+                applyDeletion(.planStale(plan, [.selectionChanged]))
+            } else if currentDatasetSignature(for: .videos) != plan.analysisSignature {
+                applyDeletion(.planStale(plan, [.analysisChanged]))
+            }
+        default:
+            break
+        }
+    }
+
     /// The identifiers `source`'s selection is drawn from right now.
     private func selectionIDs(for source: DeletionSelectionSource) -> Set<String> {
         switch source {
         case .similarPhotos: return selection.selectedIDs
         case .screenshots: return screenshotSelection.selectedIDs
+        case .videos: return videoSelection.selectedIDs
         }
     }
 
@@ -639,6 +702,9 @@ final class AppEnvironment: ObservableObject {
         case .screenshots:
             guard case .completed(let result) = catalogState else { return "" }
             return ScreenshotDataset.signature(in: result)
+        case .videos:
+            guard case .completed(let result) = catalogState else { return "" }
+            return VideoDataset.signature(in: result)
         }
     }
 
@@ -651,6 +717,109 @@ final class AppEnvironment: ObservableObject {
         switch source {
         case .similarPhotos: return DeletionPlanner.analysisSignature(for: analysis)
         case .screenshots: return ScreenshotDataset.signature(in: catalog)
+        case .videos: return VideoDataset.signature(in: catalog)
+        }
+    }
+
+    // MARK: - Video size resolution (measure once, largest-first honestly)
+
+    /// Starts measuring the current video dataset from scratch. Only starts from `.idle` —
+    /// an in-flight or already-settled measurement is left exactly as it is.
+    func startVideoSizeResolution() {
+        guard case .idle = videoSizeResolution else { return }
+        resumeVideoSizeMeasurement()
+    }
+
+    /// Measures the videos whose sizes are still unknown (all of them when idle), in bounded
+    /// sequential batches. Read-only: it never touches the selection or a prepared plan — plan
+    /// sizes are resolved separately for the reviewed subset at prepare time. Safe to call
+    /// repeatedly: while a run is in flight nothing restarts, and a fully measured dataset
+    /// settles again without calling the provider.
+    func resumeVideoSizeMeasurement() {
+        guard !videoSizeResolution.isMeasuring else { return }
+        guard photoPermissionState.isUsable else { return }
+        guard case .completed(let catalog) = catalogState else { return }
+
+        let videos = VideoDataset.records(in: catalog)
+        guard !videos.isEmpty else {
+            videoSizeResolution = .idle
+            return
+        }
+
+        let signature = VideoDataset.signature(in: catalog)
+        var bytes: [String: Int64]
+        if videoSizeResolution.isCurrent(for: signature) {
+            bytes = videoSizeResolution.bytes // resume: keep what this dataset already measured
+        } else {
+            bytes = [:] // another dataset's bytes are never mixed into this one
+        }
+        let total = videos.count
+        let targets = videos.lazy.map(\.localIdentifier).filter { bytes[$0] == nil }
+
+        guard !targets.isEmpty else {
+            videoSizeResolution = .settled(
+                VideoSizeResolution.Measurement(
+                    datasetSignature: signature,
+                    bytes: bytes,
+                    total: total
+                )
+            )
+            return
+        }
+
+        videoSizeGeneration += 1
+        let generation = videoSizeGeneration
+        videoSizeTask?.cancel()
+        videoSizeResolution = .measuring(
+            VideoSizeResolution.Measurement(
+                datasetSignature: signature,
+                bytes: bytes,
+                total: total
+            )
+        )
+
+        let provider = sizeProvider
+        videoSizeTask = Task { [weak self] in
+            guard let self else { return }
+            let batchSize = VideoSizeResolution.measurementBatchSize
+            var pending = Array(targets)
+            while !pending.isEmpty {
+                let batch = Array(pending.prefix(batchSize))
+                pending.removeFirst(batch.count)
+                let landed = await provider.sizes(for: batch)
+                // Each batch re-checks the generation, so a cancelled run's remaining batches
+                // are discarding no-ops — they can never overwrite newer state.
+                guard self.videoSizeGeneration == generation else { return }
+                bytes.merge(landed) { _, new in new }
+                self.videoSizeResolution = .measuring(
+                    VideoSizeResolution.Measurement(
+                        datasetSignature: signature,
+                        bytes: bytes,
+                        total: total
+                    )
+                )
+            }
+            guard self.videoSizeGeneration == generation else { return }
+            self.videoSizeResolution = .settled(
+                VideoSizeResolution.Measurement(
+                    datasetSignature: signature,
+                    bytes: bytes,
+                    total: total
+                )
+            )
+            self.videoSizeTask = nil
+        }
+    }
+
+    /// Cancels an in-flight measurement. Everything measured so far is kept as a settled
+    /// (possibly partial) state — never discarded — and the generation bump makes the
+    /// cancelled run's remaining batches no-ops.
+    func cancelVideoSizeResolution() {
+        videoSizeGeneration += 1
+        videoSizeTask?.cancel()
+        videoSizeTask = nil
+        if case .measuring(let measurement) = videoSizeResolution {
+            videoSizeResolution = .settled(measurement)
         }
     }
 

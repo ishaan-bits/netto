@@ -21,7 +21,8 @@ Netto/
     Storage/      Device storage snapshot provider
     Scanning/     Scan phases, progress, result summary (state types)
     Photos/       Asset catalog (done), sizing policy, photo + screenshot selection models,
-                  screenshot dataset filter, thumbnail store, and
+                  screenshot + video dataset filters, dataset-bound selection model,
+                  video size-resolution state + video preview loader, thumbnail store, and
                   Content/Photos/Analysis/ similarity engine
                   (done: candidate buckets, fingerprinting, descriptors, grouping, scoring)
     Contacts/     (next milestone) normalization + duplicate matching
@@ -33,7 +34,9 @@ Netto/
     Photos/SimilarPhotos/  Review UI: phase dispatch, group list, detail sheet,
                   selection bar, destructive review + confirmation (DeletionPresentation) ← done
     Screenshots/  Screenshots cleanup: phase dispatch, selection grid, shared review entry ← done
-    Videos/ Contacts/   (later milestones)
+    Videos/       Large videos cleanup: phase dispatch, measured-size list (largest first),
+                  video preview, shared review entry ← done
+    Contacts/     (later milestone)
     Review/       (reserved; the cleanup confirmation lives under SimilarPhotos)
   UI/Theme/       Design tokens: color, spacing, radius
   Resources/      PrivacyInfo.xcprivacy
@@ -77,6 +80,11 @@ Explicit enums instead of boolean soup:
   mapping that decides what the review screen renders (§13.1)
 - `ScreenshotsPhase` — **derived, never stored**: the pure `(permission, catalog)` mapping for
   the screenshots screen — analysis state never participates (§14)
+- `VideosPhase` — **derived, never stored**: the pure `(permission, catalog, resolution)`
+  mapping for the Large Videos screen — analysis state never participates (§15)
+- `VideoSizeResolution` — **stored, but explicit**: `idle / measuring(Measurement) /
+  settled(Measurement)` over one dataset fingerprint; bytes are only what the size provider
+  actually resolved (unknown ≠ zero), and every batch write is generation-guarded (§15)
 - `DeletionState` — the explicit deletion machine (§7): `noSelection / preparingPlan /
   resolvingSizes / readyForReview(DeletionPlan) / planStale(DeletionPlan, [PlanStalenessReason]) /
   awaitingConfirmation(DeletionPlan) / deleting(DeletionPlan) / succeeded(DeletionSuccess) /
@@ -158,6 +166,12 @@ getting a size any other way means retrieving content. So:
 `isNetworkAccessAllowed = false` — which downloads nothing — and stats `fullSizeImageURL` plus the
 `AVURLAsset` URL, summing both so a Live Photo's still and movie both count. An asset whose data
 is only in iCloud yields no local URL and is reported as unknown rather than guessed.
+
+The Large Videos screen (§15) is the one place that measures a whole media class up front —
+sorting by size *is* the feature. It uses the same `AssetSizeProviding` seam read-only, in
+bounded sequential batches with a generation guard (§15.4), never as part of plan building, and
+applies the same rule: unknown stays unknown (`nil` ≠ `0`), a video that never resolved sorts
+after every measured one and renders "Size unavailable".
 
 ### 4.3 Resource scope policy
 
@@ -441,13 +455,14 @@ Nothing below is estimated or faked; each is either a documented boundary or an 
   buffering a file.
 - Result models store `PHAsset` identifiers + lightweight metadata, not `UIImage`s. Grid cells
   request their own small thumbnails from PhotoKit with cancellation on reuse.
-- Video preview uses `AVPlayerItem`/`AVPlayerViewController` for one asset at a time; playback
-  never triggers a download and never loads a whole file into memory.
+- Video preview uses `AVPlayer` + SwiftUI `VideoPlayer` (AVKit) for one asset at a time;
+  playback never triggers a download (the preview loader is network-off) and never loads a
+  whole file into memory, and the player is released when the preview closes.
 - Byte sizes are never derived from decoding or buffering content. They come from stat-ing a
   local content URL for a bounded, user-selected subset (§4.2) — a metadata/file-attribute read,
   not a content read.
 
-## 7. Deletion safety model (implemented — photos + screenshots)
+## 7. Deletion safety model (implemented — photos, screenshots, videos)
 
 Deletion is strictly separated from analysis, and the pipeline is explicit about every
 hand-off:
@@ -464,7 +479,8 @@ media classification, exact byte sizes where measured (`nil` = unknown, **never*
 zero), a category label (exact beats similar, deterministic), plus the creation context used
 to detect staleness: the authorization status at creation, the app session token, and a
 structural fingerprint of the dataset the selection came from — the analysis result for the
-similar-photos source, the screenshot subset of the catalog for the screenshots source (§14).
+similar-photos source, the screenshot subset of the catalog for the screenshots source (§14),
+the video subset for the videos source (§15).
 The mutation service does not accept raw
 identifiers — only a `ConfirmedDeletionPlan` obtained through `DeletionPlan.confirmed()`,
 which refuses an empty plan by type.
@@ -621,7 +637,21 @@ off the main actor. Used = total − available. Refreshable via pull-to-refresh.
   screenshot dataset fingerprint, dataset-change invalidation (selection drift vs
   signature-only drift), catalog-gone reset, superseded builds discarded, stale-plan
   repreparation, and deletion success clearing the screenshot selection and catalog.
-  **Current total: 295 tests in 35 suites** (zero compiler warnings).
+- The large-videos pipeline is tested the same way: `VideoDatasetTests` (media-type-only
+  filter, id dedupe, order-independent membership-sensitive signature, size resolution,
+  the documented sort policy proven deterministic across fixed-seed shuffles and stable at
+  20k records), `VideosFlowTests` (prepare with analysis untouched, dataset-scoped selection,
+  source-gated staleness and cross-source review entry, confirmation gating, noun-aware
+  destructive copy, and the full measurement state machine — 32-batch sizing of a 70-video
+  dataset, partial settle with `nil` never zero, cancel keeping measured bytes while late
+  generation-stale batches are discarded, resume measuring only unknowns, settled-start
+  no-op, permission/catalog gates, catalog-rebuild measurement drop, post-deletion reset),
+  and `VideoPreviewTests` (seam invocation, local-only/current request options, the pure
+  result mapping — cancellation, in-cloud, Photos-error translation, file-backed requirement —
+  plus the preview model's loading/ready/unavailable state machine with a generation guard
+  proven by out-of-order scripted responses, and player release on close).
+  **Current total: 364 tests in 38 suites** (zero compiler warnings other than the allowed
+  `appintentsmetadataprocessor` notice).
 - **On-device matrix** (real iPhone, real library): empty library, small, 10k+ library,
   screenshots, large videos, exact dupes, near-dupes, no dupes, limited Photos access, denied
   Photos/Contacts, cancellation mid-scan, deletion failure, empty selection, changed selection
@@ -655,8 +685,8 @@ No payments/subscriptions/paywalls, no email cleaning, no cache/junk clearing, n
 sync, no iPad/Watch/Mac targets, no external AI APIs, no network calls of any kind.
 `PrivacyInfo.xcprivacy` declares no tracking, no collected data, no required-reason APIs.
 
-Deletion scope (this milestone): **photos and screenshots only**, one asset at a time from an
-explicit review. Still out of scope: contacts/video/calendar deletion, delete-all, automatic
+Deletion scope (this milestone): **photos, screenshots, and videos only**, one asset at a time
+from an explicit review. Still out of scope: contacts/calendar deletion, delete-all, automatic
 or background cleanup, cloud sync of any kind.
 
 ## 13. Similar photos review UI (implemented)
@@ -868,4 +898,137 @@ before commit, so the committed test surface remains the unit suite (the harness
 in the validation report and can be re-added). What Simulator validation **cannot** show:
 interaction with real screenshot-flagged assets or a real Photos mutation.
 **Real-device validation (real screenshot flags, real deletion of real screenshots): NOT
+PERFORMED — no device connected (§5.9 item 9).**
+
+## 15. Large videos cleanup (implemented)
+
+`Features/Videos/` is the LARGE VIDEOS milestone: discover → measure → sort largest-first →
+select → preview/play → review → confirm → delete, built entirely on the existing pipeline. It
+adds no deletion path, no PhotoKit enumeration, and no size heuristic of its own.
+
+### 15.1 Identification: media type only, catalog only
+
+A video is whatever the catalog already recorded as one: `PhotoLibraryProvider` bridges
+`PHAsset.mediaType == .video` (the only bridge, unchanged), `PhotoAssetRecord.isVideo` exposes
+it, and `VideoDataset` (Core/Photos) filters `CatalogScanResult.records` by that flag — catalog
+order, set-semantics dedupe, no second enumeration. Size, duration, resolution, filename, and
+date never decide whether something is a video. The dataset's structural fingerprint
+(`VideoDataset.signature` — membership + count, order-independent) is what video plans are
+validated against.
+
+### 15.2 One derived phase — permission + catalog + measurement, never analysis
+
+`VideosPresentation.phase(permission:catalog:resolution:)` maps to `VideosPhase`
+(`permissionRequired / permissionDenied / buildingCatalog / scanRequired / failed / empty /
+measuringVideos / results`). Analysis state is not a parameter: a running or failed similarity
+analysis changes nothing on this screen. Size measurement is an *input*, not a phase of its own
+(§15.4): `.idle` and a foreign-dataset measurement both render `measuringVideos(measured: 0)`
+with honest "sizes not measured yet" copy — bytes are never mixed across catalogs — `.measuring`
+shows live progress, and `.settled` resolves the sorted, size-embedded results. The dashboard's
+Large Videos status (`statusText`) and the limited-access notice derive from the same mapping.
+
+### 15.3 Dataset-bound selection (shared model)
+
+`DatasetSelectionModel` (Core/Photos) is the generalized `datasetIDs` + `selectedIDs` model the
+screenshots milestone introduced — `ScreenshotSelectionModel` is now a typealias of it, so both
+features share one tested implementation. `mutateVideoSelection` validates against the dataset
+the model was last reconciled with (unknown ids are ignored), `selectAll` covers exactly the
+video dataset, and `synchronizeVideoDataset()` — run whenever the catalog completes
+(`noteCatalogCompleted`) and whenever the screen appears — drops selections whose assets left
+the dataset instead of carrying them into a plan. A missing dataset (catalog reset, deletion
+success) clears both sets.
+
+### 15.4 Size measurement: read-only, bounded, generation-guarded
+
+Sorting by size *is* the feature, so the videos screen measures the whole video dataset — the
+one place that does — strictly read-only and never as part of plan building (§4.2):
+
+- `VideoSizeResolution` (Core/Photos) is the stored but explicit state:
+  `idle / measuring(Measurement) / settled(Measurement)`. `Measurement` carries the dataset
+  signature it belongs to, `bytes: [String: Int64]` (only values the provider actually
+  resolved — `nil` never enters), `measuredCount`, `total`, and `isPartial`.
+- `startVideoSizeResolution()` runs from `.idle` only — a settled state requires the explicit
+  `resumeVideoSizeMeasurement()` — in sequential batches of `measurementBatchSize` (32) through
+  the existing `AssetSizeProviding` seam: network off, local-URL stat-ing, no full-file reads.
+  A `videoSizeGeneration` counter is bumped on every start/cancel, so late batches from a
+  superseded run land as discarding no-ops, and cancel settles keeping what was already
+  measured.
+- Unknown stays unknown: a video whose bytes never resolved keeps `nil`, sorts after every
+  measured video (measured before unknown — `nil` ≠ `0` — then bytes desc, newer creationDate
+  first, then id asc; fully deterministic), renders "Size unavailable", and counts as *pending*
+  in the copy, never as zero bytes.
+- Measurement never touches selection, the deletion machine, or a prepared plan;
+  `VideosView.onDisappear` cancels in-flight work.
+
+### 15.5 Screen
+
+Dashboard section (`statusText`) → `VideosView`: list rows (64 pt `PhotoThumbnailView` with a
+play badge, duration, pixel dimensions, date, measured size or "Size unavailable", select
+button) ordered largest-first once settled, plus a partial-measurement banner with "Measure
+Sizes" when the provider couldn't resolve everything. Tapping a row opens a full-screen
+preview cover: `VideoPreviewModel` owns the `AVPlayer`, created through the `VideoPreviewLoading`
+seam — `PhotoKitVideoPreviewLoader` runs one `requestAVAsset(forVideo:)` with
+`isNetworkAccessAllowed = false`, `version = .current`, `.highQualityFormat` (via
+`PendingPhotoRequest`, so the continuation resumes exactly once) and accepts only a file-backed
+`AVURLAsset`. Playback autoplays when ready; loading / ready / unavailable are distinct states
+with PhotoKit-aware copy (`onlyInICloud` never silently downloads), and `close()` releases the
+player when the cover dismisses.
+
+### 15.6 Same pipeline, source-aware orchestration
+
+`DeletionSelectionSource.videos` joins the existing source-aware path — everything §14.4
+describes applies with the video dataset in place of the screenshot one:
+
+- `prepareDeletionPlan(from:)` guards catalog `.completed` for videos with analysis at
+  `.notStarted` (videos never wait for analysis), and stamps the video signature through the
+  same `DeletionPlanner.makePlan(analysisSignature:)` override.
+- `PlanExecutionContext`, validator staleness, `synchronizeVideoDataset` (selection drift →
+  `.selectionChanged`, signature-only drift → `.analysisChanged`), and cross-source review
+  entry behave exactly as §14.4: video mutations stale only video plans, and vice versa.
+- Confirmation copy is noun-aware through `DeletionPresentation.noun(for:)`: a plan whose items
+  are all videos says "Delete 2 Videos" / "Keep Videos", anything else says Photos — existing
+  photo-plan copy is unchanged, proven by the pre-existing assertions.
+- `resetLibraryStateAfterDeletion` clears the video selection and size resolution. Exactly one
+  production mutation boundary, still `PhotoDeletionService` only — deleting videos reuses the
+  same `PHAssetChangeRequest.deleteAssets` call on video `PHAsset`s: zero new mutation code,
+  zero new enumeration.
+
+### 15.7 Validation and its limits
+
+Unit tests: `VideoDatasetTests` (filter/signature/resolve, the documented sort policy across
+input orders with a fixed-seed shuffle, `nil` never sorts as zero, 20k-record determinism
+bound), `VideosFlowTests` (prepare without analysis, cross-source gating and review entry,
+dataset invalidation, confirmation gating, noun-aware destructive copy, and the measurement
+state machine: 70-asset batching of 32/32/6, partial settle, cancel keeping measured bytes
+with late batches discarded, resume measuring only the unknowns, settled no-op start,
+permission/catalog gates, catalog-rebuild signature drop, post-deletion reset), and
+`VideoPreviewTests` (loader seam, request options local-only/current, the pure result mapping —
+cancellation/in-cloud/Photos-errors/file-backed requirement — preview state machine with a
+generation guard proven by out-of-order scripted responses, and player release on close).
+
+Simulator: the DEBUG `-fixtureLibrary` launch argument exposes `FixturePhotoLibrary`'s six
+fixture videos (five with known sizes, `fixture-video-06-nosize` unknown) through the same
+seams. A confirmed deletion over fixture ids stops at the service's existence revalidation with
+**zero mutation**.
+
+**Simulator validation: PERFORMED.** The fixture build was driven end-to-end in Simulator as a
+single automated UI test — permission grant → Build Catalog → honest dashboard idle status →
+swipe to the Large Videos section → the six fixture videos rendered largest-first (byte-level
+ordering verified from the rendered rows: sizes strictly non-increasing, `fixture-video-06-nosize`
+last with "Size unavailable") → partial-measurement banner ("5 of 6 sizes measured" +
+Measure Sizes) → two rows selected ("2 of 6 videos selected") → Review ("Delete 2 Videos",
+exact count, "2 items selected for deletion") → confirmation dialog ("Delete 2 videos?") →
+confirm → zero-mutation stale outcome → "Review Again" reprepare with the selection preserved →
+"Change Selection" back to the list with selection intact — with every state captured as a test
+attachment (eight screenshots in the validation report). On iOS 27 the `.confirmationDialog`
+renders as a tap-outside-dismiss popover showing only the destructive button: the platform omits
+the `role: .cancel` "Keep Videos" label (the cancel role *replaces* the default dismiss action
+and popovers dismiss by tap-outside), so the test asserts the destructive action and
+scope-dismisses via the sheet rather than requiring the cancel label — `Keep Videos` remains in
+the product code. The UI-test harness existed only for this validation run and was removed
+before commit, so the committed test surface remains the unit suite (the harness is described
+in the validation report and can be re-added). What Simulator validation **cannot** show:
+real Photos video sizes, real HEVC playback, or a real Photos mutation.
+
+**Real-device validation (real video sizes, real playback, real deletion of real videos): NOT
 PERFORMED — no device connected (§5.9 item 9).**
