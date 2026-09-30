@@ -10,10 +10,14 @@
 		028525730B588887B78ED390 /* AssetSizeProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B632CEF701ED1C6442BB4BF /* AssetSizeProvider.swift */; };
 		042F5E4296C65CFA5E2055D3 /* ContentFingerprintTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C376C12DF3E6CB22CBF9FD5 /* ContentFingerprintTests.swift */; };
 		07AFFAEC977744C492FAF769 /* ContactDuplicateDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E7B3CF58E7995FDEDA10F1 /* ContactDuplicateDetectorTests.swift */; };
+		0C03FDD362EF90AE248B0E75 /* MotionSystemTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DF5AA15881D09FD35F6C932 /* MotionSystemTests.swift */; };
 		0C68A946963DEB14D0A0A197 /* ScreenshotSelectionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6662A39D7662110C5E4CB91 /* ScreenshotSelectionModel.swift */; };
 		0CF46D5C23D0966DC2874C56 /* CandidateBuckets.swift in Sources */ = {isa = PBXBuildFile; fileRef = 500A8B5DAAC6C788646AC806 /* CandidateBuckets.swift */; };
+		0DFC2593A97627368813EEA6 /* DashboardCategoryCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A9A42241313C34BC3267093 /* DashboardCategoryCard.swift */; };
 		102A364614DB97CDDDAFFF4E /* ContactsPermissionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36BC1A1097EB647693501776 /* ContactsPermissionService.swift */; };
+		14AC0B31E3D68C8337F54EA7 /* NettoSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9863FFAE404989F2BFD47AE3 /* NettoSurface.swift */; };
 		1B92D7830E3829C0AA24AC85 /* ContactMutationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C89A06332CC727BDAEE5C705 /* ContactMutationService.swift */; };
+		1F11C6DE772CD74084F73773 /* NettoInteractions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69534467960C13C113EC033C /* NettoInteractions.swift */; };
 		23D8E7E50A3F964C11878C4E /* PhotoKitContentFingerprinter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22885AA788B579D39A49ABA3 /* PhotoKitContentFingerprinter.swift */; };
 		24FB36A57634434E01F56A35 /* ContactRecord.swift in Sources */ = {isa = PBXBuildFile; fileRef = 903CE4AACA1DD677B1EF0FC4 /* ContactRecord.swift */; };
 		2555162948995CBCC4640006 /* PhotoAnalysisInstrumentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A77729FA13A1CE1366F5B9D /* PhotoAnalysisInstrumentation.swift */; };
@@ -29,6 +33,7 @@
 		3D476B0B56472175CC7A0E2E /* AppFlowState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E449B11B0B1BC422B08AF14 /* AppFlowState.swift */; };
 		3EA190358D3FCF453FF34CB2 /* SimilarPhotosFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40CAC5C0C03A90EA94BA1A13 /* SimilarPhotosFlowTests.swift */; };
 		414E63B68303DADA98C355A3 /* VideoDatasetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC546F89ED563D9561B485E /* VideoDatasetTests.swift */; };
+		4207466C9D80DBA8D9D03C92 /* NettoType.swift in Sources */ = {isa = PBXBuildFile; fileRef = DF7C687FB908F227988B8DB7 /* NettoType.swift */; };
 		451B0BBF98BABA0858717D8F /* ContactNormalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 782618DD5E3E12F62E979A2B /* ContactNormalization.swift */; };
 		462AD510CB428CD390BCCBA3 /* DeletionPlanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E2A1C0855CA25170E0A43D /* DeletionPlanner.swift */; };
 		4C11916AF4AB42A237F813DC /* DuplicateContactsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA895F9E25A15E30C6DF6CA4 /* DuplicateContactsView.swift */; };
@@ -38,28 +43,41 @@
 		53312A98ED4CC7E9E5489D01 /* PhotoThumbnailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4CCD35607D150B656BA4392 /* PhotoThumbnailView.swift */; };
 		54D57675D54EDADE8C8997FE /* CleanupCategory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1D60DA68E726F32FE29F9ED /* CleanupCategory.swift */; };
 		551F4EB5F30AFDB83F7D323D /* FoundationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF585D09B7C82CD64963379A /* FoundationTests.swift */; };
+		5C84F1014A2A586D33F57CD0 /* NettoCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EEC76BB95F0D6D22D643566 /* NettoCard.swift */; };
 		5CBE4B86698A056CD6B9F656 /* ContactStoreReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6273716B9AE4DFA884205011 /* ContactStoreReader.swift */; };
+		5D958438008966CC9B777BE8 /* NettoNavigation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74D3BAF90E308ABE769F2A1C /* NettoNavigation.swift */; };
+		5DDFB3AABDD81399E6DF6691 /* NettoProgressPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C5B33511B6D3B3E67103D8C /* NettoProgressPanel.swift */; };
 		605D6C5F0E89DB24302114E6 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BF2EAEE97F67E474801542C /* DashboardView.swift */; };
 		60DDF322DF698CA658F87958 /* FeaturePrint.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB4D47BF1817B180CFFDF486 /* FeaturePrint.swift */; };
 		615DC2D1778AE130BCF3F310 /* VideoPreviewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B39F70D6965684E17BC532DF /* VideoPreviewTests.swift */; };
 		620F931ADF2678B0C7B708BE /* ScreenshotsPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F4076C2718D6C2212675E99 /* ScreenshotsPresentation.swift */; };
 		62B243344AEB07EB95519181 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 506C282CBE3E31B208667CEC /* Assets.xcassets */; };
 		63CC983A98F1C062F6FC111F /* SimilarPhotoGroupRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 998225ABFF03688423C72365 /* SimilarPhotoGroupRow.swift */; };
+		6458D60CD6159929159D8F00 /* DashboardLayoutQATests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AEAFCDB7274C61F1A627A8B /* DashboardLayoutQATests.swift */; };
+		6485AFAD23F1870F3AED0618 /* DashboardScanStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = E675B10339B490666965C9DC /* DashboardScanStatus.swift */; };
 		652297CD333732C25877417F /* VideosView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD717EE2AF7EABF4CD7774F0 /* VideosView.swift */; };
 		6701B8405FB004A635DD9694 /* ContactDuplicateDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF0DDD5731C5143B17E2B773 /* ContactDuplicateDetector.swift */; };
 		6BDF0396CCFC385DB76C2FE9 /* DeletionPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D4A3D3599E58D56494B43CC /* DeletionPlan.swift */; };
 		6CA2BF6E631C13BADDAD2BA3 /* ContactReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5385C8B0731807D0609F160 /* ContactReviewView.swift */; };
+		6DA04C02B18BF8CDD29C88BA /* NettoAtmosphere.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58BF7F59EB83C7C0BBC26E18 /* NettoAtmosphere.swift */; };
+		6F8C8C32ABCB1072B54BC1BC /* NettoColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 513F8DAB1340C2E4EC3B9676 /* NettoColor.swift */; };
 		717F21B31FD0CBD2CDEE6999 /* StorageProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64FCCD23E5A31301B125E973 /* StorageProvider.swift */; };
 		7245C75C9957347608F82BB7 /* ContactMutationServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5389FA7123038434F19CE8FC /* ContactMutationServiceTests.swift */; };
+		739D22C33A4D3E4CE784F6AE /* NettoLogoMotion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F15198B7EE3E10DBF80F621 /* NettoLogoMotion.swift */; };
 		74D3FA254BA920E7D9B8C705 /* ThumbnailStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBE3A4CE30F4416BF49C15E8 /* ThumbnailStoreTests.swift */; };
 		74F1BBBD525AD06A67D46A68 /* PhotoFeatureExtractor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A199F5C27A8B05DE17D006B /* PhotoFeatureExtractor.swift */; };
 		7864BD7D898AD30B34311828 /* ContactDataset.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2838327CC59C33F57E22C431 /* ContactDataset.swift */; };
 		7CEECDE1FDEE628D8897453F /* PreviewData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 915A8A98769292540909E275 /* PreviewData.swift */; };
+		7D64765926A41006B21BF546 /* DashboardHeroView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BBBFC9ABF53B3041346DCA4 /* DashboardHeroView.swift */; };
+		7DC75078F59F713664506B54 /* NettoButtonStyles.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39920F8E8FF8D44A43EA5A3E /* NettoButtonStyles.swift */; };
 		81DD282830974F12C6FEBDCD /* VideoSizeResolution.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88A2960506DCA5F74BE7F5FA /* VideoSizeResolution.swift */; };
 		8209B7AD451247E9771C0B88 /* PhotoDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84AADD4415ED6A64E9AB8BFE /* PhotoDetailView.swift */; };
 		82E779207BC08DC390DADCAC /* VideoPreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07651E75DA47991C8352748D /* VideoPreviewView.swift */; };
+		84BC635EB579BDF6C84062F5 /* NettoLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 780332EB9BA868FEB411D32A /* NettoLayout.swift */; };
 		8572BC6CF3C588E13FE6F974 /* ContactsPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0429F98F13017FB2E687E7C8 /* ContactsPresentation.swift */; };
+		85764689F2A72E2A8BD07A4B /* DashboardPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CEF4C4EF27F8E8D068CA7DE /* DashboardPresentation.swift */; };
 		85D968C92D0661B8EB23A30B /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = AE519B787BA6F89B1633FEE2 /* PrivacyInfo.xcprivacy */; };
+		86947FF8D2E2B28D418BE927 /* NettoIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8A0439E1B2492A97304CA02 /* NettoIcon.swift */; };
 		869B8617D698F3EAD625B40D /* PendingPhotoRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 17F429B710E347326529434D /* PendingPhotoRequest.swift */; };
 		879450E54EAD9617F9BC1191 /* ScreenshotsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F27E4C8311BCDDB26B348F4 /* ScreenshotsTests.swift */; };
 		87B6E0E2B637D9972ACC06A7 /* SimilarityGroupingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F868C13A2E5CFCE085D446B /* SimilarityGroupingTests.swift */; };
@@ -73,16 +91,20 @@
 		9F3A329F9E3CDBE6705B351F /* ScreenshotsFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E60BBCF3DF10FF215B4C4BF /* ScreenshotsFlowTests.swift */; };
 		9FBC898B86364B0DDF3288F8 /* SimilarPhotosPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 619C162A4F1D1818F86968BE /* SimilarPhotosPresentation.swift */; };
 		A0F1B4C56AB218E88651928C /* PhotoSimilarityEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16504B05A053CB11CE11431 /* PhotoSimilarityEngine.swift */; };
+		AA0D2CF6DDE2EDB87DCCD1AB /* DashboardFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DECDA9F4AA190F690330183B /* DashboardFlowTests.swift */; };
 		AAC3802F2BF3979F4A7712AA /* ScanResultSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A42507B99358B78FF150FFE1 /* ScanResultSummary.swift */; };
 		AD0F17C6DC169E94352EBD92 /* ContentFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE1A5B6D2B3430AA64C823B2 /* ContentFingerprint.swift */; };
+		AD9620E4263BBC8EA0158F7A /* NettoLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD74ED5A05947717DBFA025 /* NettoLogo.swift */; };
 		AF286A62520DEA1094121F7C /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09642FE6A1B0F2A3193A82BF /* Theme.swift */; };
 		AFDD01D15A02C9FDE0B920A4 /* FixturePhotoLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4C3811C0C4DF160CF71D045 /* FixturePhotoLibrary.swift */; };
 		B3FA8E512BC773CA7F99E744 /* ContactGroupSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93D289904B8C2B4E6C3AF0DA /* ContactGroupSelection.swift */; };
 		B5DEE3E76AA55C9AC5976712 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83DBFA570B7D1FC8C1B982E /* RootView.swift */; };
 		B66166D73B4EA442733F7227 /* StorageSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CA55212085EC652E3BF665B /* StorageSnapshot.swift */; };
+		B75A864B9BBAAF364A3B2710 /* NettoMotion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2142BBEC3AD24E2C2AE75DE9 /* NettoMotion.swift */; };
 		B7EC05AF373EACD7450D3F9B /* VideosPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02B9FBE9DC0E816A8936BAC4 /* VideosPresentation.swift */; };
 		B8B2BD2A67D944848F4BD859 /* PhotoSelectionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A717930C7B8C70586F273164 /* PhotoSelectionModel.swift */; };
 		BED43FEE68D05A9BB8B1EEBD /* BestPhotoScoringTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 946932D807CD166442661DCC /* BestPhotoScoringTests.swift */; };
+		C3BD2EA9ECBE0712F2D2ACBE /* NettoGlass.swift in Sources */ = {isa = PBXBuildFile; fileRef = 721F6F695392BAAFA1FAE163 /* NettoGlass.swift */; };
 		C78F90FB4B216E8967419E70 /* VideoPreviewLoader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D4311B4AAB22E0B78ABCE8F /* VideoPreviewLoader.swift */; };
 		CA41D6DE6BCF17141005C6BE /* ThumbnailStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF93ABF5FA51D538805F9030 /* ThumbnailStore.swift */; };
 		CAB427451D6359132B4D5E45 /* ScreenshotDataset.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A7CEA3185941831E7AB52EA /* ScreenshotDataset.swift */; };
@@ -94,6 +116,7 @@
 		D06F299E68937E8EFB450134 /* PhotoDeletionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F46B10B5900513A25D9F1D3F /* PhotoDeletionService.swift */; };
 		D09031F6FF7BCD4F453F9426 /* NettoApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C030C39E4F548858F25F4262 /* NettoApp.swift */; };
 		D14BCD01223460C075B19B1A /* PhotoLibraryProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 943F7FE812E150FB04ED08A0 /* PhotoLibraryProvider.swift */; };
+		D6EFA8ABD848333A6C7B10C1 /* ScanValidationUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9711A84D071C58540D097B0 /* ScanValidationUITests.swift */; };
 		D7A97C34AA54D9E6FD5E9C24 /* SimilarPhotosView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E82042FCC36E879AB7C286B5 /* SimilarPhotosView.swift */; };
 		DDA530BB8122260AE8D4B268 /* PhotoAnalysisModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA6E0C90E92F3A5F86C9A812 /* PhotoAnalysisModels.swift */; };
 		DDB6EDB8DAC0AEDE4340863D /* PhotoCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 247D387ED1588AB57AE00C27 /* PhotoCatalogTests.swift */; };
@@ -103,15 +126,24 @@
 		E68175C74BC0D231427C12C5 /* ContactActionPlanTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83293904F7829127DA7E399F /* ContactActionPlanTests.swift */; };
 		E7C1528177DDE2B1135B30D1 /* ContactActionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 19A790CA4016751E4EA4839A /* ContactActionState.swift */; };
 		E85168B9C0BF4D27229B13E9 /* ContactsFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAE0964D824EC5D59B2527A2 /* ContactsFlowTests.swift */; };
+		EFD9FC4DA084C4C7D24D2CE9 /* AnalysisProgressReporterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D531A076C2BD1D08B966BA9 /* AnalysisProgressReporterTests.swift */; };
 		F1271AE815961173116E87D5 /* ScreenshotsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EDAF4C537477D063C60AF3C /* ScreenshotsView.swift */; };
 		F37088C35C7874EE40C139E3 /* PhotoKitContentFingerprinterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93CC37536EFB4F317F2DD204 /* PhotoKitContentFingerprinterTests.swift */; };
 		F414539B771CB8179413D226 /* SimilarityGrouping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AE5D5803EBF0E001E46312D /* SimilarityGrouping.swift */; };
 		F61FA8F08C5333C9CEB40F7A /* DeletionStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FC6DE6CB7EF6EC2B6ADAEB0 /* DeletionStateTests.swift */; };
 		F76B4342C6B3C0254A33212A /* PhotoLibraryPermissionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BCCEF4B411E88BE77EBD2EA /* PhotoLibraryPermissionService.swift */; };
+		F9464636A74319D6D4E55275 /* DesignSystemGallery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 217215D82EE3B2BD60879A69 /* DesignSystemGallery.swift */; };
 		FFDA3EC5B4C341B4E4D1BC00 /* PhotoCatalogBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 431A6DA9A2CA3C744FBF877C /* PhotoCatalogBuilder.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		1A723A46EB39DE3118948119 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A6C3853DA8D95082108DA10F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 3E18C8E14263B709C87035B4;
+			remoteInfo = Netto;
+		};
 		E24F1C7E0E4EB1F0267812A5 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = A6C3853DA8D95082108DA10F /* Project object */;
@@ -134,6 +166,8 @@
 		1D0321EF7CA5B8B4470112DB /* DeletionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionState.swift; sourceTree = "<group>"; };
 		1E39F5E4C991D6BEC4232803 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		1F27E4C8311BCDDB26B348F4 /* ScreenshotsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotsTests.swift; sourceTree = "<group>"; };
+		2142BBEC3AD24E2C2AE75DE9 /* NettoMotion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoMotion.swift; sourceTree = "<group>"; };
+		217215D82EE3B2BD60879A69 /* DesignSystemGallery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystemGallery.swift; sourceTree = "<group>"; };
 		22885AA788B579D39A49ABA3 /* PhotoKitContentFingerprinter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoKitContentFingerprinter.swift; sourceTree = "<group>"; };
 		247D387ED1588AB57AE00C27 /* PhotoCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoCatalogTests.swift; sourceTree = "<group>"; };
 		25260E35251723605222E84D /* PhotoAssetRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoAssetRecord.swift; sourceTree = "<group>"; };
@@ -143,10 +177,13 @@
 		2AE5D5803EBF0E001E46312D /* SimilarityGrouping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimilarityGrouping.swift; sourceTree = "<group>"; };
 		2D4A3D3599E58D56494B43CC /* DeletionPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionPlan.swift; sourceTree = "<group>"; };
 		36BC1A1097EB647693501776 /* ContactsPermissionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactsPermissionService.swift; sourceTree = "<group>"; };
+		39920F8E8FF8D44A43EA5A3E /* NettoButtonStyles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoButtonStyles.swift; sourceTree = "<group>"; };
 		3A199F5C27A8B05DE17D006B /* PhotoFeatureExtractor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoFeatureExtractor.swift; sourceTree = "<group>"; };
 		3C376C12DF3E6CB22CBF9FD5 /* ContentFingerprintTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentFingerprintTests.swift; sourceTree = "<group>"; };
 		3CA55212085EC652E3BF665B /* StorageSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageSnapshot.swift; sourceTree = "<group>"; };
+		3DF5AA15881D09FD35F6C932 /* MotionSystemTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotionSystemTests.swift; sourceTree = "<group>"; };
 		3E60BBCF3DF10FF215B4C4BF /* ScreenshotsFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotsFlowTests.swift; sourceTree = "<group>"; };
+		3F15198B7EE3E10DBF80F621 /* NettoLogoMotion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoLogoMotion.swift; sourceTree = "<group>"; };
 		3F4076C2718D6C2212675E99 /* ScreenshotsPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotsPresentation.swift; sourceTree = "<group>"; };
 		3F868C13A2E5CFCE085D446B /* SimilarityGroupingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimilarityGroupingTests.swift; sourceTree = "<group>"; };
 		40CAC5C0C03A90EA94BA1A13 /* SimilarPhotosFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimilarPhotosFlowTests.swift; sourceTree = "<group>"; };
@@ -159,17 +196,28 @@
 		4EDAF4C537477D063C60AF3C /* ScreenshotsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotsView.swift; sourceTree = "<group>"; };
 		500A8B5DAAC6C788646AC806 /* CandidateBuckets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CandidateBuckets.swift; sourceTree = "<group>"; };
 		506C282CBE3E31B208667CEC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		513F8DAB1340C2E4EC3B9676 /* NettoColor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoColor.swift; sourceTree = "<group>"; };
 		51FDA2CDBFB20CE5195B1A76 /* PhotoSelectionModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoSelectionModelTests.swift; sourceTree = "<group>"; };
 		5389FA7123038434F19CE8FC /* ContactMutationServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactMutationServiceTests.swift; sourceTree = "<group>"; };
-		594128439C64BC2C9B6A0471 /* Netto.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Netto.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		58BF7F59EB83C7C0BBC26E18 /* NettoAtmosphere.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoAtmosphere.swift; sourceTree = "<group>"; };
+		594128439C64BC2C9B6A0471 /* Netto.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Netto.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5BCCEF4B411E88BE77EBD2EA /* PhotoLibraryPermissionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoLibraryPermissionService.swift; sourceTree = "<group>"; };
+		5EEC76BB95F0D6D22D643566 /* NettoCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoCard.swift; sourceTree = "<group>"; };
 		619C162A4F1D1818F86968BE /* SimilarPhotosPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimilarPhotosPresentation.swift; sourceTree = "<group>"; };
 		6273716B9AE4DFA884205011 /* ContactStoreReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactStoreReader.swift; sourceTree = "<group>"; };
 		64FCCD23E5A31301B125E973 /* StorageProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StorageProvider.swift; sourceTree = "<group>"; };
 		668B4D6E0B71B9D844D2E4B2 /* ReviewSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewSelectionView.swift; sourceTree = "<group>"; };
+		69534467960C13C113EC033C /* NettoInteractions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoInteractions.swift; sourceTree = "<group>"; };
 		6A7CEA3185941831E7AB52EA /* ScreenshotDataset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotDataset.swift; sourceTree = "<group>"; };
+		6A9A42241313C34BC3267093 /* DashboardCategoryCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardCategoryCard.swift; sourceTree = "<group>"; };
+		6AEAFCDB7274C61F1A627A8B /* DashboardLayoutQATests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardLayoutQATests.swift; sourceTree = "<group>"; };
+		6CEF4C4EF27F8E8D068CA7DE /* DashboardPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardPresentation.swift; sourceTree = "<group>"; };
+		6DD74ED5A05947717DBFA025 /* NettoLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoLogo.swift; sourceTree = "<group>"; };
 		6FE893E2B201D24B3E55898E /* ScanPhase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanPhase.swift; sourceTree = "<group>"; };
+		721F6F695392BAAFA1FAE163 /* NettoGlass.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoGlass.swift; sourceTree = "<group>"; };
+		74D3BAF90E308ABE769F2A1C /* NettoNavigation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoNavigation.swift; sourceTree = "<group>"; };
 		76F7818E681D32F084ECD5E2 /* DeletionPlanTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionPlanTests.swift; sourceTree = "<group>"; };
+		780332EB9BA868FEB411D32A /* NettoLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoLayout.swift; sourceTree = "<group>"; };
 		782618DD5E3E12F62E979A2B /* ContactNormalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactNormalization.swift; sourceTree = "<group>"; };
 		7916DB01B5E75934E46F93CF /* ContactActionPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactActionPlan.swift; sourceTree = "<group>"; };
 		79397A40046B7AFA13ABDF4D /* CandidateBucketsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CandidateBucketsTests.swift; sourceTree = "<group>"; };
@@ -179,22 +227,27 @@
 		84AADD4415ED6A64E9AB8BFE /* PhotoDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoDetailView.swift; sourceTree = "<group>"; };
 		87EA3125EC9E458C82A87DAA /* DeletionFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionFlowTests.swift; sourceTree = "<group>"; };
 		88A2960506DCA5F74BE7F5FA /* VideoSizeResolution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoSizeResolution.swift; sourceTree = "<group>"; };
+		8C5B33511B6D3B3E67103D8C /* NettoProgressPanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoProgressPanel.swift; sourceTree = "<group>"; };
 		8C94B6C90DD71A357D971F7D /* ContactGroupDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactGroupDetailView.swift; sourceTree = "<group>"; };
+		8D531A076C2BD1D08B966BA9 /* AnalysisProgressReporterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnalysisProgressReporterTests.swift; sourceTree = "<group>"; };
 		903CE4AACA1DD677B1EF0FC4 /* ContactRecord.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactRecord.swift; sourceTree = "<group>"; };
 		915A8A98769292540909E275 /* PreviewData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewData.swift; sourceTree = "<group>"; };
 		93CC37536EFB4F317F2DD204 /* PhotoKitContentFingerprinterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoKitContentFingerprinterTests.swift; sourceTree = "<group>"; };
 		93D289904B8C2B4E6C3AF0DA /* ContactGroupSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactGroupSelection.swift; sourceTree = "<group>"; };
 		943F7FE812E150FB04ED08A0 /* PhotoLibraryProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoLibraryProvider.swift; sourceTree = "<group>"; };
 		946932D807CD166442661DCC /* BestPhotoScoringTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BestPhotoScoringTests.swift; sourceTree = "<group>"; };
+		9863FFAE404989F2BFD47AE3 /* NettoSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoSurface.swift; sourceTree = "<group>"; };
 		998225ABFF03688423C72365 /* SimilarPhotoGroupRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimilarPhotoGroupRow.swift; sourceTree = "<group>"; };
+		9BBBFC9ABF53B3041346DCA4 /* DashboardHeroView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardHeroView.swift; sourceTree = "<group>"; };
 		9D4311B4AAB22E0B78ABCE8F /* VideoPreviewLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPreviewLoader.swift; sourceTree = "<group>"; };
 		A3C5715E605D7649B58356D2 /* DatasetSelectionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatasetSelectionModel.swift; sourceTree = "<group>"; };
 		A42507B99358B78FF150FFE1 /* ScanResultSummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanResultSummary.swift; sourceTree = "<group>"; };
+		A6BE278DE6D0620001F67557 /* NettoUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = NettoUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A717930C7B8C70586F273164 /* PhotoSelectionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoSelectionModel.swift; sourceTree = "<group>"; };
 		A83DBFA570B7D1FC8C1B982E /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		AACD4E43A703745217ADDF51 /* AppEnvironment+Contacts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppEnvironment+Contacts.swift"; sourceTree = "<group>"; };
 		AC5F3EE89D5A9D59F323B80A /* PhotoKitThumbnailLoaderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoKitThumbnailLoaderTests.swift; sourceTree = "<group>"; };
-		AE519B787BA6F89B1633FEE2 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		AE519B787BA6F89B1633FEE2 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		AF585D09B7C82CD64963379A /* FoundationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoundationTests.swift; sourceTree = "<group>"; };
 		AF81AAA90B7718CFFC6FB54B /* ContactNormalizationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactNormalizationTests.swift; sourceTree = "<group>"; };
 		B1053E09D9E26BB566294829 /* PendingPhotoRequestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingPhotoRequestTests.swift; sourceTree = "<group>"; };
@@ -213,11 +266,16 @@
 		D202FD6123AE5CF299B9590F /* PermissionTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionTypes.swift; sourceTree = "<group>"; };
 		D4C3811C0C4DF160CF71D045 /* FixturePhotoLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixturePhotoLibrary.swift; sourceTree = "<group>"; };
 		D6662A39D7662110C5E4CB91 /* ScreenshotSelectionModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenshotSelectionModel.swift; sourceTree = "<group>"; };
+		D8A0439E1B2492A97304CA02 /* NettoIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoIcon.swift; sourceTree = "<group>"; };
 		DA6E0C90E92F3A5F86C9A812 /* PhotoAnalysisModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoAnalysisModels.swift; sourceTree = "<group>"; };
 		DA895F9E25A15E30C6DF6CA4 /* DuplicateContactsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DuplicateContactsView.swift; sourceTree = "<group>"; };
+		DECDA9F4AA190F690330183B /* DashboardFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardFlowTests.swift; sourceTree = "<group>"; };
+		DF7C687FB908F227988B8DB7 /* NettoType.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoType.swift; sourceTree = "<group>"; };
 		E1D60DA68E726F32FE29F9ED /* CleanupCategory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CleanupCategory.swift; sourceTree = "<group>"; };
+		E675B10339B490666965C9DC /* DashboardScanStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardScanStatus.swift; sourceTree = "<group>"; };
 		E7E42F1A6842109414056DC3 /* DeletionServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeletionServiceTests.swift; sourceTree = "<group>"; };
 		E82042FCC36E879AB7C286B5 /* SimilarPhotosView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimilarPhotosView.swift; sourceTree = "<group>"; };
+		E9711A84D071C58540D097B0 /* ScanValidationUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScanValidationUITests.swift; sourceTree = "<group>"; };
 		EBE3A4CE30F4416BF49C15E8 /* ThumbnailStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailStoreTests.swift; sourceTree = "<group>"; };
 		F180C4F89499F0F7864F0E31 /* PhotoSimilarityEngineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoSimilarityEngineTests.swift; sourceTree = "<group>"; };
 		F19491E522F255118DACCB6E /* VideoDataset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoDataset.swift; sourceTree = "<group>"; };
@@ -233,6 +291,8 @@
 		1431D4EFF64419B66E77009D /* UI */ = {
 			isa = PBXGroup;
 			children = (
+				8100D52F9486BD42B40803E4 /* Brand */,
+				B4799BEC2622B1E0E0B178B1 /* DesignSystem */,
 				986758EBDF75F7A4D5A84CA8 /* Theme */,
 			);
 			path = UI;
@@ -297,6 +357,7 @@
 			children = (
 				594128439C64BC2C9B6A0471 /* Netto.app */,
 				BD56D425E7D69DD8688AE332 /* NettoTests.xctest */,
+				A6BE278DE6D0620001F67557 /* NettoUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -320,6 +381,15 @@
 			path = Photos;
 			sourceTree = "<group>";
 		};
+		4BBF42A15B85DDD5F4AB1979 /* NettoUITests */ = {
+			isa = PBXGroup;
+			children = (
+				6AEAFCDB7274C61F1A627A8B /* DashboardLayoutQATests.swift */,
+				E9711A84D071C58540D097B0 /* ScanValidationUITests.swift */,
+			);
+			path = NettoUITests;
+			sourceTree = "<group>";
+		};
 		63D465293441E997B76206EE /* App */ = {
 			isa = PBXGroup;
 			children = (
@@ -336,6 +406,10 @@
 		6606EA4E1CE0C97B7FB352A8 /* Dashboard */ = {
 			isa = PBXGroup;
 			children = (
+				6A9A42241313C34BC3267093 /* DashboardCategoryCard.swift */,
+				9BBBFC9ABF53B3041346DCA4 /* DashboardHeroView.swift */,
+				6CEF4C4EF27F8E8D068CA7DE /* DashboardPresentation.swift */,
+				E675B10339B490666965C9DC /* DashboardScanStatus.swift */,
 				4BF2EAEE97F67E474801542C /* DashboardView.swift */,
 			);
 			path = Dashboard;
@@ -355,6 +429,7 @@
 			children = (
 				3748CBDCD0BA1311124CF910 /* Netto */,
 				94EFC6E5E6C8AEAEA78AA62B /* NettoTests */,
+				4BBF42A15B85DDD5F4AB1979 /* NettoUITests */,
 				42C81FE5009045C73FE7964E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -385,6 +460,14 @@
 			path = Analysis;
 			sourceTree = "<group>";
 		};
+		8100D52F9486BD42B40803E4 /* Brand */ = {
+			isa = PBXGroup;
+			children = (
+				6DD74ED5A05947717DBFA025 /* NettoLogo.swift */,
+			);
+			path = Brand;
+			sourceTree = "<group>";
+		};
 		8F58C2E9142A1BB65082B24F /* Photos */ = {
 			isa = PBXGroup;
 			children = (
@@ -410,6 +493,7 @@
 		94EFC6E5E6C8AEAEA78AA62B /* NettoTests */ = {
 			isa = PBXGroup;
 			children = (
+				8D531A076C2BD1D08B966BA9 /* AnalysisProgressReporterTests.swift */,
 				946932D807CD166442661DCC /* BestPhotoScoringTests.swift */,
 				79397A40046B7AFA13ABDF4D /* CandidateBucketsTests.swift */,
 				83293904F7829127DA7E399F /* ContactActionPlanTests.swift */,
@@ -418,12 +502,14 @@
 				AF81AAA90B7718CFFC6FB54B /* ContactNormalizationTests.swift */,
 				FAE0964D824EC5D59B2527A2 /* ContactsFlowTests.swift */,
 				3C376C12DF3E6CB22CBF9FD5 /* ContentFingerprintTests.swift */,
+				DECDA9F4AA190F690330183B /* DashboardFlowTests.swift */,
 				87EA3125EC9E458C82A87DAA /* DeletionFlowTests.swift */,
 				76F7818E681D32F084ECD5E2 /* DeletionPlanTests.swift */,
 				E7E42F1A6842109414056DC3 /* DeletionServiceTests.swift */,
 				0FC6DE6CB7EF6EC2B6ADAEB0 /* DeletionStateTests.swift */,
 				414C49886FBC1A85F0F7FE2C /* FeaturePrintTests.swift */,
 				AF585D09B7C82CD64963379A /* FoundationTests.swift */,
+				3DF5AA15881D09FD35F6C932 /* MotionSystemTests.swift */,
 				B1053E09D9E26BB566294829 /* PendingPhotoRequestTests.swift */,
 				247D387ED1588AB57AE00C27 /* PhotoCatalogTests.swift */,
 				93CC37536EFB4F317F2DD204 /* PhotoKitContentFingerprinterTests.swift */,
@@ -471,6 +557,28 @@
 				CD717EE2AF7EABF4CD7774F0 /* VideosView.swift */,
 			);
 			path = Videos;
+			sourceTree = "<group>";
+		};
+		B4799BEC2622B1E0E0B178B1 /* DesignSystem */ = {
+			isa = PBXGroup;
+			children = (
+				217215D82EE3B2BD60879A69 /* DesignSystemGallery.swift */,
+				58BF7F59EB83C7C0BBC26E18 /* NettoAtmosphere.swift */,
+				39920F8E8FF8D44A43EA5A3E /* NettoButtonStyles.swift */,
+				5EEC76BB95F0D6D22D643566 /* NettoCard.swift */,
+				513F8DAB1340C2E4EC3B9676 /* NettoColor.swift */,
+				721F6F695392BAAFA1FAE163 /* NettoGlass.swift */,
+				D8A0439E1B2492A97304CA02 /* NettoIcon.swift */,
+				69534467960C13C113EC033C /* NettoInteractions.swift */,
+				780332EB9BA868FEB411D32A /* NettoLayout.swift */,
+				3F15198B7EE3E10DBF80F621 /* NettoLogoMotion.swift */,
+				2142BBEC3AD24E2C2AE75DE9 /* NettoMotion.swift */,
+				74D3BAF90E308ABE769F2A1C /* NettoNavigation.swift */,
+				8C5B33511B6D3B3E67103D8C /* NettoProgressPanel.swift */,
+				9863FFAE404989F2BFD47AE3 /* NettoSurface.swift */,
+				DF7C687FB908F227988B8DB7 /* NettoType.swift */,
+			);
+			path = DesignSystem;
 			sourceTree = "<group>";
 		};
 		C2EA01FA3D7CAB376E6C06E0 /* Permissions */ = {
@@ -546,6 +654,24 @@
 			productReference = BD56D425E7D69DD8688AE332 /* NettoTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		3C714AD286ED2BDA2ECCDF58 /* NettoUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 756FBA215D8090B6C8017DB3 /* Build configuration list for PBXNativeTarget "NettoUITests" */;
+			buildPhases = (
+				FC474C70710D34091532F003 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5033A8136FF2B69D4406D708 /* PBXTargetDependency */,
+			);
+			name = NettoUITests;
+			packageProductDependencies = (
+			);
+			productName = NettoUITests;
+			productReference = A6BE278DE6D0620001F67557 /* NettoUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		3E18C8E14263B709C87035B4 /* Netto */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 24DD015A60A646C7024E6C5E /* Build configuration list for PBXNativeTarget "Netto" */;
@@ -577,8 +703,12 @@
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
-					3E18C8E14263B709C87035B4 = {
+					3C714AD286ED2BDA2ECCDF58 = {
 						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+						TestTargetID = 3E18C8E14263B709C87035B4;
+					};
+					3E18C8E14263B709C87035B4 = {
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -599,6 +729,7 @@
 			targets = (
 				3E18C8E14263B709C87035B4 /* Netto */,
 				187411129C89294BCB00AE9F /* NettoTests */,
+				3C714AD286ED2BDA2ECCDF58 /* NettoUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -620,6 +751,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EFD9FC4DA084C4C7D24D2CE9 /* AnalysisProgressReporterTests.swift in Sources */,
 				BED43FEE68D05A9BB8B1EEBD /* BestPhotoScoringTests.swift in Sources */,
 				E27A7E3A02AB9E0FC5D0F241 /* CandidateBucketsTests.swift in Sources */,
 				E68175C74BC0D231427C12C5 /* ContactActionPlanTests.swift in Sources */,
@@ -628,12 +760,14 @@
 				88E0DFDC08AFCF5B8C606238 /* ContactNormalizationTests.swift in Sources */,
 				E85168B9C0BF4D27229B13E9 /* ContactsFlowTests.swift in Sources */,
 				042F5E4296C65CFA5E2055D3 /* ContentFingerprintTests.swift in Sources */,
+				AA0D2CF6DDE2EDB87DCCD1AB /* DashboardFlowTests.swift in Sources */,
 				CDEB41BC84DCF7808C1FE6B9 /* DeletionFlowTests.swift in Sources */,
 				91B69BFAC804F27BEBB3F95E /* DeletionPlanTests.swift in Sources */,
 				CFB36EFE2384EFBEC42DEC4D /* DeletionServiceTests.swift in Sources */,
 				F61FA8F08C5333C9CEB40F7A /* DeletionStateTests.swift in Sources */,
 				3935CD5A17EEB98A2D2898B7 /* FeaturePrintTests.swift in Sources */,
 				551F4EB5F30AFDB83F7D323D /* FoundationTests.swift in Sources */,
+				0C03FDD362EF90AE248B0E75 /* MotionSystemTests.swift in Sources */,
 				91259EE930151B42586986EC /* PendingPhotoRequestTests.swift in Sources */,
 				DDB6EDB8DAC0AEDE4340863D /* PhotoCatalogTests.swift in Sources */,
 				F37088C35C7874EE40C139E3 /* PhotoKitContentFingerprinterTests.swift in Sources */,
@@ -677,17 +811,37 @@
 				102A364614DB97CDDDAFFF4E /* ContactsPermissionService.swift in Sources */,
 				8572BC6CF3C588E13FE6F974 /* ContactsPresentation.swift in Sources */,
 				AD0F17C6DC169E94352EBD92 /* ContentFingerprint.swift in Sources */,
+				0DFC2593A97627368813EEA6 /* DashboardCategoryCard.swift in Sources */,
+				7D64765926A41006B21BF546 /* DashboardHeroView.swift in Sources */,
+				85764689F2A72E2A8BD07A4B /* DashboardPresentation.swift in Sources */,
+				6485AFAD23F1870F3AED0618 /* DashboardScanStatus.swift in Sources */,
 				605D6C5F0E89DB24302114E6 /* DashboardView.swift in Sources */,
 				8FC6D0A3E63A5B9E25650846 /* DatasetSelectionModel.swift in Sources */,
 				6BDF0396CCFC385DB76C2FE9 /* DeletionPlan.swift in Sources */,
 				462AD510CB428CD390BCCBA3 /* DeletionPlanner.swift in Sources */,
 				E22F04471698C27FF7AEB7E3 /* DeletionPresentation.swift in Sources */,
 				38772CABF1097FEFE2E41A21 /* DeletionState.swift in Sources */,
+				F9464636A74319D6D4E55275 /* DesignSystemGallery.swift in Sources */,
 				4C11916AF4AB42A237F813DC /* DuplicateContactsView.swift in Sources */,
 				60DDF322DF698CA658F87958 /* FeaturePrint.swift in Sources */,
 				90B74A7491C111215C79C00F /* FixtureContacts.swift in Sources */,
 				AFDD01D15A02C9FDE0B920A4 /* FixturePhotoLibrary.swift in Sources */,
 				D09031F6FF7BCD4F453F9426 /* NettoApp.swift in Sources */,
+				6DA04C02B18BF8CDD29C88BA /* NettoAtmosphere.swift in Sources */,
+				7DC75078F59F713664506B54 /* NettoButtonStyles.swift in Sources */,
+				5C84F1014A2A586D33F57CD0 /* NettoCard.swift in Sources */,
+				6F8C8C32ABCB1072B54BC1BC /* NettoColor.swift in Sources */,
+				C3BD2EA9ECBE0712F2D2ACBE /* NettoGlass.swift in Sources */,
+				86947FF8D2E2B28D418BE927 /* NettoIcon.swift in Sources */,
+				1F11C6DE772CD74084F73773 /* NettoInteractions.swift in Sources */,
+				84BC635EB579BDF6C84062F5 /* NettoLayout.swift in Sources */,
+				AD9620E4263BBC8EA0158F7A /* NettoLogo.swift in Sources */,
+				739D22C33A4D3E4CE784F6AE /* NettoLogoMotion.swift in Sources */,
+				B75A864B9BBAAF364A3B2710 /* NettoMotion.swift in Sources */,
+				5D958438008966CC9B777BE8 /* NettoNavigation.swift in Sources */,
+				5DDFB3AABDD81399E6DF6691 /* NettoProgressPanel.swift in Sources */,
+				14AC0B31E3D68C8337F54EA7 /* NettoSurface.swift in Sources */,
+				4207466C9D80DBA8D9D03C92 /* NettoType.swift in Sources */,
 				869B8617D698F3EAD625B40D /* PendingPhotoRequest.swift in Sources */,
 				366EE930F5E2B80BCF0FBDD4 /* PermissionTypes.swift in Sources */,
 				2555162948995CBCC4640006 /* PhotoAnalysisInstrumentation.swift in Sources */,
@@ -730,9 +884,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		FC474C70710D34091532F003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6458D60CD6159929159D8F00 /* DashboardLayoutQATests.swift in Sources */,
+				D6EFA8ABD848333A6C7B10C1 /* ScanValidationUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		5033A8136FF2B69D4406D708 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 3E18C8E14263B709C87035B4 /* Netto */;
+			targetProxy = 1A723A46EB39DE3118948119 /* PBXContainerItemProxy */;
+		};
 		57F937E537A336E5B8377F35 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 3E18C8E14263B709C87035B4 /* Netto */;
@@ -751,10 +919,27 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.netto.app.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.tests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Netto.app/Netto";
+			};
+			name = Release;
+		};
+		99D9797B1BF2776C56A31DD3 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.uitests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Netto;
 			};
 			name = Release;
 		};
@@ -768,7 +953,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.netto.app.tests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.tests;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Netto.app/Netto";
@@ -848,6 +1033,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 47JUYY9KHQ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Netto/Info.plist;
@@ -855,7 +1041,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.netto.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto;
 				PRODUCT_NAME = Netto;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -869,6 +1055,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 47JUYY9KHQ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Netto/Info.plist;
@@ -876,10 +1063,27 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.netto.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto;
 				PRODUCT_NAME = Netto;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		EDA76F9986B7FE0DBEEB7456 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.uitests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = Netto;
 			};
 			name = Debug;
 		};
@@ -973,6 +1177,15 @@
 			buildConfigurations = (
 				EFD6B5FC94FD1FA3B6EF5252 /* Debug */,
 				A925E81D6835AB62FDA35D3B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		756FBA215D8090B6C8017DB3 /* Build configuration list for PBXNativeTarget "NettoUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EDA76F9986B7FE0DBEEB7456 /* Debug */,
+				99D9797B1BF2776C56A31DD3 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

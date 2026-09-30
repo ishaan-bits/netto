@@ -258,7 +258,22 @@ final class AppEnvironment: ObservableObject {
         )
 
         let builder = PhotoCatalogBuilder()
+        #if DEBUG
+        // M4B validation hook: `NETTO_SCAN_METRICS=1` injects the signpost observer and the
+        // metrics recorder so an end-to-end run can be measured from `log stream`. Production
+        // never sets the variable; without it the engine is exactly as before (no telemetry).
+        let engine: PhotoSimilarityEngine
+        if ProcessInfo.processInfo.environment["NETTO_SCAN_METRICS"] == "1" {
+            engine = PhotoSimilarityEngine(
+                stageObserver: SignpostStageObserver(),
+                metrics: AnalysisMetrics()
+            )
+        } else {
+            engine = PhotoSimilarityEngine()
+        }
+        #else
         let engine = PhotoSimilarityEngine()
+        #endif
 
         analysisTask = Task { [weak self] in
             guard let self else { return }

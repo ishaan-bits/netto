@@ -26,7 +26,10 @@ struct SimilarPhotosView: View {
 
     var body: some View {
         content
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Similar Photos")
+            .nettoAppear()
+            .nettoStateTransition(phaseID)
             .onAppear { env.refreshPermissions() }
             .sheet(item: $detailTarget) { target in
                 PhotoDetailView(group: target.group, assetID: target.assetID)
@@ -122,26 +125,7 @@ struct SimilarPhotosView: View {
         fraction: Double?,
         cancel: @escaping () -> Void
     ) -> some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
-            if let fraction {
-                ProgressView(value: fraction)
-                    .progressViewStyle(.linear)
-                    .tint(Theme.Palette.accent)
-                    .frame(maxWidth: 260)
-            } else {
-                ProgressView()
-            }
-            Text(message)
-                .font(.subheadline)
-                .monospacedDigit()
-                .multilineTextAlignment(.center)
-            Button("Cancel", action: cancel)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            Spacer()
-        }
-        .padding(.horizontal, Theme.Spacing.xl)
+        NettoProgressPanel(message: message, fraction: fraction, cancel: cancel)
     }
 
     // MARK: Results
@@ -201,6 +185,8 @@ struct SimilarPhotosView: View {
                 }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NettoColor.background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) {
             selectionBar
         }
@@ -295,6 +281,7 @@ struct SimilarPhotosView: View {
                 Text("\(env.selection.selectedCount) photos selected")
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
+                    .nettoCount(env.selection.selectedCount)
                 Text("Nothing is deleted yet")
                     .font(.caption2)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
@@ -306,12 +293,29 @@ struct SimilarPhotosView: View {
                 ReviewSelectionView()
             } label: {
                 Text("Review")
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(NettoPrimaryButtonStyle())
             .disabled(env.selection.selectedCount == 0)
+            .opacity(env.selection.selectedCount == 0 ? 0.45 : 1)
         }
-        .padding(Theme.Spacing.md)
-        .background(.bar)
+        .nettoFloatingBar()
+    }
+
+    /// The state *category* on screen — never the payload, so a progress tick or a changing
+    /// error string cannot remount the screen.
+    private var phaseID: String {
+        switch phase {
+        case .permissionRequired: return "permissionRequired"
+        case .permissionDenied: return "permissionDenied"
+        case .idle: return "idle"
+        case .buildingCatalog: return "buildingCatalog"
+        case .analyzing: return "analyzing"
+        case .cancelled: return "cancelled"
+        case .failed: return "failed"
+        case .emptyLibrary: return "emptyLibrary"
+        case .results: return "results"
+        }
     }
 
     // MARK: Helpers
@@ -328,7 +332,8 @@ struct SimilarPhotosView: View {
     }
 }
 
-/// Shared full-screen state view for the non-results phases (also used by ScreenshotsView).
+/// Shared full-screen state view for the non-results phases (also used by ScreenshotsView,
+/// VideosView, and DuplicateContactsView).
 struct PhaseMessage: View {
     let systemImage: String
     let title: String
@@ -336,28 +341,47 @@ struct PhaseMessage: View {
     var buttonTitle: String?
     var buttonAction: () -> Void = {}
 
+    private var isPositive: Bool {
+        systemImage.hasPrefix("checkmark") || systemImage.hasPrefix("person.crop.circle.badge")
+    }
+
     var body: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer(minLength: Theme.Spacing.xl)
-            Image(systemName: systemImage)
-                .font(.system(size: 44))
-                .foregroundStyle(Theme.Palette.accent)
+        VStack(spacing: NettoLayout.Spacing.lg) {
+            Spacer(minLength: NettoLayout.Spacing.xl)
+
+            ZStack {
+                Circle()
+                    .fill((isPositive ? NettoColor.success : NettoColor.brand).opacity(0.16))
+                    .frame(width: 96, height: 96)
+                Image(systemName: systemImage)
+                    .font(.system(size: 38, weight: .semibold))
+                    .foregroundStyle(isPositive ? NettoColor.success : NettoColor.brand)
+                    .nettoSuccessPop(isPositive)
+            }
+            .accessibilityHidden(true)
+
             Text(title)
-                .font(.title3.weight(.semibold))
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
                 .multilineTextAlignment(.center)
+
             Text(message)
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.secondaryBody)
+                .foregroundStyle(NettoColor.textSecondary)
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, Theme.Spacing.xl)
+                .lineSpacing(3)
+                .padding(.horizontal, NettoLayout.Spacing.xl)
+
             if let buttonTitle {
                 Button(buttonTitle, action: buttonAction)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                    .buttonStyle(NettoPrimaryButtonStyle())
+                    .padding(.horizontal, NettoLayout.Spacing.xl)
             }
-            Spacer(minLength: Theme.Spacing.xl)
+
+            Spacer(minLength: NettoLayout.Spacing.xl)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .nettoAppear()
     }
 }
 

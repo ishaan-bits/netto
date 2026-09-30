@@ -55,12 +55,17 @@ private func grayLevel(of image: CGImage) -> Int {
 private struct StubFingerprinter: ContentFingerprinting {
     var byteKeyOutcomes: [String: ContentLengthOutcome] = [:]
     var fingerprintOutcomes: [String: ContentFingerprintOutcome] = [:]
+    /// Asset ids whose phase-1 probe throws instead of resolving (drives the timeout path).
+    var byteKeyThrowingIDs: Set<String> = []
     /// Delay for phase 1, used to keep a run in flight while a test cancels it.
     var phaseOneDelayNanos: UInt64 = 0
 
     func byteKey(for record: PhotoAssetRecord) async throws -> ContentLengthOutcome {
         if phaseOneDelayNanos > 0 {
             try await Task.sleep(nanoseconds: phaseOneDelayNanos)
+        }
+        if byteKeyThrowingIDs.contains(record.localIdentifier) {
+            throw PhotoRequestTimeoutError()
         }
         if let outcome = byteKeyOutcomes[record.localIdentifier] {
             return outcome
@@ -88,8 +93,13 @@ private struct StubFingerprinter: ContentFingerprinting {
 
 private struct StubThumbnails: PhotoThumbnailLoading {
     var failures: [String: PhotoContentError] = [:]
+    /// Asset ids whose thumbnail request hangs past the failsafe (throws the timeout error).
+    var timeoutIDs: Set<String> = []
 
     func thumbnail(for assetID: String, targetPixelSize: Int) async throws -> CGImage {
+        if timeoutIDs.contains(assetID) {
+            throw PhotoRequestTimeoutError()
+        }
         if let failure = failures[assetID] {
             throw failure
         }
@@ -644,6 +654,85 @@ struct PhotoSimilarityEngineTests {
         // Indeterminate stages never claim a fraction.
         let candidateEvents = events.filter { $0.stage == .generatingCandidates }
         #expect(candidateEvents.allSatisfy { $0.fraction == nil })
+    }
+
+    @Test func fingerprintingProgressTicksThroughTheLongFirstPhase() async throws {
+        // The regression this pins: phase 1 (a PhotoKit round trip per asset) used to report
+        // nothing until every asset was done, so the dashboard sat at "Fingerprinting 0 of N"
+        // for the whole phase. With a slowed phase 1, intermediate events must appear.
+        var fingerprinter = StubFingerprinter()
+        fingerprinter.phaseOneDelayNanos = 20_000_000 // 20 ms × 40 assets ÷ 2 workers ≈ 400 ms
+        let log = ProgressLog()
+        let engine = makeEngine(fingerprinter: fingerprinter, workers: 2)
+        let records = (0..<40).map { makeRecord(id: "photo-\($0)") }
+
+        _ = try await engine.analyze(records: records, onProgress: { log.append($0) })
+
+        let events = log.snapshot.filter { $0.stage == .fingerprinting }
+        #expect(!events.isEmpty)
+        let intermediate = events.filter {
+            $0.completedUnits > 0 && $0.completedUnits < $0.totalUnits
+        }
+        #expect(!intermediate.isEmpty, "phase 1 never reported movement — the scan would look frozen")
+        #expect(events.last?.completedUnits == events.last?.totalUnits)
+    }
+
+    @Test func byteLengthCollisionsGrowTheFingerprintingTotalAndCompleteExactly() async throws {
+        // Two assets share a byte key → phase 2 hashes them. The total must grow by the
+        // collision count so hashing still ticks, progress stays monotonic, and the stage
+        // ends exactly at completed == total.
+        var fingerprinter = StubFingerprinter()
+        let sharedKey = ContentByteKey(imageBytes: 777, videoBytes: 0)
+        let sharedFingerprint = ContentFingerprint(
+            imageBytes: 777,
+            videoBytes: 0,
+            imageDigestHex: "shared",
+            videoDigestHex: nil
+        )
+        fingerprinter.byteKeyOutcomes["photo-1"] = .key(sharedKey)
+        fingerprinter.byteKeyOutcomes["photo-2"] = .key(sharedKey)
+        fingerprinter.fingerprintOutcomes["photo-1"] = .fingerprinted(sharedFingerprint)
+        fingerprinter.fingerprintOutcomes["photo-2"] = .fingerprinted(sharedFingerprint)
+
+        let log = ProgressLog()
+        let engine = makeEngine(fingerprinter: fingerprinter, workers: 2)
+        let records = ["photo-0", "photo-1", "photo-2", "photo-3"].map { makeRecord(id: $0) }
+        let result = try await engine.analyze(records: records, onProgress: { log.append($0) })
+
+        let events = log.snapshot.filter { $0.stage == .fingerprinting }
+        #expect(events.last?.completedUnits == 6) // 4 byte-key probes + 2 hashes
+        #expect(events.last?.totalUnits == 6)
+        var lastCompleted = -1
+        for event in events {
+            #expect(
+                event.completedUnits >= lastCompleted,
+                "fingerprinting went backwards: \(event.completedUnits) after \(lastCompleted)"
+            )
+            lastCompleted = event.completedUnits
+        }
+        #expect(result.exactGroups.count == 1)
+        #expect(Set(result.exactGroups[0].memberAssetIDs) == ["photo-1", "photo-2"])
+    }
+
+    @Test func timedOutRequestsAreSkippedAndTheRunStillCompletes() async throws {
+        // A request that hangs past the failsafe arrives here as `PhotoRequestTimeoutError`.
+        // The asset must be recorded as unavailable with a reason and the pipeline must
+        // reach a terminal state — never stall waiting for the hung callback.
+        var fingerprinter = StubFingerprinter()
+        fingerprinter.byteKeyThrowingIDs = ["photo-9"]
+        var thumbnails = StubThumbnails()
+        thumbnails.timeoutIDs = ["photo-11"]
+
+        let engine = makeEngine(fingerprinter: fingerprinter, thumbnails: thumbnails)
+        let records = ["photo-0", "photo-9", "photo-11"].map { makeRecord(id: $0) }
+        let result = try await engine.analyze(records: records)
+
+        let reasons = Dictionary(
+            uniqueKeysWithValues: result.unavailableAssets.map { ($0.assetID, $0.reason) }
+        )
+        #expect(reasons["photo-9"] == .contentUnreadable)
+        #expect(reasons["photo-11"] == .imageUnavailable)
+        #expect(result.totalRecordCount == 3)
     }
 
     @Test func defaultThresholdsApplyWhenConfigurationOmitsOne() async throws {

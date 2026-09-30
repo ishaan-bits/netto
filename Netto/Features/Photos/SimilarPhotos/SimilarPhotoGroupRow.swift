@@ -25,8 +25,9 @@ struct SimilarPhotoGroupRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-            header
+            // Media first: the photos are the reason this row exists, so they lead.
             strip
+            header
             footer
         }
         .padding(.vertical, Theme.Spacing.xs)
@@ -39,9 +40,10 @@ struct SimilarPhotoGroupRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(NettoColor.textPrimary)
                 Text(evidenceText)
                     .font(.caption)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
+                    .foregroundStyle(NettoColor.textSecondary)
             }
             Spacer(minLength: Theme.Spacing.sm)
             Menu {
@@ -51,7 +53,7 @@ struct SimilarPhotoGroupRow: View {
             } label: {
                 Image(systemName: "ellipsis.circle")
                     .font(.title3)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
+                    .foregroundStyle(NettoColor.textTertiary)
             }
             .accessibilityLabel("Group actions")
         }
@@ -96,13 +98,13 @@ struct SimilarPhotoGroupRow: View {
             Button {
                 onOpenDetail(assetID)
             } label: {
-                PhotoThumbnailView(assetID: assetID, pointSize: 96, store: store)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.sm))
+                PhotoThumbnailView(assetID: assetID, pointSize: 112, store: store)
+                    .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous))
                     .overlay {
-                        RoundedRectangle(cornerRadius: Theme.Radius.sm)
+                        RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
                             .stroke(
-                                selected ? Theme.Palette.accent : Theme.Palette.separator,
-                                lineWidth: selected ? 2 : 1
+                                selected ? NettoColor.brand : Theme.Palette.separator,
+                                lineWidth: selected ? 2.5 : 1
                             )
                     }
                     .overlay(alignment: .bottomLeading) {
@@ -111,36 +113,38 @@ struct SimilarPhotoGroupRow: View {
                         }
                     }
             }
-            .buttonStyle(.plain)
+            .nettoPress()
             .accessibilityLabel(recommended ? "Photo details, recommended to keep" : "Photo details")
 
             Button {
                 onToggle(assetID)
             } label: {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.system(size: 17, weight: .bold))
                     .foregroundStyle(Color.white)
-                    .padding(5)
+                    .padding(6)
                     .background(
-                        selected ? Theme.Palette.accent : Color.black.opacity(0.45),
+                        selected ? NettoColor.brand : Color.black.opacity(0.45),
                         in: Circle()
                     )
-                    .padding(4)
+                    .padding(6)
+                    .transition(.scale(scale: 0.5).combined(with: .opacity))
             }
-            .buttonStyle(.plain)
+            .nettoPress()
             .accessibilityLabel(selected ? "Selected for cleanup" : "Not selected")
         }
-        .frame(width: 96, height: 96)
+        .frame(width: 112, height: 112)
+        .nettoAnimate(.selection, value: selected)
     }
 
     private var keepBadge: some View {
         Text("KEEP")
             .font(.system(size: 9, weight: .heavy))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(Theme.Palette.success, in: Capsule())
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(NettoColor.success, in: Capsule())
             .foregroundStyle(.white)
-            .padding(4)
+            .padding(5)
             .accessibilityLabel("Recommended to keep")
     }
 
@@ -151,12 +155,12 @@ struct SimilarPhotoGroupRow: View {
             Text(selectionText)
                 .font(.caption)
                 .monospacedDigit()
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .foregroundStyle(NettoColor.textSecondary)
             Spacer()
             if isRecommendedKept {
                 Label("Best photo kept", systemImage: "star.fill")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Theme.Palette.success)
+                    .foregroundStyle(NettoColor.success)
             }
         }
     }

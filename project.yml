@@ -1,6 +1,6 @@
 name: Netto
 options:
-  bundleIdPrefix: com.netto
+  bundleIdPrefix: com.ishaanparimal
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
@@ -29,7 +29,7 @@ targets:
       - path: Netto
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.netto.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.ishaanparimal.netto
         PRODUCT_NAME: Netto
         INFOPLIST_FILE: Netto/Info.plist
         GENERATE_INFOPLIST_FILE: NO
@@ -46,7 +46,21 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: com.netto.app.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.ishaanparimal.netto.tests
+    dependencies:
+      - target: Netto
+
+  # TEMPORARY visual-QA target — removed at the end of the Milestone 3D QA run.
+  NettoUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: NettoUITests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.ishaanparimal.netto.uitests
+        TEST_TARGET_NAME: Netto
     dependencies:
       - target: Netto
 
@@ -62,5 +76,6 @@ schemes:
       config: Debug
       targets:
         - NettoTests
+        - NettoUITests
     archive:
       config: Release

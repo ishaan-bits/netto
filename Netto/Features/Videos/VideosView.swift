@@ -24,9 +24,27 @@ struct VideosView: View {
         )
     }
 
+    /// The state *category* on screen — never the payload, so a progress tick cannot remount
+    /// the list.
+    private var phaseID: String {
+        switch phase {
+        case .permissionRequired: return "permissionRequired"
+        case .permissionDenied: return "permissionDenied"
+        case .scanRequired: return "scanRequired"
+        case .buildingCatalog: return "buildingCatalog"
+        case .failed: return "failed"
+        case .empty: return "empty"
+        case .measuringVideos: return "measuringVideos"
+        case .results: return "results"
+        }
+    }
+
     var body: some View {
         content
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Large Videos")
+            .nettoAppear()
+            .nettoStateTransition(phaseID)
             .onAppear {
                 env.refreshPermissions()
                 env.synchronizeVideoDataset()
@@ -169,6 +187,8 @@ struct VideosView: View {
                 Text("Tap a video to preview it. Nothing is deleted until you confirm on the review screen.")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NettoColor.background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) { selectionBar }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -206,7 +226,7 @@ struct VideosView: View {
                     }
                 }
             }
-            .buttonStyle(.plain)
+            .nettoPress()
             .accessibilityLabel(previewAccessibilityLabel(for: record))
             .accessibilityHint("Opens the video preview")
 
@@ -218,10 +238,11 @@ struct VideosView: View {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(
-                        isSelected ? Theme.Palette.accent : Theme.Palette.secondaryLabel
+                        isSelected ? NettoColor.brand : Theme.Palette.secondaryLabel
                     )
             }
-            .buttonStyle(.plain)
+            .nettoPress()
+            .nettoAnimate(.selection, value: isSelected)
             .accessibilityLabel("Select video")
             .accessibilityValue(isSelected ? "Selected" : "Not selected")
             .accessibilityAddTraits(isSelected ? [.isSelected] : [])
@@ -235,15 +256,29 @@ struct VideosView: View {
         ZStack {
             PhotoThumbnailView(
                 assetID: record.localIdentifier,
-                pointSize: 64,
+                pointSize: 72,
                 store: env.thumbnails
             )
-            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.sm))
-            Image(systemName: "play.circle.fill")
-                .font(.title2)
-                .foregroundStyle(.white.opacity(0.9))
-                .shadow(radius: 2)
+            .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous))
+
+            RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [.clear, .black.opacity(0.45)],
+                        startPoint: .center,
+                        endPoint: .bottom
+                    )
+                )
+
+            Image(systemName: "play.fill")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(.ultraThinMaterial, in: Circle())
+                .environment(\.colorScheme, .dark)
+                .shadow(radius: 3, y: 1)
         }
+        .frame(width: 72, height: 72)
         .accessibilityHidden(true)
     }
 
@@ -287,6 +322,7 @@ struct VideosView: View {
                 Text("\(env.videoSelection.selectedCount) of \(env.videoSelection.datasetCount) videos selected")
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
+                    .nettoCount(env.videoSelection.selectedCount)
                 Text("Nothing is deleted yet")
                     .font(.caption2)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
@@ -298,12 +334,13 @@ struct VideosView: View {
                 ReviewSelectionView(source: .videos)
             } label: {
                 Text("Review")
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(NettoPrimaryButtonStyle())
             .disabled(env.videoSelection.selectedCount == 0)
+            .opacity(env.videoSelection.selectedCount == 0 ? 0.45 : 1)
         }
-        .padding(Theme.Spacing.md)
-        .background(.bar)
+        .nettoFloatingBar()
     }
 
     // MARK: Helpers
@@ -313,26 +350,7 @@ struct VideosView: View {
         fraction: Double?,
         cancel: @escaping () -> Void
     ) -> some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
-            if let fraction {
-                ProgressView(value: fraction)
-                    .progressViewStyle(.linear)
-                    .tint(Theme.Palette.accent)
-                    .frame(maxWidth: 260)
-            } else {
-                ProgressView()
-            }
-            Text(message)
-                .font(.subheadline)
-                .monospacedDigit()
-                .multilineTextAlignment(.center)
-            Button("Cancel", action: cancel)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            Spacer()
-        }
-        .padding(.horizontal, Theme.Spacing.xl)
+        NettoProgressPanel(message: message, fraction: fraction, cancel: cancel)
     }
 
     private func openSettings() {

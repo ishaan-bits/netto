@@ -183,4 +183,45 @@ struct PendingPhotoRequestTests {
             #expect(cancelCount.read() <= 1)
         }
     }
+
+    // MARK: - Timeout failsafe
+
+    @Test func aHungRequestTimesOutAndAbortsThroughTheCancelAction() async {
+        // The scan-stall regression this pins: PhotoKit may legally never call the handler.
+        // The bridge must fail the request with `PhotoRequestTimeoutError`, invoke the PhotoKit
+        // cancel handle exactly once, and swallow any callback that finally arrives later.
+        let resolveBox = Box<(@Sendable (Result<Int, any Error>) -> Void)?>(nil)
+        let cancelCount = Box(0)
+
+        do {
+            _ = try await PendingPhotoRequest.run(timeoutNanos: 50_000_000) { resolve in
+                resolveBox.write(resolve)
+                return { cancelCount.write(cancelCount.read() + 1) }
+            }
+            Issue.record("expected the hung request to time out")
+        } catch is PhotoRequestTimeoutError {
+            // expected
+        } catch {
+            Issue.record("wrong error from a timed-out request: \(error)")
+        }
+        #expect(cancelCount.read() == 1)
+
+        // A late callback after the deadline is swallowed, not delivered and not a double resume.
+        resolveBox.read()?(.success(99))
+        #expect(cancelCount.read() == 1)
+    }
+
+    @Test func aSettledRequestNeverFiresItsTimeout() async throws {
+        // Once resolution wins, the deadline task must be cancelled: a stray timeout firing
+        // after success would abort a completed request and invoke the cancel handle.
+        let cancelCount = Box(0)
+        let value = try await PendingPhotoRequest.run(timeoutNanos: 30_000_000) { resolve in
+            resolve(.success(3))
+            return { cancelCount.write(cancelCount.read() + 1) }
+        }
+        #expect(value == 3)
+
+        try await Task.sleep(nanoseconds: 90_000_000)
+        #expect(cancelCount.read() == 0)
+    }
 }

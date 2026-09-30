@@ -158,9 +158,11 @@ struct PhotoSimilarityEngine: Sendable {
         }
 
         // Stage 3: fingerprinting — exact-duplicate detection, two phases.
-        // Phase 1 stats content lengths for every image/video asset (no content read); phase 2
-        // hashes only byte-length collisions. Progress counts each asset exactly once, when its
-        // outcome is final.
+        // Phase 1 stats content lengths for every image/video asset (no content read) and
+        // ticks progress per asset, so the longest phase of the scan shows real movement
+        // instead of sitting at 0 of N. Phase 2 hashes only byte-length collisions; the total
+        // grows by the collision count so each hash pass ticks too, and the stage ends at
+        // completed == total either way.
         let eligible = records.filter { $0.isImage || $0.isVideo }
         try reporter.enter(.fingerprinting, total: eligible.count)
 
@@ -185,6 +187,9 @@ struct PhotoSimilarityEngine: Sendable {
             } catch {
                 unavailable.insert(record.localIdentifier, reason: .contentUnreadable)
             }
+            // Every eligible asset ticks exactly once, on the outcome — key, unavailable, or
+            // error — including timed-out requests, so phase 1 can never appear frozen.
+            try reporter.advance(.fingerprinting, total: eligible.count)
         }
         try checkCancellation()
 
@@ -196,10 +201,13 @@ struct PhotoSimilarityEngine: Sendable {
             .filter { $0.count > 1 }
             .flatMap { $0 }
             .sorted()
+        // Completed is already `eligible.count` (phase 1 ticked every asset). The total grows
+        // by the collision count so phase 2's hashes are counted units — progress stays
+        // monotonic and the stage still ends exactly at completed == total.
         try reporter.setCount(
             .fingerprinting,
-            completed: eligible.count - collidingIDs.count,
-            total: eligible.count
+            completed: eligible.count,
+            total: eligible.count + collidingIDs.count
         )
 
         let fingerprints = LockedBox<[String: ContentFingerprint]>([:])
@@ -224,7 +232,7 @@ struct PhotoSimilarityEngine: Sendable {
             } catch {
                 unavailable.insert(record.localIdentifier, reason: .contentUnreadable)
             }
-            try reporter.advance(.fingerprinting, total: eligible.count)
+            try reporter.advance(.fingerprinting, total: eligible.count + collidingIDs.count)
         }
         try checkCancellation()
 
@@ -496,16 +504,30 @@ final class LockedBox<Value: Sendable>: @unchecked Sendable {
 /// and stream yield all happen under one lock so concurrent workers can never emit an event
 /// whose counters disagree with its stage. The report closure must be non-blocking (it is a
 /// stream yield) and the observer must not re-enter the reporter.
+///
+/// Emission is throttled so a 40 000-asset phase costs the main actor a bounded number of
+/// updates per second instead of one per asset: stage transitions, total changes, terminal
+/// counts (`completed >= total`), and at most one intermediate tick per
+/// `minEmitIntervalNanos` are published; anything between those is coalesced away. Counters
+/// always keep moving, so the next published event carries the true state.
 final class AnalysisProgressReporter: @unchecked Sendable {
     private let lock = NSLock()
     private var counts: [PhotoAnalysisStage: Int] = [:]
     private var lastStage: PhotoAnalysisStage?
+    private var lastProgress: PhotoAnalysisProgress?
+    private var lastEmitUptime: UInt64 = 0
+    private let minEmitIntervalNanos: UInt64
     private let observer: any PhotoAnalysisStageObserving
     private let report: @Sendable (PhotoAnalysisProgress) -> Void
 
-    init(observer: any PhotoAnalysisStageObserving, report: @escaping @Sendable (PhotoAnalysisProgress) -> Void) {
+    init(
+        observer: any PhotoAnalysisStageObserving,
+        report: @escaping @Sendable (PhotoAnalysisProgress) -> Void,
+        minEmitIntervalNanos: UInt64 = 100_000_000
+    ) {
         self.observer = observer
         self.report = report
+        self.minEmitIntervalNanos = minEmitIntervalNanos
     }
 
     func enter(_ stage: PhotoAnalysisStage, total: Int) throws {
@@ -533,11 +555,26 @@ final class AnalysisProgressReporter: @unchecked Sendable {
     }
 
     private func emitLocked(_ stage: PhotoAnalysisStage, completed: Int, total: Int) throws {
-        let changed = lastStage != stage
+        let stageChanged = lastStage != stage
         lastStage = stage
-        if changed {
+        if stageChanged {
             try observer.analysisStageWillBegin(stage)
         }
-        report(PhotoAnalysisProgress(stage: stage, completedUnits: completed, totalUnits: total))
+
+        let progress = PhotoAnalysisProgress(
+            stage: stage,
+            completedUnits: completed,
+            totalUnits: total
+        )
+        let previous = lastProgress
+        let totalChanged = previous?.stage == stage && previous?.totalUnits != total
+        let terminal = completed >= total
+        let now = DispatchTime.now().uptimeNanoseconds
+        let intervalElapsed = now &- lastEmitUptime >= minEmitIntervalNanos
+        guard stageChanged || totalChanged || terminal || intervalElapsed else { return }
+
+        lastEmitUptime = now
+        lastProgress = progress
+        report(progress)
     }
 }

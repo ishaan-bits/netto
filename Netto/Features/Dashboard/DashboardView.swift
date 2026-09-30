@@ -1,23 +1,49 @@
 import SwiftUI
 
+/// The dashboard: identity, one honest headline, the storage hero, one scan surface, and the
+/// "Clean up" grid.
+///
+/// Composition runs top to bottom in a single vertical stack with one spacing token, so every
+/// block is laid out by normal container rules — no offsets, no fixed coordinates, no layer
+/// drawn over another. Every value on screen comes from `DashboardPresentation`,
+/// `StorageSnapshot`, or the phase enums of the four categories.
 struct DashboardView: View {
     @EnvironmentObject private var env: AppEnvironment
     @State private var showPhotoPrePrompt = false
-    @State private var showContactsPrePrompt = false
+    @Namespace private var cardNamespace
+
+    private let categoryColumns = [
+        GridItem(.flexible(), spacing: NettoLayout.Spacing.md),
+        GridItem(.flexible(), spacing: NettoLayout.Spacing.md)
+    ]
+
+    private var scanStatus: DashboardPresentation.ScanStatus {
+        DashboardPresentation.scanStatus(
+            permission: env.photoPermissionState,
+            catalog: env.catalogState,
+            analysis: env.analysisState
+        )
+    }
 
     var body: some View {
         NavigationStack {
-            List {
-                storageSection
-                permissionsSection
-                catalogSection
-                similarPhotosSection
-                screenshotsSection
-                largeVideosSection
-                duplicateContactsSection
-                statusSection
+            ScrollView {
+                VStack(alignment: .leading, spacing: NettoLayout.Spacing.xl) {
+                    header
+                        .nettoEntrance(step: 0)
+                    heroCopy
+                        .nettoEntrance(step: 1)
+                    DashboardHeroView(snapshot: env.storageSnapshot)
+                        .nettoEntrance(step: 2)
+                    scanStatusCard
+                        .nettoEntrance(step: 3)
+                    categorySection
+                }
+                .padding(NettoLayout.Spacing.lg)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .navigationTitle("Netto")
+            .nettoAtmosphere()
+            .toolbar(.hidden, for: .navigationBar)
             .refreshable { await env.refreshStorage() }
             .task { env.refreshPermissions() }
             .sheet(isPresented: $showPhotoPrePrompt) {
@@ -30,155 +56,233 @@ struct DashboardView: View {
                 )
                 .presentationDetents([.medium])
             }
-            .sheet(isPresented: $showContactsPrePrompt) {
-                PermissionPrimingView(
-                    kind: .contacts,
-                    onContinue: {
-                        showContactsPrePrompt = false
-                        Task { await env.requestContactsAccess() }
-                    }
+        }
+    }
+
+    // MARK: TOP — identity
+
+    private var header: some View {
+        HStack(spacing: NettoLayout.Spacing.sm) {
+            NettoLogo()
+                .frame(width: 26, height: 26)
+                .accessibilityHidden(true)
+            Text("Netto")
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("dashboardHeader")
+    }
+
+    // MARK: HERO — the one thing the screen is about
+
+    private var heroCopy: some View {
+        VStack(alignment: .leading, spacing: NettoLayout.Spacing.sm) {
+            Text("Your iPhone has room to breathe")
+                .font(NettoType.heroTitle)
+                .foregroundStyle(NettoColor.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Scan → Review → Clean, entirely on this iPhone.")
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("dashboardHeroCopy")
+    }
+
+    // MARK: SCAN STATUS
+
+    private var scanStatusCard: DashboardScanStatusCard {
+        DashboardScanStatusCard(
+            status: scanStatus,
+            onAllowPhotos: { showPhotoPrePrompt = true },
+            onOpenSettings: openSettings,
+            onAnalyze: { env.startSimilarityAnalysis() },
+            onCancel: cancelScan
+        )
+    }
+
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+    }
+
+    private func cancelScan() {
+        if case .running = env.analysisState {
+            env.cancelSimilarityAnalysis()
+        } else {
+            env.cancelCatalogBuild()
+        }
+    }
+
+    // MARK: CLEANUP grid
+
+    private var categorySection: some View {
+        VStack(alignment: .leading, spacing: NettoLayout.Spacing.md) {
+            Text("Clean up")
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
+                .accessibilityIdentifier("cleanupSectionTitle")
+                .nettoEntrance(step: 4)
+
+            LazyVGrid(columns: categoryColumns, spacing: NettoLayout.Spacing.md) {
+                categoryLink(
+                    id: "similarPhotos",
+                    identifier: "similarPhotosCard",
+                    title: "Similar Photos",
+                    icon: "photo.on.rectangle.angled",
+                    status: similarPhotosStatusText,
+                    assetID: similarPhotosResult.flatMap { Self.firstAssetID(in: $0) },
+                    initials: nil,
+                    step: 5,
+                    destination: { SimilarPhotosView() }
                 )
-                .presentationDetents([.medium])
+
+                categoryLink(
+                    id: "screenshots",
+                    identifier: "screenshotsCard",
+                    title: "Screenshots",
+                    icon: "rectangle.on.rectangle",
+                    status: ScreenshotsPresentation.statusText(
+                        permission: env.photoPermissionState,
+                        catalog: env.catalogState
+                    ),
+                    assetID: screenshotsAssetID,
+                    initials: nil,
+                    step: 6,
+                    destination: { ScreenshotsView() }
+                )
+
+                categoryLink(
+                    id: "largeVideos",
+                    identifier: "largeVideosCard",
+                    title: "Large Videos",
+                    icon: "video",
+                    status: VideosPresentation.statusText(
+                        permission: env.photoPermissionState,
+                        catalog: env.catalogState,
+                        resolution: env.videoSizeResolution
+                    ),
+                    assetID: videosAssetID,
+                    initials: nil,
+                    step: 7,
+                    destination: { VideosView() }
+                )
+
+                categoryLink(
+                    id: "duplicateContacts",
+                    identifier: "duplicateContactsRow",
+                    title: "Duplicate Contacts",
+                    icon: "person.2",
+                    status: ContactsPresentation.statusText(
+                        permission: env.contactsPermissionState,
+                        scan: env.contactScanState
+                    ),
+                    assetID: nil,
+                    initials: contactsInitials,
+                    step: 8,
+                    destination: { DuplicateContactsView() }
+                )
             }
-            .onAppear { env.refreshPermissions() }
         }
     }
 
-    private var storageSection: some View {
-        Section("Storage") {
-            if let snapshot = env.storageSnapshot {
-                StorageCardView(snapshot: snapshot)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Color.clear)
-            } else {
-                HStack {
-                    ProgressView()
-                    Text("Reading device storage…")
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
-                }
-            }
-        }
-    }
-
-    private var permissionsSection: some View {
-        Section("Permissions") {
-            PermissionRow(
-                kind: .photos,
-                state: env.photoPermissionState,
-                onRequest: {
-                    if env.photoPermissionState == .notDetermined {
-                        showPhotoPrePrompt = true
-                    }
-                }
+    private func categoryLink<Destination: View>(
+        id: String,
+        identifier: String,
+        title: String,
+        icon: String,
+        status: String,
+        assetID: String?,
+        initials: String?,
+        step: Int,
+        @ViewBuilder destination: () -> Destination
+    ) -> some View {
+        NavigationLink {
+            destination()
+                .nettoZoomDestination(id, in: cardNamespace)
+        } label: {
+            DashboardCategoryCard(
+                title: title,
+                icon: icon,
+                status: status,
+                assetID: assetID,
+                initials: initials,
+                store: env.thumbnails
             )
-            PermissionRow(
-                kind: .contacts,
-                state: env.contactsPermissionState,
-                onRequest: {
-                    if env.contactsPermissionState == .notDetermined {
-                        showContactsPrePrompt = true
-                    }
-                }
-            )
         }
+        .buttonStyle(DashboardCardPressStyle())
+        .nettoEntrance(step: step)
+        .nettoZoomSource(id, in: cardNamespace)
+        .accessibilityIdentifier(identifier)
     }
 
-    private var catalogSection: some View {
-        Section("Catalog") {
-            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                Text("Metadata enumeration")
-                    .font(.headline)
-                Text("Reads asset metadata only — no image data is decoded and nothing is downloaded. Sizes stay unknown until you open Large Videos or pick items for review.")
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
+    // MARK: Real data (never fabricated — nil when there is nothing to show)
 
-                catalogControls
-            }
-            .padding(.vertical, Theme.Spacing.xs)
-        }
+    private var similarPhotosResult: PhotoAnalysisResult? {
+        guard case .results(let result) = similarPhotosPhase else { return nil }
+        return result
     }
 
-    @ViewBuilder
-    private var catalogControls: some View {
-        switch env.catalogState {
-        case .notStarted:
-            Button("Build Catalog") { env.startCatalogBuild() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-
-        case .running(let progress):
-            ProgressView(value: progress.fraction)
-            Text(progress.totalCount > 0
-                 ? "Reading \(progress.enumeratedCount) of \(progress.totalCount) assets…"
-                 : "Counting assets…")
-                .font(.caption)
-                .monospacedDigit()
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-            Button("Cancel") { env.cancelCatalogBuild() }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-        case .completed(let result):
-            Group {
-                if result.isEmpty {
-                    Text("No assets are visible to Netto.")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.Palette.warning)
-                } else {
-                    Text("\(result.scannedAssetCount) assets · \(result.imageCount) photos · \(result.videoCount) videos · \(result.screenshotCount) screenshots")
-                        .font(.subheadline)
-                        .monospacedDigit()
-                    Text("Access: \(result.accessLevel.displayName) · sizes unknown until measured")
-                        .font(.caption)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
-                }
-            }
-            Button("Rebuild") { env.startCatalogBuild() }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-        case .cancelled:
-            Text("Catalog build cancelled.")
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-            Button("Resume") { env.startCatalogBuild() }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-        case .failed(let failure):
-            Text(failure.userMessage)
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.danger)
-            Button("Retry") { env.startCatalogBuild() }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-        }
-    }
-
-    private var similarPhotosSection: some View {
-        Section("Similar Photos") {
-            NavigationLink {
-                SimilarPhotosView()
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Review duplicates & similar shots")
-                        .font(.body.weight(.medium))
-                    Text(similarPhotosStatusText)
-                        .font(.caption)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
-                        .lineLimit(2)
-                }
-            }
-        }
-    }
-
-    private var similarPhotosStatusText: String {
-        let phase = SimilarPhotosPresentation.phase(
+    private var similarPhotosPhase: SimilarPhotosPhase {
+        SimilarPhotosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
             analysis: env.analysisState
         )
-        switch phase {
+    }
+
+    private static func firstAssetID(in result: PhotoAnalysisResult) -> String? {
+        for group in result.exactGroups + result.similarGroups {
+            if let id = group.memberAssetIDs.first {
+                return id
+            }
+        }
+        return nil
+    }
+
+    private var screenshotsAssetID: String? {
+        guard case .results(let records) = ScreenshotsPresentation.phase(
+            permission: env.photoPermissionState,
+            catalog: env.catalogState
+        ) else { return nil }
+        return records.first?.localIdentifier
+    }
+
+    private var videosAssetID: String? {
+        guard case .results(let records) = VideosPresentation.phase(
+            permission: env.photoPermissionState,
+            catalog: env.catalogState,
+            resolution: env.videoSizeResolution
+        ) else { return nil }
+        return records.first?.localIdentifier
+    }
+
+    private var contactsInitials: String? {
+        guard case .completed(let dataset) = env.contactScanState,
+              let id = dataset.groups.first?.memberIDs.first,
+              let record = dataset.record(for: id)
+        else { return nil }
+        return Self.initials(for: record)
+    }
+
+    private static func initials(for record: ContactRecord) -> String {
+        let given = record.givenName.trimmingCharacters(in: .whitespaces)
+        let family = record.familyName.trimmingCharacters(in: .whitespaces)
+        let letters = [given.first, family.first].compactMap { $0 }
+        if !letters.isEmpty {
+            return String(letters).uppercased()
+        }
+        let organization = record.organizationName.trimmingCharacters(in: .whitespaces)
+        guard let first = organization.first else { return "?" }
+        return String(first).uppercased()
+    }
+
+    private var similarPhotosStatusText: String {
+        switch similarPhotosPhase {
         case .permissionRequired:
             return "Photos access needed"
         case .permissionDenied:
@@ -189,6 +293,12 @@ struct DashboardView: View {
             return "Reading your library…"
         case .analyzing(let progress):
             return SimilarPhotosPresentation.stageMessage(for: progress)
+        case .emptyLibrary:
+            return "No photos visible to Netto"
+        case .cancelled:
+            return "Last run cancelled"
+        case .failed(let message):
+            return message
         case .results(let result):
             let summary = SimilarPhotosSummary(result: result)
             if summary.hasNoGroups {
@@ -196,214 +306,8 @@ struct DashboardView: View {
                     ? "No duplicates found · \(summary.unavailableCount) not analyzed"
                     : "Analyzed · no duplicates found"
             }
-            return "\(summary.exactGroupCount + summary.similarGroupCount) groups ready to review"
-        case .emptyLibrary:
-            return "No photos visible to Netto"
-        case .cancelled:
-            return "Last run cancelled"
-        case .failed(let message):
-            return message
-        }
-    }
-
-    private var screenshotsSection: some View {
-        Section("Screenshots") {
-            NavigationLink {
-                ScreenshotsView()
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Review screenshots")
-                        .font(.body.weight(.medium))
-                    Text(
-                        ScreenshotsPresentation.statusText(
-                            permission: env.photoPermissionState,
-                            catalog: env.catalogState
-                        )
-                    )
-                    .font(.caption)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-                    .lineLimit(2)
-                }
-            }
-        }
-    }
-
-    private var largeVideosSection: some View {
-        Section("Large Videos") {
-            NavigationLink {
-                VideosView()
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Review largest videos first")
-                        .font(.body.weight(.medium))
-                    Text(
-                        VideosPresentation.statusText(
-                            permission: env.photoPermissionState,
-                            catalog: env.catalogState,
-                            resolution: env.videoSizeResolution
-                        )
-                    )
-                    .font(.caption)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-                    .lineLimit(2)
-                }
-            }
-        }
-    }
-
-    private var duplicateContactsSection: some View {
-        Section("Duplicate Contacts") {
-            NavigationLink {
-                DuplicateContactsView()
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Review likely duplicate contacts")
-                        .font(.body.weight(.medium))
-                    Text(
-                        ContactsPresentation.statusText(
-                            permission: env.contactsPermissionState,
-                            scan: env.contactScanState
-                        )
-                    )
-                    .font(.caption)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-                    .lineLimit(2)
-                }
-            }
-            .accessibilityIdentifier("duplicateContactsRow")
-        }
-    }
-
-    private var statusSection: some View {
-        Section("Scan") {
-            VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                Text("Scan → Review → Clean")
-                    .font(.headline)
-                Text("Similar Photos analysis runs entirely on this iPhone. You review every group before anything changes — nothing is deleted without your explicit confirmation on the final review screen.")
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-            }
-            .padding(.vertical, Theme.Spacing.xs)
-        }
-    }
-}
-
-struct StorageCardView: View {
-    let snapshot: StorageSnapshot
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-            if snapshot.isAvailable {
-                measuredContent
-            } else {
-                // A failed read yields zeros; "0 GB of 0 GB total" would fabricate a
-                // measurement. Say what is unknown instead.
-                Text("Storage")
-                    .font(.caption)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-                Text("Storage size unavailable")
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-            }
-        }
-        .padding(Theme.Spacing.lg)
-        .background(Theme.Palette.secondaryBackground, in: RoundedRectangle(cornerRadius: Theme.Radius.lg))
-    }
-
-    private var measuredContent: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.md) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Used")
-                        .font(.caption)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
-                    Text(snapshot.formattedUsed())
-                        .font(.title2.weight(.semibold))
-                        .monospacedDigit()
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Free")
-                        .font(.caption)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
-                    Text(snapshot.formattedFree())
-                        .font(.title2.weight(.semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(Theme.Palette.success)
-                }
-            }
-
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule()
-                        .fill(Theme.Palette.tertiaryBackground)
-                    Capsule()
-                        .fill(Theme.Palette.accent)
-                        .frame(width: proxy.size.width * snapshot.usedFraction)
-                }
-            }
-            .frame(height: 8)
-
-            Text("of \(snapshot.formattedTotal()) total")
-                .font(.caption)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-        }
-    }
-}
-
-struct PermissionRow: View {
-    let kind: PermissionKind
-    let state: PermissionState
-    let onRequest: () -> Void
-
-    var body: some View {
-        HStack(spacing: Theme.Spacing.md) {
-            Image(systemName: kind == .photos ? "photo.on.rectangle" : "person.crop.circle")
-                .font(.title3)
-                .foregroundStyle(Theme.Palette.accent)
-                .frame(width: 28)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(kind.displayName)
-                    .font(.body.weight(.medium))
-                Text(state.displayName)
-                    .font(.caption)
-                    .foregroundStyle(statusColor)
-            }
-
-            Spacer()
-
-            switch state {
-            case .notDetermined:
-                Button("Allow", action: onRequest)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-            case .denied, .restricted:
-                Button("Open Settings") {
-                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-                    UIApplication.shared.open(url)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            case .limited:
-                Text("Limited")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, Theme.Spacing.sm)
-                    .padding(.vertical, Theme.Spacing.xs)
-                    .background(Theme.Palette.warning.opacity(0.2), in: Capsule())
-            case .authorized:
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(Theme.Palette.success)
-            }
-        }
-    }
-
-    private var statusColor: Color {
-        switch state {
-        case .authorized: return Theme.Palette.success
-        case .limited: return Theme.Palette.warning
-        case .denied, .restricted: return Theme.Palette.danger
-        case .notDetermined: return Theme.Palette.secondaryLabel
+            let groups = summary.exactGroupCount + summary.similarGroupCount
+            return "\(groups) \(groups == 1 ? "group" : "groups") ready to review"
         }
     }
 }
@@ -414,23 +318,24 @@ struct PermissionPrimingView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer(minLength: Theme.Spacing.lg)
+        VStack(spacing: NettoLayout.Spacing.lg) {
+            Spacer(minLength: NettoLayout.Spacing.lg)
             Image(systemName: kind == .photos ? "photo.on.rectangle.angled" : "person.2.badge.key")
                 .font(.system(size: 44))
-                .foregroundStyle(Theme.Palette.accent)
+                .foregroundStyle(NettoColor.brand)
 
             Text(kind == .photos ? "Netto needs Photos access" : "Netto needs Contacts access")
-                .font(.title3.weight(.semibold))
+                .font(NettoType.sectionTitle)
                 .multilineTextAlignment(.center)
+                .foregroundStyle(NettoColor.textPrimary)
 
             Text(kind == .photos
                  ? "Netto reads your photo library on this iPhone to find duplicates, similar shots, screenshots, and large videos. Images never leave your device, and nothing is deleted until you approve it on the review screen."
                  : "Netto reads your contacts on this iPhone to find entries that look like duplicates. Your contacts never leave your device, and no contact is merged or deleted until you approve it.")
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.secondaryBody)
+                .foregroundStyle(NettoColor.textSecondary)
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, Theme.Spacing.lg)
+                .padding(.horizontal, NettoLayout.Spacing.lg)
 
             Spacer()
 
@@ -438,13 +343,106 @@ struct PermissionPrimingView: View {
                 Text("Continue")
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            .buttonStyle(NettoPrimaryButtonStyle())
 
             Button("Not Now") { dismiss() }
                 .buttonStyle(.plain)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.buttonLabel)
+                .foregroundStyle(NettoColor.textSecondary)
         }
-        .padding(Theme.Spacing.xl)
+        .padding(NettoLayout.Spacing.xl)
+        .nettoAppear()
     }
 }
+
+#if DEBUG
+#Preview("Ready · Dark") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(PreviewData.environment())
+    .preferredColorScheme(.dark)
+}
+
+#Preview("Ready · Light") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(PreviewData.environment())
+    .preferredColorScheme(.light)
+}
+
+#Preview("Analyzed") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.result)))
+}
+
+#Preview("Scanning") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(
+        PreviewData.environment(
+            analysis: .running(
+                PhotoAnalysisProgress(stage: .extractingFeatures, completedUnits: 120, totalUnits: 480)
+            )
+        )
+    )
+}
+
+#Preview("Photos access off") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(PreviewData.environment(permission: .denied))
+}
+
+#Preview("No results") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.resultWithoutGroups)))
+}
+
+#Preview("Empty library") {
+    NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(
+        PreviewData.environment(
+            catalog: .completed(
+                CatalogScanResult(records: [], libraryAssetCount: 0, accessLevel: .authorized)
+            )
+        )
+    )
+}
+
+#Preview("Storage unavailable") {
+    let env = PreviewData.environment()
+    env.storageSnapshot = StorageSnapshot(totalCapacity: 0, availableCapacity: 0)
+    return NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(env)
+}
+
+#Preview("Storage loading") {
+    let env = PreviewData.environment()
+    env.storageSnapshot = nil
+    return NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(env)
+}
+
+#Preview("Contacts · results") {
+    let env = PreviewData.contactsEnvironment()
+    env.photoPermissionState = .authorized
+    return NavigationStack {
+        DashboardView()
+    }
+    .environmentObject(env)
+}
+#endif

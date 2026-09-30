@@ -28,8 +28,9 @@ struct PhotoDetailView: View {
                 }
                 .padding(Theme.Spacing.lg)
             }
-            .background(Theme.Palette.background)
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Photo Details")
+            .nettoAppear()
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -44,18 +45,20 @@ struct PhotoDetailView: View {
     private var thumbnail: some View {
         PhotoThumbnailView(assetID: assetID, pointSize: 300, store: env.thumbnails)
             .frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.lg))
+            .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.card, style: .continuous))
             .overlay(alignment: .topLeading) {
                 if isRecommended {
                     Label("Best", systemImage: "star.fill")
                         .font(.caption.weight(.bold))
                         .padding(.horizontal, Theme.Spacing.sm)
                         .padding(.vertical, Theme.Spacing.xs)
-                        .background(Theme.Palette.success, in: Capsule())
+                        .background(NettoColor.success, in: Capsule())
                         .foregroundStyle(.white)
                         .padding(Theme.Spacing.sm)
+                        .transition(.scale(scale: 0.8).combined(with: .opacity))
                 }
             }
+            .nettoAnimate(.success, value: isRecommended)
             .accessibilityLabel(isRecommended ? "Photo, recommended to keep" : "Photo")
     }
 
@@ -74,21 +77,19 @@ struct PhotoDetailView: View {
             infoRow("Burst shot", value: flagText(score?.representsBurst))
         }
         .padding(.horizontal, Theme.Spacing.lg)
-        .background(
-            Theme.Palette.secondaryBackground,
-            in: RoundedRectangle(cornerRadius: Theme.Radius.lg)
-        )
+        .nettoSurface(.elevated, cornerRadius: NettoLayout.Radius.card)
     }
 
     private func infoRow(_ title: String, value: String) -> some View {
         HStack {
             Text(title)
                 .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .foregroundStyle(NettoColor.textSecondary)
             Spacer()
             Text(value)
                 .font(.subheadline.weight(.medium))
                 .monospacedDigit()
+                .foregroundStyle(NettoColor.textPrimary)
         }
         .padding(.vertical, Theme.Spacing.md)
     }
@@ -116,29 +117,27 @@ struct PhotoDetailView: View {
 
     private var selectionButton: some View {
         VStack(spacing: Theme.Spacing.sm) {
-            Group {
-                if isSelected {
-                    Button(action: toggle) {
-                        Text("Remove from Cleanup")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                } else {
-                    Button(action: toggle) {
-                        Text("Mark for Cleanup")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
+            if isSelected {
+                Button(action: toggle) {
+                    Text("Remove from Cleanup")
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(NettoSecondaryButtonStyle())
+            } else {
+                Button(action: toggle) {
+                    Text("Mark for Cleanup")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(NettoPrimaryButtonStyle())
             }
-            .controlSize(.large)
 
             Text(isSelected
                  ? "Selected for cleanup. Nothing is deleted yet."
                  : "Kept — Netto will not include this photo in a cleanup.")
-                .font(.caption)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textSecondary)
                 .multilineTextAlignment(.center)
+                .nettoAnimate(.stateChange, value: isSelected)
         }
     }
 

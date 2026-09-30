@@ -20,11 +20,30 @@ struct ContactReviewView: View {
 
     var body: some View {
         content
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Review")
             .navigationBarTitleDisplayMode(.inline)
+            .nettoAppear()
+            .nettoStateTransition(phaseID, purpose: .destructive)
             .onAppear {
                 env.contactReviewDidAppear(choice)
             }
+    }
+
+    /// The state *category* on screen — never the payload, so progress or plan text cannot
+    /// remount the review.
+    private var phaseID: String {
+        switch env.contactActionState {
+        case .noSelection: return "noSelection"
+        case .preparingPlan: return "preparingPlan"
+        case .readyForReview, .awaitingConfirmation: return "readyForReview"
+        case .planStale: return "planStale"
+        case .executing: return "executing"
+        case .succeeded: return "succeeded"
+        case .needsReview: return "needsReview"
+        case .failed: return "failed"
+        case .permissionRequired: return "permissionRequired"
+        }
     }
 
     // MARK: Phase dispatch
@@ -82,10 +101,18 @@ struct ContactReviewView: View {
             Section {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
                     Text(ContactsPresentation.actionSummary(for: plan))
-                        .font(.headline)
-                    Text("\(plan.count) \(plan.count == 1 ? "contact" : "contacts") selected")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
+                        .font(NettoType.cardTitle)
+                        .foregroundStyle(NettoColor.textPrimary)
+                    HStack(alignment: .firstTextBaseline, spacing: NettoLayout.Spacing.xs) {
+                        Text("\(plan.count)")
+                            .font(NettoType.metricNumber)
+                            .monospacedDigit()
+                            .foregroundStyle(NettoColor.textPrimary)
+                            .nettoCount(plan.count)
+                        Text(plan.count == 1 ? "contact selected" : "contacts selected")
+                            .font(NettoType.secondaryBody)
+                            .foregroundStyle(NettoColor.textSecondary)
+                    }
                 }
                 .padding(.vertical, Theme.Spacing.xs)
                 .accessibilityIdentifier("contactReviewSummary")
@@ -121,6 +148,8 @@ struct ContactReviewView: View {
         // Applied to the List itself — *before* `.safeAreaInset` — so it marks the list
         // without also overwriting the identifiers of the inset action buttons.
         .accessibilityIdentifier("contactReviewList")
+        .scrollContentBackground(.hidden)
+        .background(NettoColor.background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) {
             actionBar(plan)
         }
@@ -243,52 +272,47 @@ struct ContactReviewView: View {
             } label: {
                 Text("Change Selection")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(NettoSecondaryButtonStyle())
 
-            Spacer()
+            Spacer(minLength: NettoLayout.Spacing.sm)
 
             Button(role: .destructive) {
                 showConfirmation = true
             } label: {
                 Text(ContactsPresentation.destructiveTitle(for: plan))
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.Palette.danger)
+            .buttonStyle(NettoDestructiveButtonStyle())
             .accessibilityIdentifier("contactReviewActionButton")
         }
-        .padding(Theme.Spacing.md)
-        .background(.bar)
+        .frame(maxWidth: .infinity)
+        .nettoFloatingBar()
     }
 
     // MARK: Other states
 
     private var buildingState: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
-            ProgressView()
-            Text("Preparing your review…")
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, Theme.Spacing.xl)
+        NettoProgressPanel(message: "Preparing your review…")
     }
 
     private func executingState(_ plan: ContactActionPlan) -> some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
+        VStack(spacing: NettoLayout.Spacing.lg) {
+            Spacer(minLength: NettoLayout.Spacing.xxl)
             ProgressView()
+                .tint(NettoColor.brand)
             Text(plan.isDelete ? "Deleting contacts…" : "Merging contacts…")
-                .font(.headline)
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
             Text("Netto is applying exactly the contacts you reviewed. Don’t switch away — the result is verified against Contacts before it is reported.")
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.secondaryBody)
+                .foregroundStyle(NettoColor.textSecondary)
                 .multilineTextAlignment(.center)
-            Spacer()
+                .lineSpacing(3)
+            Spacer(minLength: NettoLayout.Spacing.xxl)
         }
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, Theme.Spacing.xl)
+        .padding(.horizontal, NettoLayout.Spacing.xl)
+        .nettoAppear()
     }
 
     private func staleState(
@@ -351,40 +375,9 @@ struct ContactReviewView: View {
     }
 }
 
-/// Full-screen state view for the non-review phases of this screen.
-private struct ContactReviewPhaseMessage: View {
-    let systemImage: String
-    let title: String
-    let message: String
-    var primaryTitle: String?
-    var primaryAction: () -> Void = {}
-
-    var body: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer(minLength: Theme.Spacing.xl)
-            Image(systemName: systemImage)
-                .font(.system(size: 44))
-                .foregroundStyle(Theme.Palette.accent)
-            Text(title)
-                .font(.title3.weight(.semibold))
-                .multilineTextAlignment(.center)
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, Theme.Spacing.xl)
-            if let primaryTitle {
-                Button(primaryTitle, action: primaryAction)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-            }
-            Spacer(minLength: Theme.Spacing.xl)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
 private extension ContactReviewView {
+    /// Same shared state view the photo screens use — one visual language for every
+    /// permission, empty, error, and success state in the app.
     func contactPhaseMessage(
         systemImage: String,
         title: String,
@@ -392,12 +385,12 @@ private extension ContactReviewView {
         primaryTitle: String? = nil,
         action: @escaping () -> Void = {}
     ) -> some View {
-        ContactReviewPhaseMessage(
+        PhaseMessage(
             systemImage: systemImage,
             title: title,
             message: message,
-            primaryTitle: primaryTitle,
-            primaryAction: action
+            buttonTitle: primaryTitle,
+            buttonAction: action
         )
     }
 }

@@ -48,8 +48,11 @@ struct ContactGroupDetailView: View {
                 .onAppear { dismiss() }
             }
         }
+        .background(NettoColor.background.ignoresSafeArea())
         .navigationTitle("Likely Duplicates")
         .navigationBarTitleDisplayMode(.inline)
+        .nettoAppear()
+        .nettoStateTransition(liveGroup == nil ? "gone" : "group")
         .onAppear {
             guard let liveGroup else { return }
             // Rebind the selection to this group every time the screen appears, so a stale
@@ -88,6 +91,8 @@ struct ContactGroupDetailView: View {
                 }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(NettoColor.background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) { actionBar }
     }
 
@@ -109,7 +114,7 @@ struct ContactGroupDetailView: View {
                     }
                     .overlay {
                         Circle()
-                            .stroke(isSelected ? Theme.Palette.accent : .clear, lineWidth: 2)
+                            .stroke(isSelected ? NettoColor.brand : .clear, lineWidth: 2)
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -134,10 +139,11 @@ struct ContactGroupDetailView: View {
 
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.title3)
-                        .foregroundStyle(isSelected ? Theme.Palette.accent : Theme.Palette.separator)
+                        .foregroundStyle(isSelected ? NettoColor.brand : Theme.Palette.separator)
                 }
             }
-            .buttonStyle(.plain)
+            .nettoPress()
+            .nettoAnimate(.selection, value: isSelected)
             .accessibilityIdentifier("contactRow-\(record.identifier)")
             .accessibilityValue(isSelected ? "Selected" : "Not selected")
 
@@ -158,7 +164,8 @@ struct ContactGroupDetailView: View {
                         .foregroundStyle(isDestination ? Theme.Palette.warning : Theme.Palette.secondaryLabel)
                 }
             }
-            .buttonStyle(.plain)
+            .nettoPress()
+            .nettoAnimate(.selection, value: isDestination)
             .disabled(!isSelected)
             .accessibilityIdentifier("keepButton-\(record.identifier)")
             .accessibilityLabel("Keep \(record.displayName)")
@@ -174,6 +181,7 @@ struct ContactGroupDetailView: View {
                 Text("\(env.contactSelection.selectedCount) of \(env.contactSelection.datasetCount) selected")
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
+                    .nettoCount(env.contactSelection.selectedCount)
                 Text("Nothing is changed yet")
                     .font(.caption2)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
@@ -186,22 +194,23 @@ struct ContactGroupDetailView: View {
             } label: {
                 Text("Merge")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(NettoSecondaryButtonStyle())
             .disabled(!canMerge)
+            .opacity(canMerge ? 1 : 0.45)
             .accessibilityIdentifier("mergeSelectedButton")
 
             NavigationLink {
                 ContactReviewView(choice: .delete)
             } label: {
                 Text("Delete")
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.Palette.danger)
+            .buttonStyle(NettoDestructiveButtonStyle())
             .disabled(env.contactSelection.isEmpty)
+            .opacity(env.contactSelection.isEmpty ? 0.45 : 1)
             .accessibilityIdentifier("deleteSelectedButton")
         }
-        .padding(Theme.Spacing.md)
-        .background(.bar)
+        .nettoFloatingBar()
     }
 
     private var canMerge: Bool {

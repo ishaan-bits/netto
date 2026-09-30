@@ -20,14 +20,14 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>LSRequiresIPhoneOS</key>
-	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Netto scans your photo library on this iPhone to find duplicates, similar shots, screenshots, and large videos. Your photos never leave your device.</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
 	<key>NSContactsUsageDescription</key>
 	<string>Netto checks your contacts on this iPhone to find entries that look like duplicates so you can merge or delete them. Your contacts never leave your device.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Netto scans your photo library on this iPhone to find duplicates, similar shots, screenshots, and large videos. Your photos never leave your device.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

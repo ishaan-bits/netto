@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 588 575" width="588" height="575">
+  <title id="t">Netto logo mark</title>
+  <defs>
+    <linearGradient id="netto-left" gradientUnits="userSpaceOnUse" x1="82" y1="150" x2="82" y2="565">
+      <stop offset="0" stop-color="#1c4a26"/>
+      <stop offset="0.45" stop-color="#3f9a3a"/>
+      <stop offset="1" stop-color="#a6f04c"/>
+    </linearGradient>
+    <linearGradient id="netto-right" gradientUnits="userSpaceOnUse" x1="506" y1="0" x2="506" y2="500">
+      <stop offset="0" stop-color="#eaf24c"/>
+      <stop offset="0.35" stop-color="#b8f23a"/>
+      <stop offset="0.75" stop-color="#4f9d33"/>
+      <stop offset="1" stop-color="#1f5a2c"/>
+    </linearGradient>
+    <linearGradient id="netto-diagonal" gradientUnits="userSpaceOnUse" x1="40" y1="30" x2="520" y2="560">
+      <stop offset="0" stop-color="#d2f68e"/>
+      <stop offset="0.35" stop-color="#a2f062"/>
+      <stop offset="0.65" stop-color="#b6f83e"/>
+      <stop offset="1" stop-color="#5fb32e"/>
+    </linearGradient>
+  </defs>
+  <g id="netto-n">
+    <rect id="stroke-left" x="0" y="5" width="164" height="560" rx="82" fill="url(#netto-left)"/>
+    <rect id="stroke-right" x="425" y="0" width="163" height="565" rx="81.5" fill="url(#netto-right)"/>
+    <path id="stroke-diagonal" fill="url(#netto-diagonal)" d="M147.9 29.9L541.9 435.9A82 82 0 0 1 424.1 550.1L30.1 144.1A82 82 0 0 1 147.9 29.9Z"/>
+  </g>
+</svg>

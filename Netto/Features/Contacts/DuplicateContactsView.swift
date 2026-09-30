@@ -18,9 +18,27 @@ struct DuplicateContactsView: View {
         )
     }
 
+    /// The state *category* on screen — never the payload, so a changing error string cannot
+    /// remount the list.
+    private var phaseID: String {
+        switch phase {
+        case .permissionRequired: return "permissionRequired"
+        case .permissionDenied: return "permissionDenied"
+        case .scanRequired: return "scanRequired"
+        case .scanning: return "scanning"
+        case .failed: return "failed"
+        case .empty: return "empty"
+        case .noDuplicates: return "noDuplicates"
+        case .results: return "results"
+        }
+    }
+
     var body: some View {
         content
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Duplicate Contacts")
+            .nettoAppear()
+            .nettoStateTransition(phaseID)
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
                 env.refreshPermissions()
@@ -93,19 +111,10 @@ struct DuplicateContactsView: View {
             }
 
         case .scanning:
-            VStack(spacing: Theme.Spacing.lg) {
-                Spacer()
-                ProgressView()
-                Text("Reading contacts and looking for likely duplicates…")
-                    .font(.subheadline)
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(Theme.Palette.secondaryLabel)
-                Button("Cancel") { env.cancelContactScan() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                Spacer()
-            }
-            .padding(.horizontal, Theme.Spacing.xl)
+            NettoProgressPanel(
+                message: "Reading contacts and looking for likely duplicates…",
+                cancel: { env.cancelContactScan() }
+            )
 
         case .failed(let message):
             PhaseMessage(
@@ -147,6 +156,7 @@ struct DuplicateContactsView: View {
                     } label: {
                         groupRow(group)
                     }
+                    .nettoPress()
                     .accessibilityIdentifier("duplicateGroupRow-\(group.id)")
                 }
             } header: {
@@ -157,23 +167,60 @@ struct DuplicateContactsView: View {
             }
         }
         .accessibilityIdentifier("duplicateContactsList")
+        .scrollContentBackground(.hidden)
+        .background(NettoColor.background.ignoresSafeArea())
     }
 
     private func groupRow(_ group: ContactDuplicateGroup) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(memberNames(for: group))
-                .font(.body.weight(.medium))
-                .lineLimit(2)
-            Text(ContactsPresentation.reasonsText(group.reasons))
-                .font(.caption)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-                .lineLimit(2)
-            Text("\(group.memberCount) contacts")
-                .font(.caption2)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+        HStack(spacing: NettoLayout.Spacing.md) {
+            avatar(for: group)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(memberNames(for: group))
+                    .font(.body.weight(.medium))
+                    .foregroundStyle(NettoColor.textPrimary)
+                    .lineLimit(2)
+                Text(ContactsPresentation.reasonsText(group.reasons))
+                    .font(.caption)
+                    .foregroundStyle(NettoColor.textSecondary)
+                    .lineLimit(2)
+                Text("\(group.memberCount) contacts")
+                    .font(.caption2)
+                    .monospacedDigit()
+                    .foregroundStyle(NettoColor.textTertiary)
+            }
+
+            Spacer(minLength: NettoLayout.Spacing.sm)
+
+            NettoIcon(name: "chevron.right", size: NettoIconSize.control, weight: .semibold, tint: NettoColor.textTertiary)
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
+    }
+
+    /// Initials of the group's first member — identification aid only, always from the
+    /// on-device dataset. Falls back to a neutral glyph when the dataset is unavailable.
+    private func avatar(for group: ContactDuplicateGroup) -> some View {
+        ZStack {
+            Circle()
+                .fill(NettoColor.brand.opacity(0.16))
+            Text(initials(for: group))
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .foregroundStyle(NettoColor.brandDeep)
+                .minimumScaleFactor(0.6)
+                .lineLimit(1)
+        }
+        .frame(width: 40, height: 40)
+        .accessibilityHidden(true)
+    }
+
+    private func initials(for group: ContactDuplicateGroup) -> String {
+        guard case .completed(let dataset) = env.contactScanState else { return "?" }
+        guard let name = group.memberIDs.compactMap({ dataset.record(for: $0)?.displayName }).first
+        else { return "?" }
+        let parts = name.split(separator: " ").prefix(2)
+        let letters = parts.compactMap(\.first).map(String.init).joined()
+        return letters.isEmpty ? String(name.prefix(1)) : letters.uppercased()
     }
 
     /// First two member names plus a "+n more" suffix — identification aid only, always from

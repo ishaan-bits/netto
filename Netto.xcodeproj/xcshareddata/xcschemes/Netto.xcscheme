@@ -64,6 +64,17 @@
                ReferencedContainer = "container:Netto.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "3C714AD286ED2BDA2ECCDF58"
+               BuildableName = "NettoUITests.xctest"
+               BlueprintName = "NettoUITests"
+               ReferencedContainer = "container:Netto.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>

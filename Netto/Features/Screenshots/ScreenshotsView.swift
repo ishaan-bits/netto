@@ -23,9 +23,26 @@ struct ScreenshotsView: View {
         GridItem(.adaptive(minimum: 100), spacing: Theme.Spacing.sm)
     ]
 
+    /// The state *category* on screen — never the payload, so a progress tick cannot remount
+    /// the grid.
+    private var phaseID: String {
+        switch phase {
+        case .permissionRequired: return "permissionRequired"
+        case .permissionDenied: return "permissionDenied"
+        case .scanRequired: return "scanRequired"
+        case .buildingCatalog: return "buildingCatalog"
+        case .failed: return "failed"
+        case .empty: return "empty"
+        case .results: return "results"
+        }
+    }
+
     var body: some View {
         content
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Screenshots")
+            .nettoAppear()
+            .nettoStateTransition(phaseID)
             .onAppear {
                 env.refreshPermissions()
                 env.synchronizeScreenshotDataset()
@@ -117,6 +134,11 @@ struct ScreenshotsView: View {
                     .padding(.horizontal, Theme.Spacing.md)
                     .padding(.top, Theme.Spacing.md)
             }
+
+            summaryHeader(count: records.count)
+                .padding(.horizontal, Theme.Spacing.md)
+                .padding(.top, Theme.Spacing.md)
+
             LazyVGrid(columns: columns, spacing: Theme.Spacing.sm) {
                 ForEach(records, id: \.localIdentifier) { record in
                     cell(for: record)
@@ -124,6 +146,7 @@ struct ScreenshotsView: View {
             }
             .padding(Theme.Spacing.md)
         }
+        .background(NettoColor.background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) { selectionBar }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -145,7 +168,7 @@ struct ScreenshotsView: View {
             .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.sm))
             .overlay {
                 RoundedRectangle(cornerRadius: Theme.Radius.sm)
-                    .stroke(isSelected ? Theme.Palette.accent : .clear, lineWidth: 3)
+                    .stroke(isSelected ? NettoColor.brand : .clear, lineWidth: 3)
             }
             .overlay(alignment: .topTrailing) {
                 if isSelected {
@@ -153,12 +176,14 @@ struct ScreenshotsView: View {
                         .font(.subheadline)
                         .foregroundStyle(.white)
                         .padding(5)
-                        .background(Circle().fill(Theme.Palette.accent))
+                        .background(Circle().fill(NettoColor.brand))
                         .padding(6)
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
             }
         }
-        .buttonStyle(.plain)
+        .nettoPress()
+        .nettoAnimate(.selection, value: isSelected)
         .accessibilityLabel("Screenshot")
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
@@ -193,6 +218,7 @@ struct ScreenshotsView: View {
                 Text("\(env.screenshotSelection.selectedCount) of \(env.screenshotSelection.datasetCount) screenshots selected")
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
+                    .nettoCount(env.screenshotSelection.selectedCount)
                 Text("Nothing is deleted yet")
                     .font(.caption2)
                     .foregroundStyle(Theme.Palette.secondaryLabel)
@@ -204,12 +230,13 @@ struct ScreenshotsView: View {
                 ReviewSelectionView(source: .screenshots)
             } label: {
                 Text("Review")
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(NettoPrimaryButtonStyle())
             .disabled(env.screenshotSelection.selectedCount == 0)
+            .opacity(env.screenshotSelection.selectedCount == 0 ? 0.45 : 1)
         }
-        .padding(Theme.Spacing.md)
-        .background(.bar)
+        .nettoFloatingBar()
     }
 
     // MARK: Helpers
@@ -219,26 +246,27 @@ struct ScreenshotsView: View {
         fraction: Double?,
         cancel: @escaping () -> Void
     ) -> some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
-            if let fraction {
-                ProgressView(value: fraction)
-                    .progressViewStyle(.linear)
-                    .tint(Theme.Palette.accent)
-                    .frame(maxWidth: 260)
-            } else {
-                ProgressView()
-            }
-            Text(message)
-                .font(.subheadline)
+        NettoProgressPanel(message: message, fraction: fraction, cancel: cancel)
+    }
+
+    /// Real, counted total — nothing here is estimated.
+    private func summaryHeader(count: Int) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: NettoLayout.Spacing.sm) {
+            Text("\(count)")
+                .font(NettoType.metricNumber)
                 .monospacedDigit()
-                .multilineTextAlignment(.center)
-            Button("Cancel", action: cancel)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            Spacer()
+                .foregroundStyle(NettoColor.textPrimary)
+                .nettoCount(count)
+            Text(count == 1 ? "screenshot" : "screenshots")
+                .font(NettoType.secondaryBody)
+                .foregroundStyle(NettoColor.textSecondary)
+            Spacer(minLength: NettoLayout.Spacing.sm)
+            Text("flagged on this iPhone")
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textTertiary)
         }
-        .padding(.horizontal, Theme.Spacing.xl)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(count) screenshots flagged on this iPhone")
     }
 
     private func openSettings() {

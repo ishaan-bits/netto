@@ -36,11 +36,30 @@ struct ReviewSelectionView: View {
 
     var body: some View {
         content
+            .background(NettoColor.background.ignoresSafeArea())
             .navigationTitle("Review & Delete")
             .navigationBarTitleDisplayMode(.inline)
+            .nettoAppear()
+            .nettoStateTransition(phaseID, purpose: .destructive)
             .onAppear {
                 env.reviewDidAppear(from: source)
             }
+    }
+
+    /// The state *category* on screen — never the payload, so progress text cannot remount
+    /// the review.
+    private var phaseID: String {
+        switch phase {
+        case .empty: return "empty"
+        case .building: return "building"
+        case .ready: return "ready"
+        case .stale: return "stale"
+        case .deleting: return "deleting"
+        case .succeeded: return "succeeded"
+        case .needsReview: return "needsReview"
+        case .failed: return "failed"
+        case .permissionRequired: return "permissionRequired"
+        }
     }
 
     // MARK: Phase dispatch
@@ -92,14 +111,23 @@ struct ReviewSelectionView: View {
         return List {
             Section {
                 VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
-                    Text("\(plan.count) \(plan.count == 1 ? "item" : "items") selected for deletion")
-                        .font(.headline)
+                    HStack(alignment: .firstTextBaseline, spacing: NettoLayout.Spacing.xs) {
+                        Text("\(plan.count)")
+                            .font(NettoType.metricNumber)
+                            .monospacedDigit()
+                            .foregroundStyle(NettoColor.textPrimary)
+                            .nettoCount(plan.count)
+                        Text(plan.count == 1 ? "item selected for deletion" : "items selected for deletion")
+                            .font(NettoType.cardTitle)
+                            .foregroundStyle(NettoColor.textPrimary)
+                    }
                     Text(DeletionPresentation.categorySummary(for: plan))
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
+                        .font(NettoType.secondaryBody)
+                        .foregroundStyle(NettoColor.textSecondary)
                     Text(DeletionPresentation.sizeMessage(for: plan))
-                        .font(.subheadline.weight(.medium))
+                        .font(NettoType.secondaryBody.weight(.medium))
                         .monospacedDigit()
+                        .foregroundStyle(NettoColor.brandDeep)
                 }
                 .padding(.vertical, Theme.Spacing.xs)
             }
@@ -126,6 +154,8 @@ struct ReviewSelectionView: View {
             .font(.caption)
             .foregroundStyle(Theme.Palette.secondaryLabel)
         }
+        .scrollContentBackground(.hidden)
+        .background(NettoColor.background.ignoresSafeArea())
         .safeAreaInset(edge: .bottom) {
             actionBar(plan)
         }
@@ -150,27 +180,28 @@ struct ReviewSelectionView: View {
     private func itemRow(_ item: DeletionPlanItem) -> some View {
         HStack(spacing: Theme.Spacing.md) {
             PhotoThumbnailView(assetID: item.localIdentifier, pointSize: 48, store: env.thumbnails)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.sm))
+                .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous))
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(label(for: item))
                     .font(.subheadline)
+                    .foregroundStyle(NettoColor.textPrimary)
                 if let bytes = item.sizeInBytes {
                     Text(ByteFormat.string(bytes))
                         .font(.caption)
                         .monospacedDigit()
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
+                        .foregroundStyle(NettoColor.textSecondary)
                 } else {
                     Text("Size unavailable")
                         .font(.caption)
-                        .foregroundStyle(Theme.Palette.secondaryLabel)
+                        .foregroundStyle(NettoColor.warning)
                 }
             }
 
             Spacer()
 
             Image(systemName: "trash")
-                .foregroundStyle(Theme.Palette.danger)
+                .foregroundStyle(NettoColor.destructive)
         }
         .accessibilityElement(children: .combine)
     }
@@ -186,61 +217,59 @@ struct ReviewSelectionView: View {
         }
     }
 
+    /// The single place deletion can be started. The two buttons are deliberately separated —
+    /// "Change Selection" is quiet, the destructive action is the only filled control — and the
+    /// destructive button still only opens the system confirmation dialog.
     private func actionBar(_ plan: DeletionPlan) -> some View {
-        HStack(spacing: Theme.Spacing.md) {
+        HStack(spacing: NettoLayout.Spacing.md) {
             Button {
                 dismiss()
             } label: {
                 Text("Change Selection")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(NettoSecondaryButtonStyle())
 
-            Spacer()
+            Spacer(minLength: NettoLayout.Spacing.sm)
 
             Button(role: .destructive) {
                 showConfirmation = true
             } label: {
                 Text(DeletionPresentation.destructiveTitle(for: plan))
+                    .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.Palette.danger)
+            .buttonStyle(NettoDestructiveButtonStyle())
+            .accessibilityIdentifier("confirmDeletionButton")
         }
-        .padding(Theme.Spacing.md)
-        .background(.bar)
+        .frame(maxWidth: .infinity)
+        .nettoFloatingBar()
     }
 
     // MARK: Other states
 
     private var buildingState: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
-            ProgressView()
-            Text("Preparing your review…")
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-            Text("Resolving real sizes for the selected items.")
-                .font(.caption)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, Theme.Spacing.xl)
+        NettoProgressPanel(
+            message: "Preparing your review…\nResolving real sizes for the selected items."
+        )
     }
 
     private var deletingState: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer()
+        VStack(spacing: NettoLayout.Spacing.lg) {
+            Spacer(minLength: NettoLayout.Spacing.xxl)
             ProgressView()
+                .tint(NettoColor.brand)
             Text("Deleting…")
-                .font(.headline)
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
             Text("Netto is removing exactly the items you reviewed. This cannot be undone from here — they stay recoverable in Recently Deleted.")
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.secondaryBody)
+                .foregroundStyle(NettoColor.textSecondary)
                 .multilineTextAlignment(.center)
-            Spacer()
+                .lineSpacing(3)
+            Spacer(minLength: NettoLayout.Spacing.xxl)
         }
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, Theme.Spacing.xl)
+        .padding(.horizontal, NettoLayout.Spacing.xl)
+        .nettoAppear()
     }
 
     private func staleState(_ reasons: [PlanStalenessReason]) -> some View {
@@ -305,28 +334,57 @@ private struct ReviewPhaseMessage: View {
     var primaryTitle: String?
     var primaryAction: () -> Void = {}
 
+    private var isPositive: Bool {
+        systemImage.hasPrefix("checkmark")
+    }
+
+    private var isDestructiveOutcome: Bool {
+        systemImage.hasPrefix("exclamationmark")
+    }
+
     var body: some View {
-        VStack(spacing: Theme.Spacing.lg) {
-            Spacer(minLength: Theme.Spacing.xl)
-            Image(systemName: systemImage)
-                .font(.system(size: 44))
-                .foregroundStyle(Theme.Palette.accent)
+        VStack(spacing: NettoLayout.Spacing.lg) {
+            Spacer(minLength: NettoLayout.Spacing.xl)
+
+            ZStack {
+                Circle()
+                    .fill(iconTint.opacity(0.16))
+                    .frame(width: 96, height: 96)
+                Image(systemName: systemImage)
+                    .font(.system(size: 38, weight: .semibold))
+                    .foregroundStyle(iconTint)
+                    .nettoSuccessPop(isPositive)
+            }
+            .accessibilityHidden(true)
+
             Text(title)
-                .font(.title3.weight(.semibold))
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
                 .multilineTextAlignment(.center)
+
             Text(message)
-                .font(.subheadline)
-                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .font(NettoType.secondaryBody)
+                .foregroundStyle(NettoColor.textSecondary)
                 .multilineTextAlignment(.center)
-                .padding(.horizontal, Theme.Spacing.xl)
+                .lineSpacing(3)
+                .padding(.horizontal, NettoLayout.Spacing.xl)
+
             if let primaryTitle {
                 Button(primaryTitle, action: primaryAction)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                    .buttonStyle(NettoPrimaryButtonStyle())
+                    .padding(.horizontal, NettoLayout.Spacing.xl)
             }
-            Spacer(minLength: Theme.Spacing.xl)
+
+            Spacer(minLength: NettoLayout.Spacing.xl)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .nettoAppear()
+    }
+
+    private var iconTint: Color {
+        if isPositive { return NettoColor.success }
+        if isDestructiveOutcome { return NettoColor.warning }
+        return NettoColor.brand
     }
 }
 
