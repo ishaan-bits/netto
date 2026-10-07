@@ -163,18 +163,22 @@ struct PhotoKitContentFingerprinter: ContentFingerprinting {
         // Completeness rules — a fingerprint is only meaningful if it covers the asset's full
         // local content.
         if record.isLivePhoto, videoURL == nil {
+            PhotoKitFailureTally.record(code: "input:liveVideoMissing")
             return .failure(PhotoAnalysisUnavailableReason.contentUnreadable)
         }
         if record.isVideo, videoURL == nil {
+            PhotoKitFailureTally.record(code: "input:videoURLMissing")
             return .failure(PhotoAnalysisUnavailableReason.contentUnreadable)
         }
         guard imageURL != nil || videoURL != nil else {
+            PhotoKitFailureTally.record(code: "input:noURL")
             return .failure(PhotoAnalysisUnavailableReason.contentUnreadable)
         }
 
         var image: (url: URL, bytes: Int64)?
         if let url = imageURL {
             guard let bytes = ContentHasher.fileSize(at: url) else {
+                PhotoKitFailureTally.record(code: "input:imageStatFailed")
                 return .failure(PhotoAnalysisUnavailableReason.contentUnreadable)
             }
             image = (url, bytes)
@@ -183,6 +187,7 @@ struct PhotoKitContentFingerprinter: ContentFingerprinting {
         var video: (url: URL, bytes: Int64)?
         if let url = videoURL {
             guard let bytes = ContentHasher.fileSize(at: url) else {
+                PhotoKitFailureTally.record(code: "input:videoStatFailed")
                 return .failure(PhotoAnalysisUnavailableReason.contentUnreadable)
             }
             video = (url, bytes)
@@ -194,6 +199,7 @@ struct PhotoKitContentFingerprinter: ContentFingerprinting {
     /// `PHContentEditingInputErrorKey` NSError → analysis vocabulary, using the documented
     /// `PHPhotosError` codes (iOS 15+, verified in the installed SDK headers).
     static func reason(forPhotosError error: any Error) -> any Error {
+        PhotoKitFailureTally.record(error)
         let nsError = error as NSError
         guard nsError.domain == PHPhotosErrorDomain else { return error }
         switch nsError.code {

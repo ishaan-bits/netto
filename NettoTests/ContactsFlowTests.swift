@@ -241,7 +241,7 @@ struct ContactsFlowTests {
         #expect(recorder.callCount == 0)
     }
 
-    @Test func confirmedDeleteRunsToVerifiedSuccessAndResetsContactsState() async {
+    @Test func confirmedDeleteKeepsTheContactsScanAndPrunesTheDataset() async {
         let (env, recorder) = makeEnv(outcome: .succeeded(ContactMutationSuccess(
             plannedCount: 2,
             verifiedRemovedCount: 2,
@@ -250,6 +250,7 @@ struct ContactsFlowTests {
             destinationID: nil
         )))
         await prepareDelete(in: env)
+        let datasetBefore = completedDataset(env)
 
         env.beginContactConfirmation()
         await env.confirmContactAction()
@@ -259,14 +260,20 @@ struct ContactsFlowTests {
             return
         }
         #expect(recorder.callCount == 1)
-        // Contacts changed: selection gone, dataset dropped, a fresh scan is due.
-        #expect(env.contactSelection.isEmpty)
-        #expect(env.contactScanState == .notStarted)
 
-        // And the new scan is allowed immediately (nothing is stuck in executing).
-        env.startContactScanIfNeeded()
-        #expect(env.contactScanState == .running)
-        _ = await waitForScan(env)
+        // The completed scan stays completed: only the two confirmed removals leave the
+        // dataset — their group dissolves, every other fixture group stands — and no fresh
+        // scan is started.
+        guard case .completed(let dataset) = env.contactScanState else {
+            Issue.record("expected the contacts scan to stay completed, got \(env.contactScanState)")
+            return
+        }
+        #expect(dataset.records.count == datasetBefore.records.count - 2)
+        #expect(!dataset.identifiers.contains("fixture-contact-01"))
+        #expect(!dataset.identifiers.contains("fixture-contact-02"))
+        #expect(dataset.groups.count == ContactFixture.expectedGroupCount - 1)
+        // The acted-on group dissolved, so its selection drops with it.
+        #expect(env.contactSelection.isEmpty)
     }
 
     @Test func partialRemovalIsReportedAsNeedsReviewNotSuccess() async {
@@ -287,6 +294,18 @@ struct ContactsFlowTests {
             return
         }
         #expect(success.remainingIDs == ["fixture-contact-02"])
+
+        // Only the confirmed removal leaves the completed scan: "01" is gone, "02" (which
+        // the service reports as still present) remains — with its only partner gone its
+        // group dissolves, while the other fixture groups stand.
+        guard case .completed(let dataset) = env.contactScanState else {
+            Issue.record("expected the contacts scan to stay completed, got \(env.contactScanState)")
+            return
+        }
+        #expect(!dataset.identifiers.contains("fixture-contact-01"))
+        #expect(dataset.identifiers.contains("fixture-contact-02"))
+        #expect(dataset.groups.count == ContactFixture.expectedGroupCount - 1)
+        #expect(env.contactSelection.isEmpty)
     }
 
     @Test func staleOutcomeKeepsThePlanStale() async {
@@ -334,6 +353,8 @@ struct ContactsFlowTests {
     @Test func verificationFailureLandsInFailedWithItsOwnMessage() async {
         let (env, _) = makeEnv(outcome: .verificationFailed("The change was requested, but not confirmed."))
         await prepareDelete(in: env)
+        let datasetBefore = completedDataset(env)
+        let selectionBefore = env.contactSelection.selectedIDs
 
         env.beginContactConfirmation()
         await env.confirmContactAction()
@@ -343,14 +364,28 @@ struct ContactsFlowTests {
             return
         }
         #expect(message == "The change was requested, but not confirmed.")
-        // Requested-but-unverified: the store may have changed, so the scan and the group
-        // selection are dropped — identical to the success path's reset.
-        if case .notStarted = env.contactScanState {
-            // expected
-        } else {
-            Issue.record("stale contact scan survived an unverified mutation, got \(env.contactScanState)")
+        // Requested-but-unverified: nothing is confirmed removed, so the completed scan
+        // and the group selection stand exactly as they were.
+        #expect(env.contactScanState == .completed(datasetBefore))
+        #expect(env.contactSelection.selectedIDs == selectionBefore)
+    }
+
+    @Test func storeFailureLeavesTheContactsScanAndSelectionUntouched() async {
+        let (env, _) = makeEnv(outcome: .mutationFailed("save failed"))
+        await prepareDelete(in: env)
+        let datasetBefore = completedDataset(env)
+        let selectionBefore = env.contactSelection.selectedIDs
+
+        env.beginContactConfirmation()
+        await env.confirmContactAction()
+
+        guard case .failed = env.contactActionState else {
+            Issue.record("expected failed, got \(env.contactActionState)")
+            return
         }
-        #expect(env.contactSelection.isEmpty)
+        // Nothing changed, so nothing moves: the completed scan and the selection stand.
+        #expect(env.contactScanState == .completed(datasetBefore))
+        #expect(env.contactSelection.selectedIDs == selectionBefore)
     }
 
     @Test func contactReviewDidAppearDuringExecutionIsANoOp() {

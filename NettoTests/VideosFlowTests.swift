@@ -367,7 +367,7 @@ struct VideosFlowTests {
         #expect(DeletionPresentation.noun(for: plan).many == "Videos")
     }
 
-    @Test func deletionSuccessResetsVideoSelectionMeasurementAndCatalog() async {
+    @Test func deletionSuccessPrunesTheVideoDatasetAndKeepsTheCatalog() async {
         let (env, _) = makeVideoEnv()
         selectVideos(["video-01"], in: env)
         env.prepareDeletionPlan(from: .videos)
@@ -376,11 +376,18 @@ struct VideosFlowTests {
         env.beginConfirmation()
         await env.confirmDeletion()
 
-        // The library changed: every dataset-derived fact is dropped.
-        #expect(env.videoSelection.datasetIDs.isEmpty)
+        // The deleted video leaves the catalog-derived selection; everything else stands —
+        // the catalog stays completed (pruned in place), measurement resets, no scan starts.
+        #expect(env.videoSelection.datasetCount == VideosFixture.videos.count - 1)
+        #expect(!env.videoSelection.datasetIDs.contains("video-01"))
         #expect(env.videoSelection.selectedIDs.isEmpty)
         #expect(env.videoSizeResolution == .idle)
-        #expect(env.catalogState == .notStarted)
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stay completed, got \(env.catalogState)")
+            return
+        }
+        #expect(!catalog.records.contains { $0.localIdentifier == "video-01" })
+        #expect(catalog.records.count == VideosFixture.records.count - 1)
         #expect(env.analysisState == .notStarted)
     }
 

@@ -150,7 +150,7 @@ struct DeletionFlowTests {
 
     // MARK: Outcomes
 
-    @Test func successfulDeletionResetsLibraryStateAndRefreshesStorage() async {
+    @Test func successfulDeletionPreservesTheCompletedResultAndRefreshesStorage() async {
         let (env, service) = makeEnv(outcome: .succeeded(DeletionSuccess(
             plannedCount: 2,
             verifiedRemovedCount: 2,
@@ -168,9 +168,25 @@ struct DeletionFlowTests {
             remainingIDs: []
         )))
         #expect(service.callCount == 1)
+
+        // The completed scan stands: only the confirmed removals are applied — the sole
+        // two-member group dissolves, nothing is left selected, and no rescan is started.
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("expected the analysis to stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.exactGroups.isEmpty)
+        #expect(result.similarGroups.isEmpty)
+        #expect(result.totalRecordCount == DeletionFlowFixtures.result.totalRecordCount)
         #expect(env.selection.selectedCount == 0)
-        #expect(env.analysisState == .notStarted)
-        #expect(env.catalogState == .notStarted)
+        #expect(env.analysisState.isRunning == false)
+
+        // The catalog is pruned in place, never dropped back to "start analysis".
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stay completed, got \(env.catalogState)")
+            return
+        }
+        #expect(catalog.records.isEmpty)
         #expect(env.storageSnapshot != nil)
     }
 
@@ -256,8 +272,20 @@ struct DeletionFlowTests {
             verifiedRemovedCount: 1,
             remainingIDs: ["b"]
         )))
-        // Even a partial result changed Photos: the dataset is still invalidated.
-        #expect(env.analysisState == .notStarted)
+        // Partial outcome: only the confirmed removal leaves the completed result — "a" is
+        // gone from the groups and the catalog, "b" (which the service reports as still
+        // present) is untouched.
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("expected the analysis to stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.exactGroups.isEmpty)
+        #expect(env.selection.selectedCount == 0)
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stay completed, got \(env.catalogState)")
+            return
+        }
+        #expect(catalog.records.map(\.localIdentifier) == ["b"])
     }
 
     @Test func cancelledOutcomeReturnsToReviewForRetry() async {
@@ -290,13 +318,156 @@ struct DeletionFlowTests {
             return
         }
         #expect(message.contains("could not be verified"))
-        // Requested-but-unverified: the library may have changed, so every dataset-derived
-        // fact is dropped — identical to the success path's reset.
-        #expect(env.analysisState == .notStarted)
-        #expect(env.selection.selectedCount == 0)
-        if case .completed = env.catalogState {
-            Issue.record("stale catalog survived an unverified deletion")
+        // Requested-but-unverified: nothing is confirmed removed, so every completed result,
+        // the selection, and the catalog stand exactly as they were.
+        #expect(env.analysisState == .completed(DeletionFlowFixtures.result))
+        #expect(env.selection.selectedCount == 2)
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stand after an unverified deletion, got \(env.catalogState)")
+            return
         }
+        #expect(catalog.records.map(\.localIdentifier) == ["a", "b"])
+    }
+
+    @Test func deletingOneMemberKeepsTheGroupAndItsRecommendation() async {
+        let (env, _) = makeEnv(
+            records: ["c", "d", "e"].map { makeRecord(id: $0) },
+            outcome: .succeeded(DeletionSuccess(
+                plannedCount: 1,
+                verifiedRemovedCount: 1,
+                remainingIDs: []
+            )),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(groups: [DeletionFlowFixtures.threeMemberGroup])
+        env.mutateSelection {
+            $0.deselectAll()
+            $0.toggle("d")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("expected the analysis to stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.similarGroups.count == 1)
+        let group = result.similarGroups[0]
+        #expect(group.memberAssetIDs == ["c", "e"])
+        #expect(group.recommendedBestAssetID == "c")
+        #expect(env.selection.selectedCount == 0)
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stay completed, got \(env.catalogState)")
+            return
+        }
+        #expect(catalog.records.map(\.localIdentifier) == ["c", "e"])
+    }
+
+    @Test func deletingTheRecommendedKeepPromotesARemainingMember() async {
+        let (env, _) = makeEnv(
+            records: ["c", "d", "e"].map { makeRecord(id: $0) },
+            outcome: .succeeded(DeletionSuccess(
+                plannedCount: 1,
+                verifiedRemovedCount: 1,
+                remainingIDs: []
+            )),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(groups: [DeletionFlowFixtures.threeMemberGroup])
+        env.mutateSelection {
+            $0.deselectAll()
+            $0.toggle("c")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("expected the analysis to stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.similarGroups.count == 1)
+        let group = result.similarGroups[0]
+        #expect(group.memberAssetIDs == ["d", "e"])
+        #expect(group.recommendedBestAssetID == "d")
+        #expect(env.selection.selectedCount == 0)
+    }
+
+    @Test func mutationFailureLeavesTheResultSelectionAndSnapshotUntouched() async {
+        let store = InMemoryScanSnapshotStore()
+        let completedAt = Date(timeIntervalSince1970: 1_758_999_000)
+        try? store.save(ScanSnapshot(
+            schemaVersion: ScanSnapshot.currentSchemaVersion,
+            scanID: "original-scan",
+            completedAt: completedAt,
+            result: DeletionFlowFixtures.result
+        ))
+        let (env, _) = makeEnv(outcome: .mutationFailed("PHPhotosErrorDomain Code=-1"), snapshotStore: store)
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .failed = env.deletionState else {
+            Issue.record("expected failed, got \(env.deletionState)")
+            return
+        }
+        // Nothing changed, so nothing moves: the completed result, the selection, the
+        // catalog, and the persisted snapshot are all exactly as they were.
+        #expect(env.analysisState == .completed(DeletionFlowFixtures.result))
+        #expect(env.selection.selectedCount == 2)
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stand after a failed deletion, got \(env.catalogState)")
+            return
+        }
+        #expect(catalog.records.map(\.localIdentifier) == ["a", "b"])
+        #expect(store.saveCount == 1)
+        #expect(store.loadLatest()?.scanID == "original-scan")
+        #expect(store.loadLatest()?.result == DeletionFlowFixtures.result)
+    }
+
+    @Test func successfulDeletionPersistsAnUpdatedSnapshotOfTheSameScan() async {
+        let store = InMemoryScanSnapshotStore()
+        let completedAt = Date(timeIntervalSince1970: 1_758_999_000)
+        try? store.save(ScanSnapshot(
+            schemaVersion: ScanSnapshot.currentSchemaVersion,
+            scanID: "original-scan",
+            completedAt: completedAt,
+            result: DeletionFlowFixtures.result
+        ))
+        let (env, _) = makeEnv(snapshotStore: store)
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .completed(let updated) = env.analysisState else {
+            Issue.record("expected the analysis to stay completed, got \(env.analysisState)")
+            return
+        }
+        // Same completed scan, updated result: the identity is preserved, only the
+        // confirmed removals are applied.
+        guard let persisted = store.loadLatest() else {
+            Issue.record("expected the updated snapshot to persist")
+            return
+        }
+        #expect(persisted.scanID == "original-scan")
+        #expect(persisted.completedAt == completedAt)
+        #expect(persisted.result == updated)
+        #expect(persisted.result.exactGroups.isEmpty)
+        #expect(env.lastScanCompletedAt == completedAt)
+
+        // A fresh launch restores the updated result, not the pre-deletion one.
+        let restored = makeEnv(snapshotStore: store).env
+        await restored.bootstrap()
+        #expect(restored.analysisState == .completed(updated))
+        #expect(restored.lastScanCompletedAt == completedAt)
+        #expect(restored.selection.selectedCount == 0)
     }
 
     // MARK: Cross-feature invalidation
@@ -396,17 +567,44 @@ struct DeletionFlowTests {
         }
     }
 
+    // MARK: Deselect All (global)
+
+    @Test func deselectAllStalesAPreparedPlanWithoutDeleting() async {
+        let (env, service) = makeEnv()
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+
+        env.mutateSelection { $0.deselectAll() }
+
+        // Stale plan, not deletion — Review reopens empty and the deletion engine
+        // is never invoked.
+        guard case .planStale(_, let reasons) = env.deletionState else {
+            Issue.record("expected planStale, got \(env.deletionState)")
+            return
+        }
+        #expect(reasons.contains(.selectionChanged))
+        #expect(env.selection.selectedCount == 0)
+        #expect(service.callCount == 0)
+    }
+
     // MARK: Helpers
 
     private func makeEnv(
+        records: [PhotoAssetRecord] = [makeRecord(id: "a"), makeRecord(id: "b")],
         sizeProvider: FakeSizeProvider = FakeSizeProvider(sizes: ["b": 500]),
         outcome: DeletionOutcome = .succeeded(DeletionSuccess(
             plannedCount: 2,
             verifiedRemovedCount: 2,
             remainingIDs: []
-        ))
+        )),
+        result: PhotoAnalysisResult = DeletionFlowFixtures.result,
+        snapshotStore: InMemoryScanSnapshotStore = InMemoryScanSnapshotStore()
     ) -> (env: AppEnvironment, service: RecordingDeletionService) {
-        let records = [makeRecord(id: "a"), makeRecord(id: "b")]
         let service = RecordingDeletionService(outcome: outcome)
         let env = AppEnvironment(
             storageProvider: FakeStorage(),
@@ -414,6 +612,8 @@ struct DeletionFlowTests {
             makePhotoLibrary: { FakeLibrary(records: records) },
             sizeProvider: sizeProvider,
             deletionService: service,
+            // Completions in this suite must never touch the app's real persisted snapshot.
+            scanSnapshotStore: snapshotStore,
             sessionToken: "session-1"
         )
         env.photoPermissionState = .authorized
@@ -422,7 +622,7 @@ struct DeletionFlowTests {
             libraryAssetCount: records.count,
             accessLevel: .authorized
         ))
-        env.analysisState = .completed(DeletionFlowFixtures.result)
+        env.analysisState = .completed(result)
         return (env, service)
     }
 
@@ -477,6 +677,26 @@ private enum DeletionFlowFixtures {
         totalRecordCount: 2,
         candidateBucketCount: 1,
         candidatePairCount: 1
+    )
+
+    static let threeMemberGroup = PhotoSimilarityGroup(
+        kind: .nearDuplicates,
+        memberAssetIDs: ["c", "d", "e"],
+        evidence: .visualSimilarity(minDistance: 0.1, maxDistance: 0.4, threshold: 0.6),
+        recommendedBestAssetID: "c",
+        memberScores: [:]
+    )
+
+    static let threeMemberResult = PhotoAnalysisResult(
+        exactGroups: [group],
+        similarGroups: [threeMemberGroup],
+        unavailableAssets: [],
+        descriptorKind: nil,
+        visionAvailable: false,
+        similarityThreshold: 0.6,
+        totalRecordCount: 5,
+        candidateBucketCount: 2,
+        candidatePairCount: 4
     )
 }
 

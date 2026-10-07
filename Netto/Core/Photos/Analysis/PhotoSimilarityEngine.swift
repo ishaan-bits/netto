@@ -2,7 +2,8 @@ import CoreGraphics
 import Foundation
 
 struct PhotoAnalysisConfiguration: Sendable, Equatable {
-    /// Metadata bucketing rules (aspect tolerance, temporal gap, bucket size cap).
+    /// Metadata bucketing rules (aspect tolerance, temporal gap, bucket size cap, video
+    /// duration quantum).
     var bucketing: CandidateBucketsConfiguration = .default
     /// L2 threshold for near-duplicate grouping. `nil` → the descriptor family's provisional
     /// default (`FeaturePrintKind.defaultSimilarityThreshold`), which is calibrated only on
@@ -10,8 +11,21 @@ struct PhotoAnalysisConfiguration: Sendable, Equatable {
     var similarityThreshold: Float?
     /// Fixed worker width for fingerprinting and extraction. Never one task per asset.
     var maxConcurrentWorkers: Int = 4
-    /// Longest thumbnail side requested from PhotoKit. Full-resolution pixels are never decoded.
-    var thumbnailMaxPixelSize: Int = 256
+    /// Requests in flight during the cheap perceptual pass. That pass is network-bound: an
+    /// asset that is not local waits on Photos' make-available path for seconds each, so at
+    /// `maxConcurrentWorkers` the cheap stage alone would take hours on a non-local library.
+    /// Bounded and explicit — never one task per asset (64 ≪ library size).
+    var fingerprintThumbnailConcurrency: Int = 64
+    /// Longest thumbnail side for the cheap perceptual gate. Small on purpose: this pass only
+    /// decides which pairs are worth a descriptor, and it runs for every multi-bucket image.
+    var perceptualThumbnailMaxPixelSize: Int = 96
+    /// Longest thumbnail side for descriptor input — the pixels the near-duplicate decision
+    /// rests on, so this one is exact.
+    var verificationThumbnailMaxPixelSize: Int = 256
+    /// Hamming distance (of 64) within which two same-bucket images still earn a descriptor
+    /// comparison. Deliberately generous: a false positive costs one small thumbnail and one
+    /// descriptor; a false negative silently loses a candidate pair.
+    var perceptualCandidateMaxHamming: Int = 16
 
     init() {}
 }
@@ -20,17 +34,22 @@ struct PhotoAnalysisConfiguration: Sendable, Equatable {
 /// duplicates by visual descriptor, over a catalog of `PhotoAssetRecord`s.
 ///
 /// Contract:
-/// - **Analysis only.** Reads metadata, thumbnails, and (for length collisions) content bytes.
-///   Never mutates the photo library, never requests network access, never retains full-
-///   resolution pixels or `UIImage`s.
-/// - **Bounded work.** Two independent complexity bounds: exact detection costs one stat per
-///   asset plus SHA-256 only for byte-length collisions; near detection compares only inside
-///   candidate buckets (`Σ size(size-1)/2`, never `n(n-1)/2`), with a fixed-width worker pool.
+/// - **Analysis only.** Reads metadata, bounded thumbnails, and (for confirmed exact pairs)
+///   content bytes. Never mutates the photo library, never requests network access (thumbnails
+///   and content are both local-only — see `PhotoKitThumbnailLoader`), never retains
+///   full-resolution pixels or `UIImage`s.
+/// - **Cheap first.** Work is ordered so the expensive passes run only for assets that survive
+///   the cheap ones: metadata buckets skip singletons outright; multi-bucket images cost one
+///   96 px perceptual thumbnail (no Vision, no content); descriptors are extracted only for
+///   pairs within `perceptualCandidateMaxHamming`; content bytes are read only to confirm
+///   perceptually identical pairs (images) or length-colliding videos. Complexity stays
+///   `Σ size(size-1)/2` inside buckets — never `n(n-1)/2` — with a fixed-width worker pool.
 /// - **Cancellable end to end.** Stream termination cancels the producer; every stage boundary
 ///   and worker loop checks cancellation; in-flight PhotoKit requests are cancelled through
 ///   `PendingPhotoRequest`.
-/// - **Honest about gaps.** Assets that cannot be analyzed are reported with a reason, never
-///   silently classified as duplicates or as clean.
+/// - **Honest about gaps.** Every asset ends in exactly one bucket: analyzed (evidence
+///   produced), unavailable (a request failed, with a reason), or skipped (no candidate partner
+///   could exist — reported as skipped, never as failed and never as analyzed).
 struct PhotoSimilarityEngine: Sendable {
     let configuration: PhotoAnalysisConfiguration
     let fingerprinter: any ContentFingerprinting
@@ -116,6 +135,9 @@ struct PhotoSimilarityEngine: Sendable {
     ) async throws -> PhotoAnalysisResult {
         let runStart = DispatchTime.now().uptimeNanoseconds
         let metrics = engine.metrics
+        // Failure-code tally is per run: one summary must never include a previous run's
+        // failures (the validation harness runs cancel-then-full in one process).
+        PhotoKitFailureTally.reset()
         defer {
             engine.stageObserver.analysisDidFinish()
             // Total is recorded on every exit path — cancelled runs included, because a
@@ -147,6 +169,18 @@ struct PhotoSimilarityEngine: Sendable {
             configuration: config.bucketing
         )
         metrics?.record(.candidates, seconds: secondsSince(candidatesStart))
+        // Partition shape, recorded once: how much of the library sits in singletons (skip
+        // candidates under cheap-first) versus multi-record buckets (thumbnail-eligible).
+        let bucketSizes = bucketing.buckets.map(\.records.count)
+        metrics?.set(.bucketCount, to: bucketing.buckets.count)
+        metrics?.set(.bucketSingletons, to: bucketSizes.filter { $0 == 1 }.count)
+        metrics?.set(.bucketMulti, to: bucketSizes.filter { $0 > 1 }.count)
+        metrics?.set(
+            .bucketMultiAssets,
+            to: bucketSizes.reduce(0) { $0 + ($1 > 1 ? $1 : 0) }
+        )
+        metrics?.set(.videoBuckets, to: bucketing.videoBuckets.count)
+        metrics?.set(.candidatePairs, to: bucketing.candidatePairCount)
         try reporter.complete(.generatingCandidates, total: 0)
 
         let unavailable = LockedBox<[String: PhotoAnalysisUnavailableReason]>([:])
@@ -157,42 +191,117 @@ struct PhotoSimilarityEngine: Sendable {
             unavailable.insert(record.localIdentifier, reason: .notAnalyzable)
         }
 
-        // Stage 3: fingerprinting — exact-duplicate detection, two phases.
-        // Phase 1 stats content lengths for every image/video asset (no content read) and
-        // ticks progress per asset, so the longest phase of the scan shows real movement
-        // instead of sitting at 0 of N. Phase 2 hashes only byte-length collisions; the total
-        // grows by the collision count so each hash pass ticks too, and the stage ends at
-        // completed == total either way.
-        let eligible = records.filter { $0.isImage || $0.isVideo }
-        try reporter.enter(.fingerprinting, total: eligible.count)
+        // Cheap-first work partition:
+        // - multi-record image buckets → one 96 px perceptual thumbnail each (the candidate gate);
+        // - multi-record video buckets → one content-length stat each (exact path);
+        // - singletons (image and video) → skipped: no partner can exist inside their bucket,
+        //   so no request is ever issued for them.
+        let multiImageBuckets = bucketing.buckets.filter { $0.records.count > 1 }
+        let multiVideoBuckets = bucketing.videoBuckets.filter { $0.records.count > 1 }
+        let skippedImageCount = bucketing.buckets.filter { $0.records.count == 1 }.count
+        let skippedVideoCount = bucketing.videoBuckets.filter { $0.records.count == 1 }.count
+        metrics?.set(.thumbnailsSkipped, to: skippedImageCount)
+        metrics?.set(.assetsSkipped, to: skippedImageCount + skippedVideoCount)
 
+        var cheapWork: [AnalysisCheapWork] = []
+        cheapWork.reserveCapacity(
+            multiImageBuckets.reduce(0) { $0 + $1.records.count }
+                + multiVideoBuckets.reduce(0) { $0 + $1.records.count }
+        )
+        for bucket in multiImageBuckets {
+            for record in bucket.records { cheapWork.append(.perceptualHash(record)) }
+        }
+        for bucket in multiVideoBuckets {
+            for record in bucket.records { cheapWork.append(.videoByteKey(record)) }
+        }
+        let cheapCount = cheapWork.count
+
+        // Stage 3: fingerprinting — the cheap evidence pass. Images get a perceptual hash
+        // (no Vision, no content bytes); videos get a length stat (no content bytes). The
+        // total is the work-item count and grows by the video length-collision count so the
+        // SHA pass is counted units too — the stage always ends at completed == total.
+        let fingerprintWallStart = DispatchTime.now().uptimeNanoseconds
+        try reporter.enter(.fingerprinting, total: cheapCount)
+
+        let perceptualHashes = LockedBox<[String: PerceptualHash]>([:])
         let byteKeys = LockedBox<[String: ContentByteKey]>([:])
-        try await BoundedWorkers.run(items: eligible, width: workerWidth) { record in
+        let fingerprintWidth = max(workerWidth, config.fingerprintThumbnailConcurrency)
+        try await BoundedWorkers.run(items: cheapWork, width: fingerprintWidth) { work in
             guard !Task.isCancelled else { return }
-            do {
-                try Task.checkCancellation()
+            switch work {
+            case .perceptualHash(let record):
                 let phaseStart = DispatchTime.now().uptimeNanoseconds
-                let outcome = try await engine.fingerprinter.byteKey(for: record)
-                metrics?.record(.fingerprint, seconds: secondsSince(phaseStart))
-                switch outcome {
-                case .key(let key):
-                    byteKeys.write(record.localIdentifier, key)
-                case .unavailable(let reason):
-                    unavailable.insert(record.localIdentifier, reason: reason)
+                metrics?.increment(.thumbnailsRequested)
+                do {
+                    try Task.checkCancellation()
+                    let image = try await engine.thumbnailLoader.thumbnail(
+                        for: record.localIdentifier,
+                        targetPixelSize: config.perceptualThumbnailMaxPixelSize,
+                        mode: .perceptual
+                    )
+                    let elapsed = secondsSince(phaseStart)
+                    metrics?.record(.thumbnail, seconds: elapsed)
+                    let hash = try PerceptualHasher.hash(of: image)
+                    metrics?.increment(.thumbnailsSucceeded)
+                    perceptualHashes.write(record.localIdentifier, hash)
+                } catch is CancellationError {
+                    return
+                } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
+                    return
+                } catch {
+                    // Failed requests are timed and counted separately: on a non-local library
+                    // they are the dominant cost, and the split is what the validation report
+                    // reads. A hash failure after a successful fetch lands here too — the asset
+                    // produced no usable visual evidence.
+                    let elapsed = secondsSince(phaseStart)
+                    metrics?.record(.thumbnail, seconds: elapsed)
+                    metrics?.record(.thumbnailFailed, seconds: elapsed)
+                    metrics?.increment(.thumbnailsFailed)
+                    unavailable.insert(
+                        record.localIdentifier,
+                        reason: unavailableReason(for: error, kind: nil)
+                    )
                 }
-            } catch is CancellationError {
-                return
-            } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
-                return
-            } catch {
-                unavailable.insert(record.localIdentifier, reason: .contentUnreadable)
+            case .videoByteKey(let record):
+                let phaseStart = DispatchTime.now().uptimeNanoseconds
+                metrics?.increment(.contentRequestsAttempted)
+                do {
+                    try Task.checkCancellation()
+                    let outcome = try await engine.fingerprinter.byteKey(for: record)
+                    let elapsed = secondsSince(phaseStart)
+                    metrics?.record(.fingerprint, seconds: elapsed)
+                    switch outcome {
+                    case .key(let key):
+                        byteKeys.write(record.localIdentifier, key)
+                    case .unavailable(let reason):
+                        // Failures get their own duration bucket: a run whose library is not
+                        // local is almost entirely `contentFailed` time, and the report needs
+                        // that number separately from productive content work.
+                        metrics?.record(.contentFailed, seconds: elapsed)
+                        metrics?.increment(.contentRequestsFailed)
+                        unavailable.insert(record.localIdentifier, reason: reason)
+                    }
+                } catch is CancellationError {
+                    return
+                } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
+                    return
+                } catch {
+                    metrics?.record(.contentFailed, seconds: secondsSince(phaseStart))
+                    metrics?.increment(.contentRequestsFailed)
+                    unavailable.insert(
+                        record.localIdentifier,
+                        reason: contentFailureReason(for: error)
+                    )
+                }
             }
-            // Every eligible asset ticks exactly once, on the outcome — key, unavailable, or
-            // error — including timed-out requests, so phase 1 can never appear frozen.
-            try reporter.advance(.fingerprinting, total: eligible.count)
+            // Every work item ticks exactly once, on the outcome — success, unavailable, or
+            // error — including timed-out requests, so the stage can never appear frozen.
+            try reporter.advance(.fingerprinting, total: cheapCount)
         }
         try checkCancellation()
 
+        // Phase 2: SHA-256 only for videos whose length pairs collided. The total grows by
+        // the collision count so each hash pass ticks, and progress stays monotonic.
         var byKey: [ContentByteKey: [String]] = [:]
         for (assetID, key) in byteKeys.read() {
             byKey[key, default: []].append(assetID)
@@ -201,28 +310,29 @@ struct PhotoSimilarityEngine: Sendable {
             .filter { $0.count > 1 }
             .flatMap { $0 }
             .sorted()
-        // Completed is already `eligible.count` (phase 1 ticked every asset). The total grows
-        // by the collision count so phase 2's hashes are counted units — progress stays
-        // monotonic and the stage still ends exactly at completed == total.
         try reporter.setCount(
             .fingerprinting,
-            completed: eligible.count,
-            total: eligible.count + collidingIDs.count
+            completed: cheapCount,
+            total: cheapCount + collidingIDs.count
         )
 
         let fingerprints = LockedBox<[String: ContentFingerprint]>([:])
         let collidingRecords = collidingIDs.compactMap { recordsByID[$0] }
         try await BoundedWorkers.run(items: collidingRecords, width: workerWidth) { record in
             guard !Task.isCancelled else { return }
+            let phaseStart = DispatchTime.now().uptimeNanoseconds
+            metrics?.increment(.contentRequestsAttempted)
             do {
                 try Task.checkCancellation()
-                let phaseStart = DispatchTime.now().uptimeNanoseconds
                 let outcome = try await engine.fingerprinter.fingerprint(for: record)
-                metrics?.record(.fingerprint, seconds: secondsSince(phaseStart))
+                let elapsed = secondsSince(phaseStart)
+                metrics?.record(.fingerprint, seconds: elapsed)
                 switch outcome {
                 case .fingerprinted(let fingerprint):
                     fingerprints.write(record.localIdentifier, fingerprint)
                 case .unavailable(let reason):
+                    metrics?.record(.contentFailed, seconds: elapsed)
+                    metrics?.increment(.contentRequestsFailed)
                     unavailable.insert(record.localIdentifier, reason: reason)
                 }
             } catch is CancellationError {
@@ -230,18 +340,61 @@ struct PhotoSimilarityEngine: Sendable {
             } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
                 return
             } catch {
-                unavailable.insert(record.localIdentifier, reason: .contentUnreadable)
+                metrics?.record(.contentFailed, seconds: secondsSince(phaseStart))
+                metrics?.increment(.contentRequestsFailed)
+                unavailable.insert(
+                    record.localIdentifier,
+                    reason: contentFailureReason(for: error)
+                )
             }
-            try reporter.advance(.fingerprinting, total: eligible.count + collidingIDs.count)
+            try reporter.advance(.fingerprinting, total: cheapCount + collidingIDs.count)
         }
         try checkCancellation()
+        metrics?.record(.fingerprintWall, seconds: secondsSince(fingerprintWallStart))
 
-        // Stages 4+5: extractingFeatures ↔ comparing — interleaved per bucket. Each bucket's
-        // prints are extracted, compared, and released before the next bucket starts, so at most
-        // `workerWidth × maxBucketSize` prints (a few hundred KB) are alive at once.
-        let bucketedAssetCount = bucketing.buckets.reduce(0) { $0 + $1.records.count }
+        // The perceptual gate: inside each multi-bucket, keep only pairs within hamming
+        // tolerance. Everything else — including every singleton, which never reached stage 3 —
+        // costs no thumbnail beyond its hash and no descriptor at all.
+        let hashes = perceptualHashes.read()
+        let maxHamming = config.perceptualCandidateMaxHamming
+        var candidateWork: [CandidatePairWork] = []
+        candidateWork.reserveCapacity(multiImageBuckets.count)
+        for bucket in multiImageBuckets {
+            let hashed = bucket.records.compactMap { record -> (PhotoAssetRecord, PerceptualHash)? in
+                guard let hash = hashes[record.localIdentifier] else { return nil }
+                return (record, hash)
+            }
+            guard hashed.count > 1 else { continue }
+            var pairs: [(PhotoAssetRecord, PhotoAssetRecord)] = []
+            for firstIndex in 0..<hashed.count {
+                for secondIndex in (firstIndex + 1)..<hashed.count {
+                    guard hashed[firstIndex].1.distance(to: hashed[secondIndex].1) <= maxHamming
+                    else { continue }
+                    pairs.append((hashed[firstIndex].0, hashed[secondIndex].0))
+                }
+            }
+            guard !pairs.isEmpty else { continue }
+            var memberIDs = Set<String>()
+            for (left, right) in pairs {
+                memberIDs.insert(left.localIdentifier)
+                memberIDs.insert(right.localIdentifier)
+            }
+            let members = hashed.map(\.0).filter { memberIDs.contains($0.localIdentifier) }
+            candidateWork.append(CandidatePairWork(members: members, pairs: pairs))
+        }
+        metrics?.set(
+            .perceptualCandidates,
+            to: candidateWork.reduce(0) { $0 + $1.pairs.count }
+        )
+
+        // Stages 4+5: extractingFeatures ↔ comparing — interleaved per candidate bucket. Each
+        // bucket's prints are extracted, compared, and released before the next bucket starts,
+        // so at most `workerWidth × maxBucketSize` prints (a few hundred KB) are alive at once.
+        let extractionTotal = candidateWork.reduce(0) { $0 + $1.members.count }
+        let comparisonTotal = candidateWork.count
+        let extractionWallStart = DispatchTime.now().uptimeNanoseconds
         let descriptorKind: FeaturePrintKind?
-        if bucketedAssetCount > 0 {
+        if extractionTotal > 0 {
             await engine.featureExtractor.prepare()
             descriptorKind = engine.featureExtractor.kind
         } else {
@@ -251,26 +404,48 @@ struct PhotoSimilarityEngine: Sendable {
             config.similarityThreshold ?? $0.defaultSimilarityThreshold
         } ?? FeaturePrintKind.cpuGrid.defaultSimilarityThreshold
 
-        try reporter.enter(.extractingFeatures, total: bucketedAssetCount)
-        let extractionTotal = bucketedAssetCount
-        let comparisonTotal = bucketing.buckets.count
+        try reporter.enter(.extractingFeatures, total: extractionTotal)
         let relations = LockedBox<[PairRelation]>([])
 
-        try await BoundedWorkers.run(items: bucketing.buckets, width: workerWidth) { bucket in
+        try await BoundedWorkers.run(items: candidateWork, width: workerWidth) { work in
             guard !Task.isCancelled else { return }
 
             var prints: [(assetID: String, print: FeaturePrint)] = []
-            prints.reserveCapacity(bucket.records.count)
-            for record in bucket.records {
+            prints.reserveCapacity(work.members.count)
+            for record in work.members {
                 if Task.isCancelled { return }
+                metrics?.increment(.thumbnailsRequested)
+                let thumbnailStart = DispatchTime.now().uptimeNanoseconds
+                let thumbnail: CGImage
                 do {
                     try Task.checkCancellation()
-                    let thumbnailStart = DispatchTime.now().uptimeNanoseconds
-                    let thumbnail = try await engine.thumbnailLoader.thumbnail(
+                    thumbnail = try await engine.thumbnailLoader.thumbnail(
                         for: record.localIdentifier,
-                        targetPixelSize: config.thumbnailMaxPixelSize
+                        targetPixelSize: config.verificationThumbnailMaxPixelSize,
+                        mode: .verification
                     )
-                    metrics?.record(.thumbnail, seconds: secondsSince(thumbnailStart))
+                } catch is CancellationError {
+                    return
+                } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
+                    return
+                } catch {
+                    // Failed requests were previously invisible to the metrics (the record
+                    // call sat in the success path only), which hid the dominant cost of a
+                    // non-local library. They are now timed and counted separately.
+                    let elapsed = secondsSince(thumbnailStart)
+                    metrics?.record(.thumbnail, seconds: elapsed)
+                    metrics?.record(.thumbnailFailed, seconds: elapsed)
+                    metrics?.increment(.thumbnailsFailed)
+                    unavailable.insert(
+                        record.localIdentifier,
+                        reason: unavailableReason(for: error, kind: descriptorKind)
+                    )
+                    try reporter.advance(.extractingFeatures, total: extractionTotal)
+                    continue
+                }
+                metrics?.record(.thumbnail, seconds: secondsSince(thumbnailStart))
+                metrics?.increment(.thumbnailsSucceeded)
+                do {
                     let descriptorStart = DispatchTime.now().uptimeNanoseconds
                     let featurePrint = try await engine.featureExtractor.featurePrint(
                         for: thumbnail
@@ -291,33 +466,47 @@ struct PhotoSimilarityEngine: Sendable {
                 try reporter.advance(.extractingFeatures, total: extractionTotal)
             }
 
-            // Compare every pair inside the bucket (bucket ≤ maxBucketSize, so this is a small
-            // constant, not library-scale work).
-            let knownFingerprints = fingerprints.read()
+            // Compare phase, two passes: content confirmation for perceptually identical
+            // pairs (recorded as fingerprint time), then descriptor distances for everything
+            // that is not byte-identical (recorded as comparison time). Both loops are inside
+            // the bucket, so the pair count stays bounded by maxBucketSize — never library-scale.
+            var nearCandidates: [(String, String)] = []
+            nearCandidates.reserveCapacity(work.pairs.count)
+            for (left, right) in work.pairs {
+                if Task.isCancelled { return }
+                if let leftHash = hashes[left.localIdentifier],
+                   let rightHash = hashes[right.localIdentifier],
+                   leftHash == rightHash,
+                   try await confirmExactPair(
+                       left: left,
+                       right: right,
+                       engine: engine,
+                       byteKeys: byteKeys,
+                       fingerprints: fingerprints,
+                       unavailable: unavailable,
+                       metrics: metrics
+                   ) {
+                    // Byte-identical: the exact group's job. Reporting them as "near" too
+                    // would double-count one piece of content.
+                    continue
+                }
+                nearCandidates.append((left.localIdentifier, right.localIdentifier))
+            }
+
+            let printByID = Dictionary(
+                uniqueKeysWithValues: prints.map { ($0.assetID, $0.print) }
+            )
             var bucketRelations: [PairRelation] = []
-            if prints.count > 1 {
+            if !nearCandidates.isEmpty {
                 let compareStart = DispatchTime.now().uptimeNanoseconds
-                for firstIndex in 0..<prints.count {
-                    for secondIndex in (firstIndex + 1)..<prints.count {
-                        let lhs = prints[firstIndex]
-                        let rhs = prints[secondIndex]
-                        guard let distance = try? lhs.print.distance(to: rhs.print),
-                              distance <= workerThreshold else { continue }
-                        // Byte-identical pairs belong to the exact group; reporting them as
-                        // "near" too would double-count one piece of content.
-                        if let leftPrint = knownFingerprints[lhs.assetID],
-                           let rightPrint = knownFingerprints[rhs.assetID],
-                           leftPrint == rightPrint {
-                            continue
-                        }
-                        bucketRelations.append(
-                            PairRelation(
-                                assetA: lhs.assetID,
-                                assetB: rhs.assetID,
-                                distance: distance
-                            )
-                        )
-                    }
+                for (leftID, rightID) in nearCandidates {
+                    guard let leftPrint = printByID[leftID],
+                          let rightPrint = printByID[rightID],
+                          let distance = try? leftPrint.distance(to: rightPrint),
+                          distance <= workerThreshold else { continue }
+                    bucketRelations.append(
+                        PairRelation(assetA: leftID, assetB: rightID, distance: distance)
+                    )
                 }
                 metrics?.record(.comparison, seconds: secondsSince(compareStart))
             }
@@ -329,6 +518,7 @@ struct PhotoSimilarityEngine: Sendable {
         try checkCancellation()
         try reporter.complete(.extractingFeatures, total: extractionTotal)
         try reporter.complete(.comparing, total: comparisonTotal)
+        metrics?.record(.extractionWall, seconds: secondsSince(extractionWallStart))
 
         // Stage 6: grouping — cliques from relations, groups from fingerprints.
         try reporter.enter(.grouping, total: 1)
@@ -353,11 +543,27 @@ struct PhotoSimilarityEngine: Sendable {
             .map { PhotoAnalysisUnavailable(assetID: $0.key, reason: $0.value) }
             .sorted { $0.assetID < $1.assetID }
 
+        // Accounting invariant: analyzed + unavailable + skipped == totalRecordCount, and the
+        // three sets are disjoint — an asset with evidence and no failure is analyzed, any
+        // failure (including a confirm-stage content failure) is unavailable, a singleton is
+        // skipped. Nothing is double-counted and nothing silently disappears.
+        let skippedCount = skippedImageCount + skippedVideoCount
+        let analyzedCount = max(
+            0,
+            records.count - unavailableList.count - skippedCount
+        )
+
         metrics?.set(.assetsConsidered, to: records.count)
         metrics?.set(.assetsFingerprinted, to: byteKeys.read().count)
         metrics?.set(.assetsUnavailable, to: unavailableList.count)
+        metrics?.set(.assetsAnalyzed, to: analyzedCount)
         metrics?.set(.exactGroups, to: exactGroups.count)
         metrics?.set(.similarGroups, to: similarGroups.count)
+        // Final reason breakdown: a partition of `assetsUnavailable`, so the summary line
+        // answers "why" (iCloud vs unreadable vs deleted vs permission), not just "how many".
+        for asset in unavailableList {
+            metrics?.incrementReason(asset.reason)
+        }
 
         let result = PhotoAnalysisResult(
             exactGroups: exactGroups,
@@ -368,20 +574,164 @@ struct PhotoSimilarityEngine: Sendable {
             similarityThreshold: descriptorKind == nil ? nil : workerThreshold,
             totalRecordCount: records.count,
             candidateBucketCount: bucketing.buckets.count,
-            candidatePairCount: bucketing.candidatePairCount
+            candidatePairCount: bucketing.candidatePairCount,
+            analyzedAssetCount: analyzedCount,
+            skippedNoCandidateCount: skippedCount
         )
         try reporter.complete(.finalizing, total: 1)
         return result
     }
 
+    /// Exact confirmation for a perceptually identical (hamming-0) image pair: resolve both
+    /// byte keys (memoized across pairs), compare, and only then — on a length collision —
+    /// SHA both. Returns `true` only when both fingerprints resolved and are equal; a content
+    /// failure returns `false` (the pair stays a descriptor candidate) *and* records the
+    /// asset as unavailable with the failure's reason, keeping it out of any "analyzed" claim.
+    /// Cancellation is rethrown so a cancelled run never records a failure it did not cause.
+    private static func confirmExactPair(
+        left: PhotoAssetRecord,
+        right: PhotoAssetRecord,
+        engine: PhotoSimilarityEngine,
+        byteKeys: LockedBox<[String: ContentByteKey]>,
+        fingerprints: LockedBox<[String: ContentFingerprint]>,
+        unavailable: LockedBox<[String: PhotoAnalysisUnavailableReason]>,
+        metrics: AnalysisMetrics?
+    ) async throws -> Bool {
+        // Both sides resolve unconditionally — a `guard let a, let b` chain would stop at the
+        // first unavailable member and never probe its partner, silently losing the partner's
+        // failure reason (bucket order decides who short-circuits). Every pair member gets its
+        // own memoized attempt; a member already recorded unavailable returns early inside
+        // its own resolve without a second request.
+        let leftKey = try await resolveByteKey(
+            for: left, engine: engine, byteKeys: byteKeys,
+            unavailable: unavailable, metrics: metrics
+        )
+        let rightKey = try await resolveByteKey(
+            for: right, engine: engine, byteKeys: byteKeys,
+            unavailable: unavailable, metrics: metrics
+        )
+        guard let leftKey, let rightKey, leftKey == rightKey else { return false }
+        let leftPrint = try await resolveFingerprint(
+            for: left, engine: engine, byteKeys: byteKeys,
+            fingerprints: fingerprints, unavailable: unavailable, metrics: metrics
+        )
+        let rightPrint = try await resolveFingerprint(
+            for: right, engine: engine, byteKeys: byteKeys,
+            fingerprints: fingerprints, unavailable: unavailable, metrics: metrics
+        )
+        guard let leftPrint, let rightPrint else { return false }
+        return leftPrint == rightPrint
+    }
+
+    /// Memoized content-length probe. One attempt per asset per run: pairs share the result,
+    /// a previously failed asset returns `nil` without a second request, and a `nil` result
+    /// means the failure was already recorded with its reason.
+    private static func resolveByteKey(
+        for record: PhotoAssetRecord,
+        engine: PhotoSimilarityEngine,
+        byteKeys: LockedBox<[String: ContentByteKey]>,
+        unavailable: LockedBox<[String: PhotoAnalysisUnavailableReason]>,
+        metrics: AnalysisMetrics?
+    ) async throws -> ContentByteKey? {
+        if let key = byteKeys.read()[record.localIdentifier] { return key }
+        guard unavailable.read()[record.localIdentifier] == nil else { return nil }
+        let phaseStart = DispatchTime.now().uptimeNanoseconds
+        metrics?.increment(.contentRequestsAttempted)
+        do {
+            try Task.checkCancellation()
+            let outcome = try await engine.fingerprinter.byteKey(for: record)
+            let elapsed = secondsSince(phaseStart)
+            metrics?.record(.fingerprint, seconds: elapsed)
+            switch outcome {
+            case .key(let key):
+                byteKeys.write(record.localIdentifier, key)
+                return key
+            case .unavailable(let reason):
+                metrics?.record(.contentFailed, seconds: elapsed)
+                metrics?.increment(.contentRequestsFailed)
+                unavailable.insert(record.localIdentifier, reason: reason)
+                return nil
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
+            throw failure
+        } catch {
+            let elapsed = secondsSince(phaseStart)
+            metrics?.record(.contentFailed, seconds: elapsed)
+            metrics?.increment(.contentRequestsFailed)
+            unavailable.insert(
+                record.localIdentifier,
+                reason: contentFailureReason(for: error)
+            )
+            return nil
+        }
+    }
+
+    /// Memoized SHA-256 pass. Only ever called after both byte keys matched, so the expensive
+    /// read happens at most twice per confirmed pair and never for a provably distinct asset.
+    private static func resolveFingerprint(
+        for record: PhotoAssetRecord,
+        engine: PhotoSimilarityEngine,
+        byteKeys: LockedBox<[String: ContentByteKey]>,
+        fingerprints: LockedBox<[String: ContentFingerprint]>,
+        unavailable: LockedBox<[String: PhotoAnalysisUnavailableReason]>,
+        metrics: AnalysisMetrics?
+    ) async throws -> ContentFingerprint? {
+        if let fingerprint = fingerprints.read()[record.localIdentifier] { return fingerprint }
+        guard unavailable.read()[record.localIdentifier] == nil else { return nil }
+        let phaseStart = DispatchTime.now().uptimeNanoseconds
+        metrics?.increment(.contentRequestsAttempted)
+        do {
+            try Task.checkCancellation()
+            let outcome = try await engine.fingerprinter.fingerprint(for: record)
+            let elapsed = secondsSince(phaseStart)
+            metrics?.record(.fingerprint, seconds: elapsed)
+            switch outcome {
+            case .fingerprinted(let fingerprint):
+                fingerprints.write(record.localIdentifier, fingerprint)
+                return fingerprint
+            case .unavailable(let reason):
+                metrics?.record(.contentFailed, seconds: elapsed)
+                metrics?.increment(.contentRequestsFailed)
+                unavailable.insert(record.localIdentifier, reason: reason)
+                return nil
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
+            throw failure
+        } catch {
+            let elapsed = secondsSince(phaseStart)
+            metrics?.record(.contentFailed, seconds: elapsed)
+            metrics?.increment(.contentRequestsFailed)
+            unavailable.insert(
+                record.localIdentifier,
+                reason: contentFailureReason(for: error)
+            )
+            return nil
+        }
+    }
+
+    /// Failure reason for a *content* probe that threw instead of resolving: a hung request
+    /// is `.timedOut` (the failsafe fired), everything else is `.contentUnreadable`.
+    private static func contentFailureReason(for error: any Error) -> PhotoAnalysisUnavailableReason {
+        if error is PhotoRequestTimeoutError { return .timedOut }
+        if let reason = error as? PhotoAnalysisUnavailableReason { return reason }
+        return .contentUnreadable
+    }
+
     /// Maps an error from a live seam to the honest unavailable reason the UI will show. The
     /// vocabulary stays granular on purpose (permission off / asset deleted / iCloud-only /
-    /// unreadable / thumbnail failed / Vision failed / CPU fallback failed) — see §10 of
-    /// ARCHITECTURE.md — so "could not analyze" is never mistaken for "not a duplicate".
+    /// unreadable / timed out / thumbnail failed / Vision failed / CPU fallback failed) — see
+    /// §10 of ARCHITECTURE.md — so "could not analyze" is never mistaken for "not a duplicate".
     private static func unavailableReason(
         for error: any Error,
         kind: FeaturePrintKind?
     ) -> PhotoAnalysisUnavailableReason {
+        if error is PhotoRequestTimeoutError {
+            return .timedOut
+        }
         if let contentError = error as? PhotoContentError {
             switch contentError {
             case .onlyInICloud:
@@ -423,6 +773,20 @@ struct PhotoSimilarityEngine: Sendable {
 }
 
 // MARK: - Concurrency helpers
+
+/// One unit of stage-3 (cheap) work: an image that earns a perceptual hash, or a video that
+/// earns a content-length stat. Singletons never appear here — they are skipped, not failed.
+private enum AnalysisCheapWork: Sendable {
+    case perceptualHash(PhotoAssetRecord)
+    case videoByteKey(PhotoAssetRecord)
+}
+
+/// One bucket of stage-4/5 work: the members that survived the perceptual gate (extract a
+/// descriptor for each) and the pairs within hamming tolerance (confirm + compare each).
+private struct CandidatePairWork: Sendable {
+    let members: [PhotoAssetRecord]
+    let pairs: [(PhotoAssetRecord, PhotoAssetRecord)]
+}
 
 /// Fixed-width strided worker pool: `width` tasks, each taking items `i, i + width, …`.
 /// Never one task per asset — peak memory and CPU utilization stay bounded regardless of
@@ -480,6 +844,12 @@ final class LockedBox<Value: Sendable>: @unchecked Sendable {
     }
 
     func write(_ key: String, _ newValue: ContentFingerprint) where Value == [String: ContentFingerprint] {
+        lock.lock()
+        value[key] = newValue
+        lock.unlock()
+    }
+
+    func write(_ key: String, _ newValue: PerceptualHash) where Value == [String: PerceptualHash] {
         lock.lock()
         value[key] = newValue
         lock.unlock()

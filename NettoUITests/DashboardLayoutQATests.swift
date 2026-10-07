@@ -185,6 +185,10 @@ final class DashboardLayoutQATests: XCTestCase {
 
     private func launch() {
         app = XCUIApplication()
+        // Set via KVC: `launchArguments` is MainActor-isolated while this helper is
+        // compiler-nonisolated (XCTest still runs it on the main thread). A direct assignment
+        // would add Swift 6 isolation warnings, and assumeIsolated trips sending-self checks.
+        app.setValue(["-resetScanSnapshot"], forKey: "launchArguments")
         app.launch()
     }
 

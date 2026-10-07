@@ -21,7 +21,9 @@ struct DashboardView: View {
         DashboardPresentation.scanStatus(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            analysis: env.analysisState
+            analysis: env.analysisState,
+            lastScannedAt: env.lastScanCompletedAt,
+            eta: env.scanETA()
         )
     }
 
@@ -35,8 +37,13 @@ struct DashboardView: View {
                         .nettoEntrance(step: 1)
                     DashboardHeroView(snapshot: env.storageSnapshot)
                         .nettoEntrance(step: 2)
-                    scanStatusCard
-                        .nettoEntrance(step: 3)
+                    // Periodic re-render so the "Last scanned …" relative time keeps aging
+                    // naturally while the dashboard sits open; the card's identity (and every
+                    // control inside it) is unchanged between ticks.
+                    TimelineView(.periodic(from: .now, by: 60)) { _ in
+                        scanStatusCard
+                    }
+                    .nettoEntrance(step: 3)
                     categorySection
                 }
                 .padding(NettoLayout.Spacing.lg)
@@ -186,6 +193,22 @@ struct DashboardView: View {
                     step: 8,
                     destination: { DuplicateContactsView() }
                 )
+
+                // Top-level Swipe Review — a sibling of the photo features above, opening
+                // the swipe session directly (no Similar Photos detour). Its deck is the
+                // scanned catalog itself, so it needs analysis results only for the shared
+                // review handoff, never to open or run.
+                categoryLink(
+                    id: "swipeReview",
+                    identifier: SwipeReviewPresentation.entryAccessibilityID,
+                    title: SwipeReviewPresentation.entryLabel,
+                    icon: "arrow.left.and.right",
+                    status: swipeReviewStatusText,
+                    assetID: swipeReviewAssetID,
+                    initials: nil,
+                    step: 9,
+                    destination: { SwipeReviewView(items: swipeReviewDeck) }
+                )
             }
         }
     }
@@ -302,13 +325,55 @@ struct DashboardView: View {
         case .results(let result):
             let summary = SimilarPhotosSummary(result: result)
             if summary.hasNoGroups {
-                return summary.unavailableCount > 0
-                    ? "No duplicates found · \(summary.unavailableCount) not analyzed"
+                return summary.notAnalyzedCount > 0
+                    ? "No duplicates found · \(summary.notAnalyzedCount) not analyzed"
                     : "Analyzed · no duplicates found"
             }
             let groups = summary.exactGroupCount + summary.similarGroupCount
             return "\(groups) \(groups == 1 ? "group" : "groups") ready to review"
         }
+    }
+
+    // MARK: Swipe Review (standalone)
+
+    /// Swipe Review's card status — catalog-driven, because the feature reviews the scanned
+    /// library itself, not the analysis. It only reflects Photos access and scan progress.
+    private var swipeReviewStatusText: String {
+        switch env.photoPermissionState {
+        case .notDetermined:
+            return "Photos access needed"
+        case .denied, .restricted:
+            return "Photos access is off"
+        case .authorized, .limited:
+            break
+        }
+        switch env.catalogState {
+        case .notStarted:
+            return "Not scanned yet"
+        case .running:
+            return "Reading your library…"
+        case .cancelled:
+            return "Last run cancelled"
+        case .failed(let failure):
+            return failure.userMessage
+        case .completed(let catalog):
+            let images = catalog.imageCount
+            return images == 0
+                ? "No photos visible to Netto"
+                : "\(images.formatted()) photos"
+        }
+    }
+
+    /// Thumbnail asset for the card: the library's first image; nil until a scan completes.
+    private var swipeReviewAssetID: String? {
+        guard case .completed(let catalog) = env.catalogState else { return nil }
+        return catalog.records.first(where: \.isImage)?.localIdentifier
+    }
+
+    /// The deck the card pushes: every image in the scanned catalog, in catalog order.
+    private var swipeReviewDeck: [SwipeReviewItem] {
+        guard case .completed(let catalog) = env.catalogState else { return [] }
+        return SwipeReviewPresentation.items(from: catalog)
     }
 }
 

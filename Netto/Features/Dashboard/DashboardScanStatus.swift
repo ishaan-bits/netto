@@ -32,8 +32,8 @@ struct DashboardScanStatusCard: View {
         VStack(alignment: .leading, spacing: NettoLayout.Spacing.md) {
             header
 
-            if case .scanning(_, let fraction) = status {
-                progress(fraction: fraction)
+            if case .scanning(_, let fraction, let eta) = status {
+                progress(fraction: fraction, eta: eta)
             }
 
             if let buttonTitle = copy.buttonTitle {
@@ -92,12 +92,19 @@ struct DashboardScanStatusCard: View {
     /// Determinate when the stage reports a real fraction; indeterminate otherwise — a bar
     /// that only ever animates is honest, a fabricated percentage is not. Both run on the real
     /// value (or on an explicitly indeterminate pulse), never on a timer that pretends.
-    private func progress(fraction: Double?) -> some View {
-        ScanProgressBar(fraction: fraction)
+    ///
+    /// The accessibility value carries the full picture — percent (or "In progress"), plus the
+    /// time-remaining line when one exists — so VoiceOver gets stage, counts (in the combined
+    /// header), and ETA without a second element announcing every tick; `.updatesFrequently`
+    /// keeps that throttled exactly as before.
+    private func progress(fraction: Double?, eta: ScanETA) -> some View {
+        var value = fraction.map { "\(Int(($0 * 100).rounded())) percent" } ?? "In progress"
+        if let etaLine = ScanETAEstimator.etaLine(for: eta) {
+            value += ", \(etaLine)"
+        }
+        return ScanProgressBar(fraction: fraction)
             .accessibilityLabel("Scan progress")
-            .accessibilityValue(
-                fraction.map { "\(Int(($0 * 100).rounded())) percent" } ?? "In progress"
-            )
+            .accessibilityValue(value)
             .accessibilityAddTraits(.updatesFrequently)
             .accessibilityIdentifier("scanProgressBar")
     }

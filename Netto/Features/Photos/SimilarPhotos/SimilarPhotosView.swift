@@ -187,8 +187,75 @@ struct SimilarPhotosView: View {
         }
         .scrollContentBackground(.hidden)
         .background(NettoColor.background.ignoresSafeArea())
+        .safeAreaInset(edge: .top, spacing: 0) {
+            selectionToolbar
+        }
         .safeAreaInset(edge: .bottom) {
             selectionBar
+        }
+    }
+
+    // MARK: Top selection toolbar
+
+    /// Compact selection controls at the top of the screen, next to the live selection state.
+    /// Exposes exactly two actions — "Deselect All" and "Reset to Recommended" (see
+    /// `SimilarPhotosPresentation.selectionToolbarActions`; no bulk "Select All") — and never
+    /// sits beside the bottom Review action, which stays focused on "N photos selected →
+    /// Review". Every action is selection-only: nothing deletes, rescans, or touches the
+    /// analysis results or their KEEP recommendations.
+    private var selectionToolbar: some View {
+        HStack(spacing: Theme.Spacing.md) {
+            Text("\(env.selection.selectedCount) selected")
+                .font(.subheadline.weight(.semibold))
+                .monospacedDigit()
+                .lineLimit(1)
+                .nettoCount(env.selection.selectedCount)
+                .accessibilityIdentifier("selectionStateLabel")
+
+            Spacer(minLength: Theme.Spacing.xs)
+
+            // Secondary selection-management control: subtle text + small chevron on the
+            // shared glass — never a capsule or accent color that could compete with the
+            // bottom Review button, which stays the screen's only primary action.
+            Menu {
+                ForEach(SimilarPhotosPresentation.selectionToolbarActions, id: \.rawValue) { action in
+                    if SimilarPhotosPresentation.shows(action, selectedCount: env.selection.selectedCount) {
+                        Button(action.rawValue) {
+                            perform(action)
+                        }
+                        .accessibilityIdentifier(SimilarPhotosPresentation.selectionActionIdentifier(action))
+                    }
+                }
+            } label: {
+                HStack(spacing: 2) {
+                    Text(SimilarPhotosPresentation.selectionToolbarMenuLabel)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                }
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(Theme.Palette.secondaryLabel)
+                .lineLimit(1)
+            }
+            .menuIndicator(.hidden)
+            .accessibilityValue(
+                SimilarPhotosPresentation.selectionToolbarAccessibilityValue(
+                    selectedCount: env.selection.selectedCount
+                )
+            )
+            .accessibilityIdentifier("selectionMenu")
+        }
+        .padding(Theme.Spacing.md)
+        .nettoGlass()
+        .padding(.horizontal, Theme.Spacing.md)
+        .padding(.top, Theme.Spacing.xs)
+    }
+
+    private func perform(_ action: SimilarPhotosPresentation.SelectionToolbarAction) {
+        switch action {
+        case .deselectAll:
+            env.mutateSelection { $0.deselectAll() }
+        case .resetToRecommended:
+            env.mutateSelection { $0.resetToRecommended() }
         }
     }
 
@@ -289,10 +356,12 @@ struct SimilarPhotosView: View {
 
             Spacer()
 
+            // Selection management (Deselect All / Reset to Recommended) lives in the top
+            // toolbar — this action row stays focused on the count and Review.
             NavigationLink {
                 ReviewSelectionView()
             } label: {
-                Text("Review")
+                Text(SimilarPhotosPresentation.primaryReviewActionLabel)
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(NettoPrimaryButtonStyle())

@@ -44,7 +44,11 @@ private func photosError(_ code: PHPhotosError.Code) -> NSError {
 struct PhotoKitThumbnailLoaderTests {
     // MARK: Request options (the iCloud / quality policy)
 
-    @Test func requestOptionsAreLocalOnlyBoundedAndEdited() {
+    @Test func requestOptionsAreBoundedCurrentAndSingleShot() {
+        // Milestone 4C policy change: analysis thumbnails now *may* fetch their iCloud
+        // rendition (bounded by the request failsafe) instead of failing every cloud asset
+        // up front; the local-only policy lives on the content-fingerprint path. Both modes
+        // share the bounded single-callback settings and differ only in resize quality.
         let options = PhotoKitThumbnailLoader.makeImageRequestOptions()
         #expect(options.isNetworkAccessAllowed == false)
         #expect(options.deliveryMode == .highQualityFormat)
@@ -53,11 +57,42 @@ struct PhotoKitThumbnailLoaderTests {
         #expect(options.isSynchronous == false)
     }
 
+    @Test func perceptualModeTradesExactnessForSpeed() {
+        let perceptual = PhotoKitThumbnailLoader.makeImageRequestOptions(mode: .perceptual)
+        #expect(perceptual.isNetworkAccessAllowed == false)
+        #expect(perceptual.resizeMode == .fast)
+        #expect(perceptual.deliveryMode == .highQualityFormat)
+
+        let verification = PhotoKitThumbnailLoader.makeImageRequestOptions(mode: .verification)
+        #expect(verification.isNetworkAccessAllowed == false)
+        #expect(verification.resizeMode == .exact)
+    }
+
+    @Test func requestModeIsForwardedToTheSeam() async throws {
+        // The engine's cheap-first distinction must survive the seam: `.perceptual` (96 px
+        // gate) and `.verification` (256 px evidence) arrive at the request untouched.
+        let recordedMode = Box<PhotoThumbnailRequestMode?>(nil)
+        let loader = PhotoKitThumbnailLoader { _, _, mode in
+            recordedMode.write(mode)
+            return solidImage(width: 8, height: 8)
+        }
+
+        _ = try await loader.thumbnail(for: "photo-1", targetPixelSize: 96, mode: .perceptual)
+        #expect(recordedMode.read() == .perceptual)
+
+        _ = try await loader.thumbnail(for: "photo-1", targetPixelSize: 256, mode: .verification)
+        #expect(recordedMode.read() == .verification)
+
+        // The 2-arg convenience defaults to the accurate rendition.
+        _ = try await loader.thumbnail(for: "photo-1", targetPixelSize: 256)
+        #expect(recordedMode.read() == .verification)
+    }
+
     // MARK: Injected request seam
 
     @Test func successfulImageIsReturnedUnchanged() async throws {
         let image = solidImage(width: 64, height: 48)
-        let loader = PhotoKitThumbnailLoader { _, _ in image }
+        let loader = PhotoKitThumbnailLoader { _, _, _ in image }
 
         let result = try await loader.thumbnail(for: "photo-1", targetPixelSize: 256)
         #expect(result === image)
@@ -65,7 +100,7 @@ struct PhotoKitThumbnailLoaderTests {
 
     @Test func targetPixelSizeIsClampedToAtLeastOne() async throws {
         let recordedSize = Box<Int?>(nil)
-        let loader = PhotoKitThumbnailLoader { _, size in
+        let loader = PhotoKitThumbnailLoader { _, size, _ in
             recordedSize.write(size)
             return solidImage(width: 1, height: 1)
         }
@@ -78,7 +113,7 @@ struct PhotoKitThumbnailLoaderTests {
     }
 
     @Test func explicitFailuresPropagateToTheCaller() async throws {
-        let loader = PhotoKitThumbnailLoader { _, _ in
+        let loader = PhotoKitThumbnailLoader { _, _, _ in
             throw PhotoContentError.onlyInICloud
         }
         await #expect(throws: PhotoContentError.onlyInICloud) {
@@ -87,7 +122,7 @@ struct PhotoKitThumbnailLoaderTests {
     }
 
     @Test func cancellationPropagatesOutOfTheLoader() async {
-        let loader = PhotoKitThumbnailLoader { _, _ in
+        let loader = PhotoKitThumbnailLoader { _, _, _ in
             withUnsafeCurrentTask { $0?.cancel() }
             try await Task.sleep(nanoseconds: 10_000_000_000)
             return solidImage(width: 1, height: 1)
@@ -185,6 +220,40 @@ struct PhotoKitThumbnailLoaderTests {
             #expect(error == .permissionDenied || error == .assetNotFound)
         } catch {
             Issue.record("unexpected error type: \(error)")
+        }
+    }
+
+    @Test func analysisThumbnailRequestsSettleWithinTheFailsafeOnThisHost() async {
+        // Milestone 4C probe: analysis thumbnails are local-only (network disabled); each
+        // request must still settle inside the 15 s failsafe — local successes and immediate
+        // local-only refusals alike, never riding the timeout. (With network allowed, every
+        // non-local asset took ~2.5 s serialized on this host — the measurement that drove
+        // the local-only policy.) Prints one line per request for the validation report and
+        // asserts only the hard bound.
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else { return }
+        let fetch = PHAsset.fetchAssets(with: PHFetchOptions())
+        guard fetch.count > 0 else { return }
+
+        let loader = PhotoKitThumbnailLoader()
+        for index in 0..<min(6, fetch.count) {
+            let asset = fetch.object(at: index)
+            let started = Date()
+            func elapsed() -> String {
+                String(format: "%.2f", Date().timeIntervalSince(started))
+            }
+            do {
+                _ = try await loader.thumbnail(
+                    for: asset.localIdentifier,
+                    targetPixelSize: 96,
+                    mode: .perceptual
+                )
+                print("PROBE perceptual-fetch #\(index) outcome=success duration=\(elapsed())s")
+            } catch {
+                print("PROBE perceptual-fetch #\(index) outcome=\(error) duration=\(elapsed())s")
+            }
+            let seconds = Date().timeIntervalSince(started)
+            #expect(seconds < 17, "request \(index) overran the failsafe + margin: \(seconds)s")
         }
     }
 }

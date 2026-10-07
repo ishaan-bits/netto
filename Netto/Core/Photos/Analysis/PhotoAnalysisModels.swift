@@ -57,7 +57,7 @@ struct PhotoAnalysisProgress: Sendable, Equatable {
 /// dropped: each reason maps to something honest the UI can tell the user later. The set is
 /// deliberately granular — "could not read" is a different thing from "did not match" — and the
 /// engine never collapses these into a single failure or, worse, into "not a duplicate".
-enum PhotoAnalysisUnavailableReason: String, Sendable, Equatable, Error {
+enum PhotoAnalysisUnavailableReason: String, Sendable, Equatable, Error, Codable {
     /// Photos access was not granted when the request ran (denied, restricted, or not yet
     /// determined). Distinct from a missing asset so the UI can point at Settings.
     case permissionUnavailable
@@ -81,23 +81,27 @@ enum PhotoAnalysisUnavailableReason: String, Sendable, Equatable, Error {
     case cpuDescriptorFailed
     /// Not an analyzable media type (for example audio-only records).
     case notAnalyzable
+    /// A bounded PhotoKit request (thumbnail or content probe) never answered before its
+    /// failsafe deadline. Distinct from `contentUnreadable`: the request was *issued* and
+    /// hung, which on a validation run is the signal that the failsafe is doing its job.
+    case timedOut
 }
 
-struct PhotoAnalysisUnavailable: Sendable, Equatable {
+struct PhotoAnalysisUnavailable: Sendable, Equatable, Codable {
     let assetID: String
     let reason: PhotoAnalysisUnavailableReason
 }
 
 /// Evidence backing a group. Carries the numbers that made the group, so the UI (and tests) can
 /// explain a match without re-running analysis.
-enum PhotoAnalysisEvidence: Sendable, Equatable {
+enum PhotoAnalysisEvidence: Sendable, Equatable, Codable {
     /// Byte-identical content: same SHA-256 over the same content lengths.
     case exactContent(fingerprint: String, byteLength: Int64)
     /// Visual near-duplicate: every pair in the group is within `threshold` L2 distance.
     case visualSimilarity(minDistance: Float, maxDistance: Float, threshold: Float)
 }
 
-enum PhotoSimilarityGroupKind: String, Sendable, Equatable {
+enum PhotoSimilarityGroupKind: String, Sendable, Equatable, Codable {
     case exactDuplicates
     case nearDuplicates
 }
@@ -106,7 +110,7 @@ enum PhotoSimilarityGroupKind: String, Sendable, Equatable {
 ///
 /// This is a *recommendation input*, never a deletion decision. `sizeInBytes` is deliberately
 /// absent — it is unknown at analysis time and must never be fabricated.
-struct PhotoAssetQualityScore: Sendable, Equatable {
+struct PhotoAssetQualityScore: Sendable, Equatable, Codable {
     let localIdentifier: String
     let isFavorite: Bool
     let representsBurst: Bool
@@ -120,7 +124,7 @@ struct PhotoAssetQualityScore: Sendable, Equatable {
 /// `memberAssetIDs` is always sorted so group identity and ordering are stable across runs;
 /// `id` is derived from the kind plus that sorted membership (or the fingerprint for exact
 /// groups), so re-running analysis over an unchanged library yields identical ids.
-struct PhotoSimilarityGroup: Sendable, Equatable, Identifiable {
+struct PhotoSimilarityGroup: Sendable, Equatable, Identifiable, Codable {
     let kind: PhotoSimilarityGroupKind
     let memberAssetIDs: [String]
     let evidence: PhotoAnalysisEvidence
@@ -144,7 +148,7 @@ struct PhotoSimilarityGroup: Sendable, Equatable, Identifiable {
 }
 
 /// Outcome of a completed analysis run.
-struct PhotoAnalysisResult: Sendable, Equatable {
+struct PhotoAnalysisResult: Sendable, Equatable, Codable {
     let exactGroups: [PhotoSimilarityGroup]
     let similarGroups: [PhotoSimilarityGroup]
     let unavailableAssets: [PhotoAnalysisUnavailable]
@@ -160,10 +164,72 @@ struct PhotoAnalysisResult: Sendable, Equatable {
     let candidateBucketCount: Int
     /// Pairs actually considered (within buckets only) — always far below `n(n-1)/2`.
     let candidatePairCount: Int
+    /// Assets that produced visual/content evidence this run (hash or fingerprint), with no
+    /// unavailable reason. `nil` for fixtures that predate cheap-first — callers fall back to
+    /// `total - unavailable` through `effectiveAnalyzedCount`.
+    var analyzedAssetCount: Int? = nil
+    /// Assets never requested because no candidate partner could exist (single-record buckets):
+    /// analyzed honestly as "skipped", never as failed and never silently counted as analyzed.
+    var skippedNoCandidateCount: Int = 0
 
     var totalGroupedAssetCount: Int {
         Set(exactGroups.flatMap(\.memberAssetIDs)).count
             + Set(similarGroups.flatMap(\.memberAssetIDs)).count
+    }
+
+    /// Assets with evidence this run. Legacy results (no explicit count) fall back to the
+    /// pre-cheap-first meaning: everything not reported unavailable was analyzed.
+    var effectiveAnalyzedCount: Int {
+        if let analyzedAssetCount { return max(0, analyzedAssetCount) }
+        return max(0, totalRecordCount - unavailableAssets.count)
+    }
+
+    /// This result with the given asset identifiers removed — the in-place update a confirmed
+    /// deletion applies to a completed scan, never a rescan. Groups left with fewer than two
+    /// members dissolve (they are no longer duplicates); a group that keeps its recommended
+    /// KEEP keeps it, and a group whose KEEP was removed promotes the best remaining member
+    /// (scored over `catalogRecords` when available, first remaining otherwise). Scan-run
+    /// counters are historical facts about the run and are left untouched.
+    func removingAssets(
+        _ assetIDs: Set<String>,
+        catalogRecords: [String: PhotoAssetRecord] = [:]
+    ) -> PhotoAnalysisResult {
+        guard !assetIDs.isEmpty else { return self }
+
+        func pruned(_ groups: [PhotoSimilarityGroup]) -> [PhotoSimilarityGroup] {
+            groups.compactMap { group in
+                let remaining = group.memberAssetIDs.filter { !assetIDs.contains($0) }
+                guard remaining.count > 1 else { return nil }
+                var recommended = group.recommendedBestAssetID
+                if assetIDs.contains(recommended) {
+                    let remainingRecords = remaining.compactMap { catalogRecords[$0] }
+                    recommended = remainingRecords.count == remaining.count
+                        ? BestPhotoScoring.recommendedBestID(in: remainingRecords) ?? remaining[0]
+                        : remaining[0]
+                }
+                return PhotoSimilarityGroup(
+                    kind: group.kind,
+                    memberAssetIDs: remaining,
+                    evidence: group.evidence,
+                    recommendedBestAssetID: recommended,
+                    memberScores: group.memberScores.filter { remaining.contains($0.key) }
+                )
+            }
+        }
+
+        return PhotoAnalysisResult(
+            exactGroups: pruned(exactGroups),
+            similarGroups: pruned(similarGroups),
+            unavailableAssets: unavailableAssets.filter { !assetIDs.contains($0.assetID) },
+            descriptorKind: descriptorKind,
+            visionAvailable: visionAvailable,
+            similarityThreshold: similarityThreshold,
+            totalRecordCount: totalRecordCount,
+            candidateBucketCount: candidateBucketCount,
+            candidatePairCount: candidatePairCount,
+            analyzedAssetCount: analyzedAssetCount,
+            skippedNoCandidateCount: skippedNoCandidateCount
+        )
     }
 
     static let empty = PhotoAnalysisResult(
@@ -175,7 +241,9 @@ struct PhotoAnalysisResult: Sendable, Equatable {
         similarityThreshold: nil,
         totalRecordCount: 0,
         candidateBucketCount: 0,
-        candidatePairCount: 0
+        candidatePairCount: 0,
+        analyzedAssetCount: nil,
+        skippedNoCandidateCount: 0
     )
 }
 

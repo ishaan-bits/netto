@@ -6,7 +6,7 @@ import Foundation
 /// Distances are only meaningful between prints of the same kind, which is why `distance(to:)`
 /// refuses to mix them: the two families have different vector lengths and different calibration
 /// scales, and silently comparing them would produce garbage groups.
-enum FeaturePrintKind: String, Sendable, Equatable, CaseIterable {
+enum FeaturePrintKind: String, Sendable, Equatable, CaseIterable, Codable {
     /// `VNGenerateImageFeaturePrintRequest` output (768 float32 elements, L2 distance). The
     /// production path on real hardware: learned features, robust to re-encodes and crops.
     case visionFeaturePrint

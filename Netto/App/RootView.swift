@@ -17,10 +17,19 @@ final class AppEnvironment: ObservableObject {
     let contactsPermission: any ContactsPermissionServicing
     /// Review thumbnails: bounded, coalesced, pixel-capped (never full-resolution pixels).
     let thumbnails: ThumbnailStore
+    /// The raw thumbnail loader behind the cache. The Photo Details large preview loads
+    /// through this directly: its request is the explicitly user-requested preview policy
+    /// (network allowed, degraded frames surfaced), and its bitmap is released with the screen
+    /// instead of being pinned in the strip cache. Scanner passes never see this path — they
+    /// go through `thumbnails` / the engine's own loader with the local-only options.
+    let thumbnailLoader: any PhotoThumbnailLoading
     /// Real byte measurement for the reviewed selection (bounded, never during enumeration).
     let sizeProvider: any AssetSizeProviding
     /// The deletion boundary — the only path from this app to Photos mutation.
     let deletionService: any PhotoDeleting
+    /// Last completed scan, persisted so a relaunch restores results without a new scan.
+    /// Injected so tests use temporary storage instead of the app's real snapshot file.
+    let scanSnapshotStore: any ScanSnapshotStore
 
     @Published var flowState: AppFlowState = .launching
     @Published var prompt: PermissionPrompt = .none
@@ -29,6 +38,10 @@ final class AppEnvironment: ObservableObject {
     @Published var storageSnapshot: StorageSnapshot?
     @Published var catalogState: CatalogScanState = .notStarted
     @Published var analysisState: PhotoAnalysisState = .notStarted
+    /// When the current completed result reached its terminal state — from the restored
+    /// snapshot on launch, or `Date()` on a fresh completion. `nil` before any scan has
+    /// completed; drives the dashboard's dynamic "Last scanned …" text.
+    @Published var lastScanCompletedAt: Date?
     @Published var selection = PhotoSelectionModel()
     /// Screenshots marked for cleanup — a filter over the catalog, not a second enumeration.
     @Published var screenshotSelection = ScreenshotSelectionModel()
@@ -61,6 +74,20 @@ final class AppEnvironment: ObservableObject {
     /// Bumped on every start and cancel. An in-flight run compares it before each state write,
     /// so a cancelled run can never overwrite a newer one's state.
     private var analysisGeneration = 0
+    /// Progress coalescing (milestone 4C): the engine already throttles emissions, but every
+    /// event still lands in `@Published` storage — on a long scan the resulting update stream
+    /// starves the main actor and delays the terminal state by minutes (measured: ~18 min of
+    /// drain after the pre-4C engine finished its own ~20 min). Apply a progress event only when the stage
+    /// changes, a stage reaches its terminal count, or `progressCoalesceInterval` has passed
+    /// since the last applied event; unapplied events are not lost — the next applied event
+    /// carries the newest counters, and completion is its own unconditional event.
+    private var lastAppliedProgressAt: TimeInterval = 0
+    private var lastAppliedStage: PhotoAnalysisStage?
+    private let progressCoalesceInterval: TimeInterval = 0.25
+    /// Rolling-throughput ETA for the active scan. Fed only at the coalesced progress points
+    /// below (analysis and catalog), read on demand by the dashboard — no extra @Published
+    /// traffic per asset, no second progress system.
+    private var scanETAEstimator = ScanETAEstimator()
     /// Bumped on every plan build; a superseded build discards its result instead of writing it.
     private var planBuildGeneration = 0
     /// In-flight video size measurement, if any (bounded sequential batches).
@@ -93,6 +120,7 @@ final class AppEnvironment: ObservableObject {
         sizeProvider: any AssetSizeProviding = PhotoKitAssetSizeProvider(),
         deletionService: any PhotoDeleting = PhotoDeletionService(),
         contactMutationService: any ContactMutating = ContactMutationService(),
+        scanSnapshotStore: any ScanSnapshotStore = FileScanSnapshotStore(),
         sessionToken: String = UUID().uuidString
     ) {
         self.storageProvider = storageProvider
@@ -100,10 +128,12 @@ final class AppEnvironment: ObservableObject {
         self.contactsPermission = contactsPermission
         self.makePhotoLibrary = makePhotoLibrary
         self.makeContactReader = makeContactReader
+        self.thumbnailLoader = thumbnailLoader
         self.thumbnails = ThumbnailStore(loader: thumbnailLoader)
         self.sizeProvider = sizeProvider
         self.deletionService = deletionService
         self.contactMutationService = contactMutationService
+        self.scanSnapshotStore = scanSnapshotStore
         self.deletionSessionToken = sessionToken
     }
 
@@ -111,7 +141,38 @@ final class AppEnvironment: ObservableObject {
         photoPermissionState = photoPermission.currentStatus()
         contactsPermissionState = contactsPermission.currentStatus()
         storageSnapshot = await storageProvider.deviceStorage()
+        // Restore the last completed scan (if any) into the same state path a fresh
+        // completion writes. No PhotoKit work is started: a missing, corrupt, or
+        // incompatible snapshot simply leaves the existing first-run state untouched.
+        if let snapshot = scanSnapshotStore.loadLatest() {
+            restoreCompletedScan(snapshot)
+        }
         flowState = .dashboard
+    }
+
+    /// Applies a persisted snapshot exactly as a fresh `.completed` write would: results into
+    /// `analysisState`, the deterministic default selection over the restored groups, and the
+    /// persisted completion date. Best-effort by design — an unusable snapshot never crashes
+    /// and never triggers analysis.
+    private func restoreCompletedScan(_ snapshot: ScanSnapshot) {
+        analysisState = .completed(snapshot.result)
+        selection = PhotoSelectionModel(result: snapshot.result)
+        lastScanCompletedAt = snapshot.completedAt
+    }
+
+    /// Persists a newly completed scan, replacing the previous snapshot only now — cancelled,
+    /// failed, and interrupted runs never reach this point. Best-effort: a failed write is
+    /// ignored (the fresh result is already on screen) and never fails the scan itself.
+    private func persistCompletedScan(_ result: PhotoAnalysisResult) {
+        let completedAt = Date()
+        let snapshot = ScanSnapshot(
+            schemaVersion: ScanSnapshot.currentSchemaVersion,
+            scanID: UUID().uuidString,
+            completedAt: completedAt,
+            result: result
+        )
+        try? scanSnapshotStore.save(snapshot)
+        lastScanCompletedAt = completedAt
     }
 
     func refreshStorage() async {
@@ -163,6 +224,13 @@ final class AppEnvironment: ObservableObject {
         }
 
         let builder = PhotoCatalogBuilder()
+        scanETAEstimator.reset()
+        scanETAEstimator.record(
+            stage: "catalog",
+            completed: CatalogScanProgress.indeterminate.enumeratedCount,
+            total: CatalogScanProgress.indeterminate.totalCount,
+            at: ScanETAEstimator.monotonicNow()
+        )
         catalogState = .running(.indeterminate)
 
         catalogTask = Task { [weak self] in
@@ -176,6 +244,12 @@ final class AppEnvironment: ObservableObject {
                     case .progress(let progress):
                         if self.catalogState.isRunning {
                             self.catalogState = .running(progress)
+                            self.scanETAEstimator.record(
+                                stage: "catalog",
+                                completed: progress.enumeratedCount,
+                                total: progress.totalCount,
+                                at: ScanETAEstimator.monotonicNow()
+                            )
                         }
                     case .completed(let result):
                         self.noteCatalogCompleted(result, standalone: true)
@@ -253,6 +327,9 @@ final class AppEnvironment: ObservableObject {
             return
         }
 
+        lastAppliedProgressAt = 0
+        lastAppliedStage = nil
+        scanETAEstimator.reset()
         analysisState = .running(
             PhotoAnalysisProgress(stage: .preparing, completedUnits: 0, totalUnits: 0)
         )
@@ -331,11 +408,12 @@ final class AppEnvironment: ObservableObject {
                     guard self.isCurrentAnalysis(generation) else { return }
                     switch event {
                     case .progress(let progress):
-                        self.analysisState = .running(progress)
+                        self.applyAnalysisProgress(progress)
                     case .completed(let result):
                         sawCompletion = true
                         self.selection = PhotoSelectionModel(result: result)
                         self.analysisState = .completed(result)
+                        self.persistCompletedScan(result)
                     }
                 }
                 if !sawCompletion {
@@ -371,6 +449,36 @@ final class AppEnvironment: ObservableObject {
 
     private func isCurrentAnalysis(_ generation: Int) -> Bool {
         analysisGeneration == generation
+    }
+
+    /// Applies one analysis progress event under the coalescing policy (see
+    /// `progressCoalesceInterval`). Stage changes and stage-terminal counts always apply — they
+    /// are the events a reader (and the validation harness) keys off — intermediate ticks apply
+    /// at most once per interval. The producer is untouched; only the main-actor write rate is
+    /// bounded, so cancellation, completion, and failure paths stay exactly as responsive.
+    private func applyAnalysisProgress(_ progress: PhotoAnalysisProgress) {
+        let now = Date().timeIntervalSinceReferenceDate
+        let stageChanged = lastAppliedStage != progress.stage
+        let stageTerminal = progress.isComplete
+        guard stageChanged || stageTerminal || now - lastAppliedProgressAt >= progressCoalesceInterval
+        else { return }
+        lastAppliedStage = progress.stage
+        lastAppliedProgressAt = now
+        analysisState = .running(progress)
+        // Sampled at the same coalesced cadence the state is written, with monotonic time —
+        // the estimator's own minimum sample interval smooths it further.
+        scanETAEstimator.record(
+            stage: progress.stage.rawValue,
+            completed: progress.completedUnits,
+            total: progress.totalUnits,
+            at: ScanETAEstimator.monotonicNow()
+        )
+    }
+
+    /// The active scan's current-stage estimate. Computed on read from the rolling estimator
+    /// — the view formats it; no arithmetic and no additional state writes live in SwiftUI.
+    func scanETA() -> ScanETA {
+        scanETAEstimator.estimate()
     }
 
     private func finishAnalysis(_ generation: Int, as state: PhotoAnalysisState) {
@@ -621,13 +729,17 @@ final class AppEnvironment: ObservableObject {
     private func handleDeletionOutcome(_ outcome: DeletionOutcome) async {
         switch outcome {
         case .succeeded(let success):
+            // The plan is the source of truth for what was attempted; capture it before the
+            // state machine leaves `.deleting`.
+            let plannedIDs = deletingPlanSelectionIDs()
             if success.isFullyRemoved {
                 applyDeletion(.succeeded(success))
             } else {
                 applyDeletion(.needsReview(success))
             }
-            // Photos changed: drop every dataset-derived fact so nothing stale is shown again.
-            resetLibraryStateAfterDeletion()
+            // Photos changed, the scan did not: apply only the confirmed removals to the
+            // completed results instead of invalidating them back to "start analysis".
+            preserveResultsAfterDeletion(removing: plannedIDs.subtracting(success.remainingIDs))
             await refreshStorage()
 
         case .stale(let reasons):
@@ -649,9 +761,8 @@ final class AppEnvironment: ObservableObject {
 
         case .verificationFailed(let message):
             applyDeletion(.failed(message))
-            // The mutation was requested but could not be confirmed: the library may have
-            // changed, so every dataset-derived fact is dropped — same honesty as success.
-            resetLibraryStateAfterDeletion()
+            // Requested but unverified: nothing is confirmed removed, so the completed
+            // results, their selection, and every dataset stand exactly as they were.
             await refreshStorage()
 
         case .revalidationFailed(let message):
@@ -667,26 +778,78 @@ final class AppEnvironment: ObservableObject {
         }
     }
 
-    /// Selection is reset, in-flight analysis invalidated, and both datasets marked for a fresh
-    /// read — the library changed, so nothing read before the deletion may be reused.
-    private func resetLibraryStateAfterDeletion() {
+    /// Reviewed identifiers of the execution in flight (empty outside `.deleting`).
+    private func deletingPlanSelectionIDs() -> Set<String> {
+        if case .deleting(let plan) = deletionState { return plan.selectionSnapshot }
+        return []
+    }
+
+    /// Photos changed, but the completed scan did not: every derived view is pruned in place
+    /// — the analysis result loses only the confirmed removals (and so does its selection and
+    /// the persisted snapshot, which keeps the original scan's identity), the catalog loses
+    /// only the removed records, and the screenshot/video filters reconcile against that
+    /// pruned catalog. No rescan is started; failure outcomes never reach here.
+    private func preserveResultsAfterDeletion(removing deletedAssetIDs: Set<String>) {
         planBuildGeneration += 1
-        selection = PhotoSelectionModel()
-        screenshotSelection.reset()
-        videoSelection.reset()
+        planSource = .similarPhotos
         cancelVideoSizeResolution()
         videoSizeResolution = .idle
-        planSource = .similarPhotos
+
+        // A read started before the mutation would complete with pre-mutation data: cancel
+        // it and supersede any late write so it can never overwrite the pruned results.
         analysisGeneration += 1
         analysisTask?.cancel()
         analysisTask = nil
-        analysisState = .notStarted
-        // A catalog read started before the mutation would complete with pre-mutation data;
-        // cancel it and supersede any late write so the reset cannot be overwritten.
+        let catalogWasRunning = catalogTask != nil
         catalogTask?.cancel()
         catalogTask = nil
-        catalogGeneration += 1
-        catalogState = .notStarted
+        if catalogWasRunning { catalogGeneration += 1 }
+
+        if case .completed(let result) = analysisState, !deletedAssetIDs.isEmpty {
+            let recordsByID: [String: PhotoAssetRecord] = {
+                guard case .completed(let catalog) = catalogState else { return [:] }
+                return Dictionary(
+                    catalog.records.map { ($0.localIdentifier, $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+            }()
+            let updated = result.removingAssets(deletedAssetIDs, catalogRecords: recordsByID)
+            analysisState = .completed(updated)
+            selection = PhotoSelectionModel(result: updated, preserving: selection)
+            persistUpdatedScanResult(updated)
+        }
+
+        if case .completed(let catalog) = catalogState {
+            if !deletedAssetIDs.isEmpty {
+                catalogState = .completed(catalog.removingAssetIDs(deletedAssetIDs))
+                synchronizeScreenshotDataset()
+                synchronizeVideoDataset()
+            }
+        } else if catalogWasRunning, case .running = catalogState {
+            // The in-flight build carried pre-mutation records and can never finish now.
+            catalogState = .notStarted
+            synchronizeScreenshotDataset()
+            synchronizeVideoDataset()
+        }
+    }
+
+    /// Replaces the persisted snapshot after a confirmed deletion without pretending a new
+    /// scan happened: same `scanID` and `completedAt` as the snapshot this result came from,
+    /// so the store keeps describing one completed scan. A fresh snapshot is written only
+    /// when nothing was persisted yet (tests set results directly).
+    private func persistUpdatedScanResult(_ result: PhotoAnalysisResult) {
+        if let existing = scanSnapshotStore.loadLatest() {
+            let snapshot = ScanSnapshot(
+                schemaVersion: ScanSnapshot.currentSchemaVersion,
+                scanID: existing.scanID,
+                completedAt: existing.completedAt,
+                result: result
+            )
+            try? scanSnapshotStore.save(snapshot)
+            lastScanCompletedAt = existing.completedAt
+        } else {
+            persistCompletedScan(result)
+        }
     }
 
     private func isCurrentPlanBuild(_ generation: Int) -> Bool {
@@ -954,6 +1117,11 @@ extension AppEnvironment {
     static func live() -> AppEnvironment {
         #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
+        // UI tests wipe the persisted scan so every launch starts from the first-run state —
+        // the startup condition every existing dashboard UI test was written against.
+        if arguments.contains("-resetScanSnapshot") {
+            FileScanSnapshotStore().clear()
+        }
         if arguments.contains("-fixtureLibrary") {
             return AppEnvironment(
                 makePhotoLibrary: { FixturePhotoLibrary() },

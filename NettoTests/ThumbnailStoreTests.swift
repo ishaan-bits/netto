@@ -29,7 +29,11 @@ private struct StubLoader: PhotoThumbnailLoading {
     var failures: Set<String> = []
     var cancellations: Set<String> = []
 
-    func thumbnail(for assetID: String, targetPixelSize: Int) async throws -> CGImage {
+    func thumbnail(
+        for assetID: String,
+        targetPixelSize: Int,
+        mode: PhotoThumbnailRequestMode
+    ) async throws -> CGImage {
         log.increment(assetID)
         if delayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: delayNanoseconds)

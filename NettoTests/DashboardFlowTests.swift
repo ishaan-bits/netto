@@ -118,6 +118,89 @@ struct DashboardFlowTests {
         #expect(DashboardPresentation.heroFraction(snapshot) == 0.75)
     }
 
+    // MARK: - Scan ETA presentation
+
+    @Test func scanStatusForwardsTheETAIntoTheScanningState() {
+        let status = DashboardPresentation.scanStatus(
+            permission: .authorized,
+            catalog: .notStarted,
+            analysis: .running(PhotoAnalysisProgress(
+                stage: .extractingFeatures,
+                completedUnits: 5_397,
+                totalUnits: 41_036
+            )),
+            eta: .remaining(seconds: 120)
+        )
+        guard case .scanning(_, let fraction, let eta) = status else {
+            Issue.record("expected scanning, got \(status)")
+            return
+        }
+        #expect(eta == .remaining(seconds: 120))
+        #expect(fraction != nil)
+    }
+
+    @Test func scanningCopyShowsStageCountsThenTimeRemaining() {
+        let stage = "Analyzing 5397 of 41036 images…"
+        let copy = DashboardPresentation.scanCopy(for: .scanning(
+            stage: stage,
+            fraction: 0.13,
+            eta: .remaining(seconds: 120)
+        ))
+        #expect(copy.title == "Scanning your library")
+        #expect(copy.body == stage + "\n~2 min remaining")
+        #expect(copy.buttonTitle == "Cancel")
+    }
+
+    @Test func calculatingLineShowsBeforeEnoughThroughputSamples() {
+        let stage = "Fingerprinting…"
+        let copy = DashboardPresentation.scanCopy(for: .scanning(
+            stage: stage,
+            fraction: nil,
+            eta: .calculating
+        ))
+        #expect(copy.body == stage + "\nCalculating time remaining…")
+    }
+
+    @Test func finishingLineWinsOverAUntrustworthyCountdown() {
+        let copy = DashboardPresentation.scanCopy(for: .scanning(
+            stage: "Comparing 40 of 41 groups…",
+            fraction: 0.98,
+            eta: .finishing
+        ))
+        #expect(copy.body.contains("Finishing analysis…"))
+        #expect(!copy.body.contains("sec remaining"))
+        #expect(!copy.body.contains("min remaining"))
+        #expect(!copy.body.contains("Calculating"))
+    }
+
+    @Test func indeterminateStageAddsNoTimeLine() {
+        let stage = "Counting assets…"
+        let copy = DashboardPresentation.scanCopy(for: .scanning(
+            stage: stage,
+            fraction: nil,
+            eta: .indeterminate
+        ))
+        #expect(copy.body == stage)
+    }
+
+    @Test func completedAndCancelledStatesCarryNoETA() {
+        let completed = DashboardPresentation.scanStatus(
+            permission: .authorized,
+            catalog: .notStarted,
+            analysis: .completed(Self.sampleResult),
+            eta: .remaining(seconds: 120)
+        )
+        #expect(completed == .finished(analyzed: 4, total: 4, groups: 0, lastScannedAt: nil))
+
+        let cancelled = DashboardPresentation.scanStatus(
+            permission: .authorized,
+            catalog: .notStarted,
+            analysis: .cancelled,
+            eta: .calculating
+        )
+        #expect(cancelled == .cancelled)
+    }
+
     private static let sampleResult = PhotoAnalysisResult(
         exactGroups: [],
         similarGroups: [],

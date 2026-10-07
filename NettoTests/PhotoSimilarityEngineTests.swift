@@ -52,6 +52,37 @@ private func grayLevel(of image: CGImage) -> Int {
     return Int(first)
 }
 
+/// Horizontal brightness ramp across `size` pixels. `increasing` goes dark → bright, so every
+/// 9×8 cell is dimmer than its right neighbour and all 64 comparison bits are set; the
+/// decreasing direction leaves all 64 clear — the two hashes are complements (hamming 64).
+private func rampImage(increasing: Bool, size: Int) -> CGImage {
+    var buffer = [UInt8](repeating: 255, count: size * size * 4)
+    for y in 0..<size {
+        for x in 0..<size {
+            let t = Int(x) * 255 / max(1, size - 1)
+            let value = UInt8(max(0, min(255, increasing ? t : 255 - t)))
+            let offset = (y * size + x) * 4
+            buffer[offset] = value
+            buffer[offset + 1] = value
+            buffer[offset + 2] = value
+        }
+    }
+    let provider = CGDataProvider(data: Data(buffer) as CFData)!
+    return CGImage(
+        width: size,
+        height: size,
+        bitsPerComponent: 8,
+        bitsPerPixel: 32,
+        bytesPerRow: size * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: false,
+        intent: .defaultIntent
+    )!
+}
+
 private struct StubFingerprinter: ContentFingerprinting {
     var byteKeyOutcomes: [String: ContentLengthOutcome] = [:]
     var fingerprintOutcomes: [String: ContentFingerprintOutcome] = [:]
@@ -91,12 +122,46 @@ private struct StubFingerprinter: ContentFingerprinting {
     }
 }
 
+/// Records every thumbnail request (id + mode) so tests can prove what the cheap-first gate
+/// did — and, more importantly, what it never asked for.
+private final class RequestedLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [(assetID: String, mode: PhotoThumbnailRequestMode)] = []
+
+    func record(_ assetID: String, mode: PhotoThumbnailRequestMode) {
+        lock.lock()
+        entries.append((assetID, mode))
+        lock.unlock()
+    }
+
+    var snapshot: [(assetID: String, mode: PhotoThumbnailRequestMode)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+
+    var count: Int { snapshot.count }
+}
+
 private struct StubThumbnails: PhotoThumbnailLoading {
     var failures: [String: PhotoContentError] = [:]
     /// Asset ids whose thumbnail request hangs past the failsafe (throws the timeout error).
     var timeoutIDs: Set<String> = []
+    /// Delay per request, used to keep a run in flight while a test observes progress or
+    /// cancels (the perceptual pass is the pipeline's long phase under cheap-first).
+    var delayNanos: UInt64 = 0
+    /// Shared request log — copies of this struct share the same recorder.
+    let requested = RequestedLog()
 
-    func thumbnail(for assetID: String, targetPixelSize: Int) async throws -> CGImage {
+    func thumbnail(
+        for assetID: String,
+        targetPixelSize: Int,
+        mode: PhotoThumbnailRequestMode
+    ) async throws -> CGImage {
+        requested.record(assetID, mode: mode)
+        if delayNanos > 0 {
+            try await Task.sleep(nanoseconds: delayNanos)
+        }
         if timeoutIDs.contains(assetID) {
             throw PhotoRequestTimeoutError()
         }
@@ -104,6 +169,52 @@ private struct StubThumbnails: PhotoThumbnailLoading {
             throw failure
         }
         return solidGrayImage(level: trailingLevel(assetID))
+    }
+}
+
+/// Returns vertical-ramp images whose direction depends on the asset id: an increasing ramp
+/// downsamples to strictly rising cells (every comparison true → all-ones hash) and a
+/// decreasing ramp to an all-zeroes hash, so ids of opposite direction sit at hamming
+/// distance 64 — a pair the perceptual gate must reject no matter how close its metadata
+/// says it is. Ramps (rather than stripes) because the 9×8 reduction averages fine detail
+/// away; a linear ramp's ordering survives any box filter.
+private struct RampThumbnails: PhotoThumbnailLoading {
+    func thumbnail(
+        for assetID: String,
+        targetPixelSize: Int,
+        mode: PhotoThumbnailRequestMode
+    ) async throws -> CGImage {
+        rampImage(increasing: trailingLevel(assetID) % 2 == 0, size: 32)
+    }
+}
+
+/// Counts extraction calls — the assertion that a rejected pair cost no descriptor work.
+private final class ExtractCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+private struct CountingExtractor: PhotoFeatureExtracting {
+    let kind: FeaturePrintKind
+    let counter: ExtractCounter
+
+    func prepare() async {}
+
+    func featurePrint(for thumbnail: CGImage) async throws -> FeaturePrint {
+        counter.increment()
+        return FeaturePrint(kind: kind, values: [Float(grayLevel(of: thumbnail)) / 256])
     }
 }
 
@@ -234,7 +345,7 @@ private func makeRecord(
 
 private func makeEngine(
     fingerprinter: StubFingerprinter = StubFingerprinter(),
-    thumbnails: StubThumbnails = StubThumbnails(),
+    thumbnails: any PhotoThumbnailLoading = StubThumbnails(),
     extractor: any PhotoFeatureExtracting = StubExtractor(kind: .cpuGrid),
     observer: any PhotoAnalysisStageObserving = NoopStageObserver(),
     metrics: AnalysisMetrics? = nil,
@@ -244,6 +355,7 @@ private func makeEngine(
     var configuration = PhotoAnalysisConfiguration()
     configuration.similarityThreshold = threshold
     configuration.maxConcurrentWorkers = workers
+    configuration.fingerprintThumbnailConcurrency = workers
     return PhotoSimilarityEngine(
         configuration: configuration,
         fingerprinter: fingerprinter,
@@ -556,9 +668,9 @@ struct PhotoSimilarityEngineTests {
     }
 
     @Test func consumerCancellationEndsTheStreamWithoutCompleting() async throws {
-        var fingerprinter = StubFingerprinter()
-        fingerprinter.phaseOneDelayNanos = 20_000_000 // 20 ms per asset, phase 1
-        let engine = makeEngine(fingerprinter: fingerprinter, workers: 1)
+        var thumbnails = StubThumbnails()
+        thumbnails.delayNanos = 20_000_000 // 20 ms per perceptual thumbnail, one worker
+        let engine = makeEngine(thumbnails: thumbnails, workers: 1)
         let records = (0..<40).map { makeRecord(id: "photo-\($0)") }
 
         let task = Task<Bool, Never> {
@@ -657,13 +769,14 @@ struct PhotoSimilarityEngineTests {
     }
 
     @Test func fingerprintingProgressTicksThroughTheLongFirstPhase() async throws {
-        // The regression this pins: phase 1 (a PhotoKit round trip per asset) used to report
-        // nothing until every asset was done, so the dashboard sat at "Fingerprinting 0 of N"
-        // for the whole phase. With a slowed phase 1, intermediate events must appear.
-        var fingerprinter = StubFingerprinter()
-        fingerprinter.phaseOneDelayNanos = 20_000_000 // 20 ms × 40 assets ÷ 2 workers ≈ 400 ms
+        // The regression this pins: the perceptual pass (one PhotoKit round trip per
+        // multi-bucket asset) used to report nothing until every asset was done, so the
+        // dashboard sat at "Fingerprinting 0 of N" for the whole phase. With slowed
+        // thumbnails, intermediate events must appear.
+        var thumbnails = StubThumbnails()
+        thumbnails.delayNanos = 20_000_000 // 20 ms × 40 assets ÷ 2 workers ≈ 400 ms
         let log = ProgressLog()
-        let engine = makeEngine(fingerprinter: fingerprinter, workers: 2)
+        let engine = makeEngine(thumbnails: thumbnails, workers: 2)
         let records = (0..<40).map { makeRecord(id: "photo-\($0)") }
 
         _ = try await engine.analyze(records: records, onProgress: { log.append($0) })
@@ -677,26 +790,29 @@ struct PhotoSimilarityEngineTests {
         #expect(events.last?.completedUnits == events.last?.totalUnits)
     }
 
-    @Test func byteLengthCollisionsGrowTheFingerprintingTotalAndCompleteExactly() async throws {
-        // Two assets share a byte key → phase 2 hashes them. The total must grow by the
+    @Test func videoLengthCollisionsGrowTheFingerprintingTotalAndCompleteExactly() async throws {
+        // Two videos share a byte key → phase 2 hashes them. The total must grow by the
         // collision count so hashing still ticks, progress stays monotonic, and the stage
-        // ends exactly at completed == total.
+        // ends exactly at completed == total. Under cheap-first this two-phase path is
+        // video-only: images reach content through perceptual confirmation instead.
         var fingerprinter = StubFingerprinter()
-        let sharedKey = ContentByteKey(imageBytes: 777, videoBytes: 0)
+        let sharedKey = ContentByteKey(imageBytes: 0, videoBytes: 777)
         let sharedFingerprint = ContentFingerprint(
-            imageBytes: 777,
-            videoBytes: 0,
-            imageDigestHex: "shared",
-            videoDigestHex: nil
+            imageBytes: 0,
+            videoBytes: 777,
+            imageDigestHex: nil,
+            videoDigestHex: "shared"
         )
-        fingerprinter.byteKeyOutcomes["photo-1"] = .key(sharedKey)
-        fingerprinter.byteKeyOutcomes["photo-2"] = .key(sharedKey)
-        fingerprinter.fingerprintOutcomes["photo-1"] = .fingerprinted(sharedFingerprint)
-        fingerprinter.fingerprintOutcomes["photo-2"] = .fingerprinted(sharedFingerprint)
+        fingerprinter.byteKeyOutcomes["vid-1"] = .key(sharedKey)
+        fingerprinter.byteKeyOutcomes["vid-2"] = .key(sharedKey)
+        fingerprinter.fingerprintOutcomes["vid-1"] = .fingerprinted(sharedFingerprint)
+        fingerprinter.fingerprintOutcomes["vid-2"] = .fingerprinted(sharedFingerprint)
 
         let log = ProgressLog()
         let engine = makeEngine(fingerprinter: fingerprinter, workers: 2)
-        let records = ["photo-0", "photo-1", "photo-2", "photo-3"].map { makeRecord(id: $0) }
+        let records = ["vid-0", "vid-1", "vid-2", "vid-3"].map {
+            makeRecord(id: $0, mediaType: .video)
+        }
         let result = try await engine.analyze(records: records, onProgress: { log.append($0) })
 
         let events = log.snapshot.filter { $0.stage == .fingerprinting }
@@ -711,7 +827,7 @@ struct PhotoSimilarityEngineTests {
             lastCompleted = event.completedUnits
         }
         #expect(result.exactGroups.count == 1)
-        #expect(Set(result.exactGroups[0].memberAssetIDs) == ["photo-1", "photo-2"])
+        #expect(Set(result.exactGroups[0].memberAssetIDs) == ["vid-1", "vid-2"])
     }
 
     @Test func timedOutRequestsAreSkippedAndTheRunStillCompletes() async throws {
@@ -730,8 +846,8 @@ struct PhotoSimilarityEngineTests {
         let reasons = Dictionary(
             uniqueKeysWithValues: result.unavailableAssets.map { ($0.assetID, $0.reason) }
         )
-        #expect(reasons["photo-9"] == .contentUnreadable)
-        #expect(reasons["photo-11"] == .imageUnavailable)
+        #expect(reasons["photo-9"] == .timedOut)
+        #expect(reasons["photo-11"] == .timedOut)
         #expect(result.totalRecordCount == 3)
     }
 
@@ -810,8 +926,9 @@ struct PhotoSimilarityEngineTests {
     }
 
     @Test func everyDurationAndCounterIsRecordedOnACompletedRun() async throws {
-        // The device-validation instrumentation must be complete on success: all seven
-        // durations present, and counters that agree with the result envelope.
+        // The device-validation instrumentation must be complete on success: every duration
+        // that can occur on this run present, counters that agree with the result envelope,
+        // and the failure-split durations present exactly when their failures happened.
         var fingerprinter = StubFingerprinter()
         fingerprinter.byteKeyOutcomes["cloud-0"] = .unavailable(.contentOnlyInICloud)
 
@@ -831,7 +948,12 @@ struct PhotoSimilarityEngineTests {
         #expect(result.similarGroups.count == 1)
 
         let snapshot = metrics.snapshot()
-        for category in AnalysisMetrics.Duration.allCases {
+        // Durations this run must have recorded (all stages + both wall-clock spans).
+        let required: [AnalysisMetrics.Duration] = [
+            .candidates, .fingerprint, .fingerprintWall, .thumbnail, .descriptor,
+            .comparison, .grouping, .extractionWall, .total,
+        ]
+        for category in required {
             guard let seconds = snapshot.durations[category] else {
                 Issue.record("duration \(category) was never recorded")
                 continue
@@ -839,6 +961,12 @@ struct PhotoSimilarityEngineTests {
             #expect(seconds >= 0, "duration \(category) went negative")
         }
         #expect(snapshot.durations[.total, default: 0] > 0)
+        // Failure-split durations: content failure happened (cloud-0), thumbnail failure did not.
+        #expect(snapshot.durations[.contentFailed, default: -1] >= 0, "contentFailed missing")
+        #expect(
+            snapshot.durations[.thumbnailFailed] == nil,
+            "thumbnailFailed must stay unrecorded when no thumbnail failed"
+        )
 
         #expect(snapshot.counters[.assetsConsidered] == 3)
         #expect(snapshot.counters[.assetsFingerprinted] == 2)
@@ -846,6 +974,87 @@ struct PhotoSimilarityEngineTests {
         #expect(snapshot.counters[.assetsUnavailable] == 1)
         #expect(snapshot.counters[.exactGroups] == 0)
         #expect(snapshot.counters[.similarGroups] == 1)
+        // Request accounting: three content probes (one failed) during confirmation, six
+        // thumbnails total — three perceptual (the cheap gate) and three verification (the
+        // descriptors) — all succeeded.
+        #expect(snapshot.counters[.contentRequestsAttempted] == 3)
+        #expect(snapshot.counters[.contentRequestsFailed] == 1)
+        #expect(snapshot.counters[.thumbnailsRequested] == 6)
+        #expect(snapshot.counters[.thumbnailsSucceeded] == 6)
+        #expect(snapshot.counters[.thumbnailsFailed, default: 0] == 0)
+        #expect(snapshot.counters[.thumbnailsSkipped] == 0)
+        // Bucket shape: one multi-record bucket of three.
+        #expect(snapshot.counters[.bucketCount] == 1)
+        #expect(snapshot.counters[.bucketSingletons] == 0)
+        #expect(snapshot.counters[.bucketMulti] == 1)
+        #expect(snapshot.counters[.bucketMultiAssets] == 3)
+        #expect(snapshot.counters[.candidatePairs] == 3)
+        // Cheap-first partition: all three pairs cleared the perceptual gate, nothing was
+        // skipped, no video bucket existed, and the disjoint accounting invariant holds —
+        // analyzed (2) + unavailable (1) + skipped (0) == total (3).
+        #expect(snapshot.counters[.perceptualCandidates] == 3)
+        #expect(snapshot.counters[.assetsSkipped, default: 0] == 0)
+        #expect(snapshot.counters[.videoBuckets, default: 0] == 0)
+        #expect(snapshot.counters[.assetsAnalyzed, default: -1] == 2)
+        // Reason breakdown partitions the unavailable list.
+        #expect(snapshot.reasons == ["contentOnlyInICloud": 1])
+    }
+
+    @Test func singletonsAreSkippedWithoutAnyRequest() async throws {
+        // Cheap-first: an asset whose bucket holds no partner cannot match anything, so the
+        // run must not spend a thumbnail or a content probe on it — and it must be reported
+        // as skipped, never as failed and never inside an "analyzed" claim.
+        let thumbnails = StubThumbnails()
+        let engine = makeEngine(thumbnails: thumbnails)
+        let records = [
+            makeRecord(id: "alone-1", pixelWidth: 4032, pixelHeight: 3024),
+            makeRecord(id: "alone-2", pixelWidth: 100, pixelHeight: 100, creationDate: Date(timeIntervalSince1970: 1_700_000_900)),
+        ]
+
+        let result = try await engine.analyze(records: records)
+
+        #expect(result.unavailableAssets.isEmpty)
+        #expect(result.skippedNoCandidateCount == 2)
+        #expect(result.analyzedAssetCount == 0)
+        #expect(result.effectiveAnalyzedCount == 0)
+        #expect(result.candidateBucketCount == 2)
+        // The whole point of the partition: not one request was issued.
+        #expect(thumbnails.requested.count == 0)
+        #expect(result.descriptorKind == nil)
+    }
+
+    @Test func farHashPairsAreNeverExtracted() async throws {
+        // The perceptual gate: two same-bucket images whose 9×8 hashes are complements
+        // (hamming 64 ≫ tolerance 16) cost no descriptor request and produce no relation —
+        // even though their metadata says they are identical candidates.
+        let metrics = AnalysisMetrics()
+        let counter = ExtractCounter()
+        let engine = makeEngine(
+            thumbnails: RampThumbnails(),
+            extractor: CountingExtractor(kind: .cpuGrid, counter: counter),
+            metrics: metrics
+        )
+        let records = [
+            makeRecord(id: "photo-0"),  // stripe phase 0
+            makeRecord(id: "photo-1"),  // stripe phase 1 → hamming 64 from photo-0
+        ]
+
+        let result = try await engine.analyze(records: records)
+
+        #expect(counter.count == 0, "a gate-rejected pair must cost no descriptor extraction")
+        #expect(result.similarGroups.isEmpty)
+        #expect(result.exactGroups.isEmpty)
+        #expect(result.unavailableAssets.isEmpty)
+        #expect(result.effectiveAnalyzedCount == 2)
+        #expect(result.skippedNoCandidateCount == 0)
+        #expect(result.descriptorKind == nil)
+        let snapshot = metrics.snapshot()
+        #expect(snapshot.counters[.perceptualCandidates, default: -1] == 0)
+        #expect(snapshot.counters[.thumbnailsRequested, default: -1] == 2)
+        // default 0, not −1: with no extraction at all the counter is never incremented,
+        // and "never touched" is exactly the assertion here.
+        #expect(snapshot.counters[.descriptorsExtracted, default: 0] == 0)
+        #expect(snapshot.counters[.assetsAnalyzed, default: -1] == 2)
     }
 
     @Test func totalIsRecordedEvenWhenTheRunAborts() async throws {

@@ -72,6 +72,53 @@ struct SimilarPhotosPresentationTests {
             == "Analyzed 42 items — every one is distinct, so there is nothing marked for cleanup.")
     }
 
+    @Test func skippedAssetsAreReportedButNeverClaimedAsAnalyzed() {
+        // Cheap-first runs skip singletons (no partner could exist). They are neither
+        // analyzed nor failed — the summary must keep the three counts disjoint and the
+        // no-duplicates message must say what happened rather than quietly omit it.
+        let partial = PhotoAnalysisResult(
+            exactGroups: [],
+            similarGroups: [],
+            unavailableAssets: [],
+            descriptorKind: .cpuGrid,
+            visionAvailable: false,
+            similarityThreshold: 0.15,
+            totalRecordCount: 10,
+            candidateBucketCount: 2,
+            candidatePairCount: 1,
+            analyzedAssetCount: 4,
+            skippedNoCandidateCount: 6
+        )
+        let summary = SimilarPhotosSummary(result: partial)
+        #expect(summary.analyzedCount == 4)
+        #expect(summary.skippedCount == 6)
+        #expect(summary.notAnalyzedCount == 6)
+        let message = SimilarPhotosPresentation.noDuplicatesMessage(result: partial)
+        #expect(message.contains("Analyzed 4 items"))
+        #expect(message.contains("6 more had no similar candidates to compare."))
+
+        // Every item skipped: nothing was analyzed, but nothing failed either — the message
+        // must distinguish "no partners" from "could not be analyzed".
+        let allSkipped = PhotoAnalysisResult(
+            exactGroups: [],
+            similarGroups: [],
+            unavailableAssets: [],
+            descriptorKind: nil,
+            visionAvailable: false,
+            similarityThreshold: nil,
+            totalRecordCount: 10,
+            candidateBucketCount: 10,
+            candidatePairCount: 0,
+            analyzedAssetCount: 0,
+            skippedNoCandidateCount: 10
+        )
+        let allSkippedSummary = SimilarPhotosSummary(result: allSkipped)
+        #expect(allSkippedSummary.analyzedCount == 0)
+        #expect(allSkippedSummary.notAnalyzedCount == 10)
+        #expect(SimilarPhotosPresentation.noDuplicatesMessage(result: allSkipped)
+            == "Every item was the only candidate in its group, so there is nothing marked for cleanup.")
+    }
+
     @Test func permissionGatesEvenAFinishedResult() {
         let completed = PhotoAnalysisState.completed(fixture)
 
@@ -260,6 +307,41 @@ struct SimilarPhotosPresentationTests {
         #expect(!rich.hasNoGroups)
     }
 
+    // MARK: Top selection toolbar (M4H)
+
+    @Test func menuLabelIsSelectionNotActionsAndReviewStaysThePrimaryAction() {
+        #expect(SimilarPhotosPresentation.selectionToolbarMenuLabel == "Selection")
+        #expect(SimilarPhotosPresentation.selectionToolbarMenuLabel != "Actions")
+        // The bottom primary action is unchanged and can never be confused with the menu.
+        #expect(SimilarPhotosPresentation.primaryReviewActionLabel == "Review")
+        #expect(SimilarPhotosPresentation.selectionToolbarMenuLabel != SimilarPhotosPresentation.primaryReviewActionLabel)
+    }
+
+    @Test func selectionMenuCarriesAClearAccessibilityValue() {
+        #expect(SimilarPhotosPresentation.selectionToolbarAccessibilityValue(selectedCount: 0) == "0 photos selected")
+        #expect(SimilarPhotosPresentation.selectionToolbarAccessibilityValue(selectedCount: 1) == "1 photo selected")
+        #expect(SimilarPhotosPresentation.selectionToolbarAccessibilityValue(selectedCount: 234) == "234 photos selected")
+    }
+
+    // MARK: Top selection toolbar (M4G)
+
+    @Test func topToolbarExposesOnlyDeselectAllAndResetToRecommended() {
+        // The exact menu the view builds from: two actions, exact labels, no Select All.
+        let labels = SimilarPhotosPresentation.selectionToolbarActions.map(\.rawValue)
+        #expect(labels == ["Deselect All", "Reset to Recommended"])
+        #expect(!labels.contains("Select All"))
+
+        // Deselect All hides at zero (nothing to clear); Reset stays available always.
+        #expect(SimilarPhotosPresentation.shows(.deselectAll, selectedCount: 3))
+        #expect(!SimilarPhotosPresentation.shows(.deselectAll, selectedCount: 0))
+        #expect(SimilarPhotosPresentation.shows(.resetToRecommended, selectedCount: 0))
+        #expect(SimilarPhotosPresentation.shows(.resetToRecommended, selectedCount: 3))
+
+        // Stable identifiers the toolbar ships with.
+        #expect(SimilarPhotosPresentation.selectionActionIdentifier(.deselectAll) == "deselectAllButton")
+        #expect(SimilarPhotosPresentation.selectionActionIdentifier(.resetToRecommended) == "resetToRecommendedButton")
+    }
+
     // MARK: Fixtures
 
     private var emptyCatalog: CatalogScanResult {
@@ -443,7 +525,8 @@ struct SimilarPhotosFlowTests {
                     records: [makeRecord(id: "x", width: 4000, height: 1000)],
                     chunkDelay: 0.3
                 )
-            }
+            },
+            scanSnapshotStore: InMemoryScanSnapshotStore()
         )
         env.photoPermissionState = .authorized
         env.startSimilarityAnalysis()
@@ -453,6 +536,177 @@ struct SimilarPhotosFlowTests {
         #expect(calls.count == 1)
         #expect(env.analysisState.isRunning)
         env.cancelSimilarityAnalysis()
+    }
+
+    // MARK: Deselect All (global)
+
+    private func deselectAllFixtureResult() -> PhotoAnalysisResult {
+        PhotoAnalysisResult(
+            exactGroups: [],
+            similarGroups: [
+                PhotoSimilarityGroup(
+                    kind: .nearDuplicates,
+                    memberAssetIDs: ["n1", "n2", "n3"],
+                    evidence: .visualSimilarity(minDistance: 0.01, maxDistance: 0.02, threshold: 0.15),
+                    recommendedBestAssetID: "n2",
+                    memberScores: [:]
+                )
+            ],
+            unavailableAssets: [],
+            descriptorKind: nil,
+            visionAvailable: false,
+            similarityThreshold: nil,
+            totalRecordCount: 10,
+            candidateBucketCount: 1,
+            candidatePairCount: 3
+        )
+    }
+
+    @Test func globalDeselectAllLeavesResultsGroupsAndReviewAtZero() {
+        let env = makeEnv(permission: .authorized) { FakeLibrary(records: []) }
+        let result = deselectAllFixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        #expect(env.selection.selectedCount == 2)
+
+        env.mutateSelection { $0.deselectAll() }
+
+        // Review reads the same selection and now sees nothing to review.
+        #expect(env.selection.selectedCount == 0)
+        #expect(env.selection.selectedIDs.isEmpty)
+        #expect(env.selectionCount(for: .similarPhotos) == 0)
+        #expect(env.selectionCount(for: .screenshots) == 0)
+        #expect(env.selectionCount(for: .videos) == 0)
+        // Results, groups, and recommendations are a different layer — untouched.
+        #expect(env.analysisState == .completed(result))
+        #expect(Set(env.selection.memberIDs(inGroup: result.similarGroups[0].id)) == ["n1", "n2", "n3"])
+        #expect(env.selection.selectionState(inGroup: result.similarGroups[0].id) == .none)
+        // Nothing was deleted along the way.
+        #expect(env.deletionState == .noSelection)
+    }
+
+    @Test func manualSelectionStillWorksAfterGlobalDeselectAll() {
+        let env = makeEnv(permission: .authorized) { FakeLibrary(records: []) }
+        env.selection = PhotoSelectionModel(result: deselectAllFixtureResult())
+
+        env.mutateSelection { $0.deselectAll() }
+        #expect(env.selectionCount(for: .similarPhotos) == 0)
+
+        env.mutateSelection { $0.setSelected(true, forAsset: "n1") }
+        #expect(env.selection.selectedCount == 1)
+        #expect(env.selectionCount(for: .similarPhotos) == 1)
+
+        env.mutateSelection { $0.setSelected(false, forAsset: "n1") }
+        #expect(env.selectionCount(for: .similarPhotos) == 0)
+    }
+
+    // MARK: Reset to Recommended (M4F)
+
+    @Test func deselectAllThenResetToRecommendedRestoresTheOriginalSelection() {
+        let env = makeEnv(permission: .authorized) { FakeLibrary(records: []) }
+        let result = deselectAllFixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        #expect(env.selection.selectedCount == 2)
+
+        env.mutateSelection { $0.deselectAll() }
+        #expect(env.selection.selectedCount == 0)
+        // Deselect All touches only the selection: groups, membership, and the result layer
+        // (which carries the KEEP labels) are exactly as presented.
+        #expect(env.selection.selectionState(inGroup: result.similarGroups[0].id) == .none)
+        #expect(Set(env.selection.memberIDs(inGroup: result.similarGroups[0].id)) == ["n1", "n2", "n3"])
+        #expect(env.analysisState == .completed(result))
+
+        env.mutateSelection { $0.resetToRecommended() }
+        #expect(env.selection.selectedCount == 2)
+        #expect(env.selection.isSelected("n1"))
+        #expect(env.selection.isSelected("n3"))
+        #expect(!env.selection.isSelected("n2")) // KEEP back out
+        #expect(env.analysisState == .completed(result)) // still no rescan, still no recompute
+    }
+
+    @Test func manualSelectionChangesThenResetToRecommendedRestoreTheOriginalSelection() {
+        let env = makeEnv(permission: .authorized) { FakeLibrary(records: []) }
+        let result = deselectAllFixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+
+        env.mutateSelection { $0.setSelected(false, forAsset: "n1") }
+        env.mutateSelection { $0.setSelected(true, forAsset: "n2") }
+        env.mutateSelection { $0.toggle("n3") }
+        #expect(env.selection.selectedCount == 1) // {n2} — far from the presented selection
+        #expect(env.selection.isSelected("n2"))
+
+        env.mutateSelection { $0.resetToRecommended() }
+        #expect(env.selection == PhotoSelectionModel(result: result))
+        #expect(env.selection.selectedCount == 2)
+        #expect(!env.selection.isSelected("n2"))
+    }
+
+    @Test func selectAllThenResetToRecommendedRestoreTheOriginalSelection() {
+        let env = makeEnv(permission: .authorized) { FakeLibrary(records: []) }
+        let result = deselectAllFixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+
+        env.mutateSelection { $0.selectAll() }
+        #expect(env.selection.selectedCount == 3) // all members, KEEP included
+        #expect(env.selection.isSelected("n2"))
+
+        env.mutateSelection { $0.resetToRecommended() }
+        #expect(env.selection.selectedCount == 2)
+        #expect(!env.selection.isSelected("n2"))
+        #expect(env.selection.isSelected("n1"))
+        #expect(env.selection.isSelected("n3"))
+    }
+
+    @Test func selectionActionsTriggerNeitherScanningNorDeletion() {
+        let calls = FactoryCallBox()
+        let env = makeEnv(permission: .authorized) {
+            calls.record()
+            return FakeLibrary(records: [])
+        }
+        let result = deselectAllFixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+
+        // The two toolbar actions, plus a manual change — none of them may start a scan or
+        // enter the deletion pipeline.
+        env.mutateSelection { $0.deselectAll() }
+        env.mutateSelection { $0.setSelected(true, forAsset: "n1") }
+        env.mutateSelection { $0.setSelected(false, forAsset: "n3") }
+        env.mutateSelection { $0.resetToRecommended() }
+
+        // No rescan (the library factory was never invoked), the analysis result is
+        // byte-identical, and the deletion pipeline was never entered.
+        #expect(calls.count == 0)
+        #expect(env.analysisState == .completed(result))
+        #expect(env.deletionState == .noSelection)
+    }
+
+    @Test func reviewUsesTheCurrentSelectionAfterEachOperation() {
+        let env = makeEnv(permission: .authorized) { FakeLibrary(records: []) }
+        let result = deselectAllFixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+
+        #expect(env.selectionCount(for: .similarPhotos) == 2) // as presented
+
+        env.mutateSelection { $0.deselectAll() }
+        #expect(env.selectionCount(for: .similarPhotos) == 0)
+
+        env.mutateSelection { $0.resetToRecommended() }
+        #expect(env.selectionCount(for: .similarPhotos) == 2)
+
+        env.mutateSelection { $0.selectAll() }
+        #expect(env.selectionCount(for: .similarPhotos) == 3)
+
+        env.mutateSelection { $0.setSelected(false, forAsset: "n1") }
+        #expect(env.selectionCount(for: .similarPhotos) == 2)
+
+        env.mutateSelection { $0.resetToRecommended() }
+        #expect(env.selectionCount(for: .similarPhotos) == 2)
+        #expect(env.selectionCount(for: .similarPhotos) == env.selection.selectedCount)
     }
 
     // MARK: Helpers
@@ -475,7 +729,9 @@ struct SimilarPhotosFlowTests {
     ) -> AppEnvironment {
         let env = AppEnvironment(
             storageProvider: FakeStorage(),
-            makePhotoLibrary: factory
+            makePhotoLibrary: factory,
+            // Completions in this suite must never touch the app's real persisted snapshot.
+            scanSnapshotStore: InMemoryScanSnapshotStore()
         )
         env.photoPermissionState = permission
         return env

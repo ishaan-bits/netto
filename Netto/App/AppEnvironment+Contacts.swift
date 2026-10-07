@@ -326,13 +326,18 @@ extension AppEnvironment {
     private func handleContactOutcome(_ outcome: ContactActionOutcome) async {
         switch outcome {
         case .succeeded(let success):
+            // The plan is the source of truth for what was attempted; capture it before the
+            // state machine leaves `.executing` (for a merge this is the source IDs — the
+            // destination is never part of the removal set).
+            let plannedIDs = executingContactPlanRemovalIDs()
             if success.isFullyRemoved {
                 applyContactAction(.succeeded(success))
             } else {
                 applyContactAction(.needsReview(success))
             }
-            // Contacts changed: drop every dataset-derived fact so nothing stale is shown again.
-            resetContactsStateAfterMutation()
+            // Contacts changed, the scan did not: apply only the confirmed removals to the
+            // completed dataset instead of invalidating it back to a fresh scan.
+            preserveContactsAfterMutation(removing: plannedIDs.subtracting(success.remainingIDs))
 
         case .stale(let reasons):
             if case .executing(let plan) = contactActionState {
@@ -352,9 +357,8 @@ extension AppEnvironment {
 
         case .verificationFailed(let message):
             applyContactAction(.failed(message))
-            // The change was requested but could not be confirmed: the store may have
-            // changed, so every dataset-derived fact is dropped — same honesty as success.
-            resetContactsStateAfterMutation()
+            // Requested but unverified: nothing is confirmed removed, so the completed scan
+            // and the group selection stand exactly as they were.
 
         case .revalidationFailed(let message):
             // Pre-mutation refusal: nothing changed, the existing scan stays valid.
@@ -369,16 +373,28 @@ extension AppEnvironment {
         }
     }
 
-    /// Selection reset, in-flight scan invalidated, and the dataset marked for a fresh read —
-    /// contacts changed, so nothing read before the mutation may be reused. The groups will
-    /// be recomputed from the live store on the next scan.
-    private func resetContactsStateAfterMutation() {
+    /// Removable identifiers of the execution in flight (empty outside `.executing`).
+    private func executingContactPlanRemovalIDs() -> Set<String> {
+        if case .executing(let plan) = contactActionState { return Set(plan.removedIdentifiers) }
+        return []
+    }
+
+    /// Contacts changed, but the completed scan did not become obsolete: the dataset loses
+    /// only the confirmed removals (groups re-derived over the remaining records) and the
+    /// group selection is reconciled against it — a dissolved group's selection drops out, a
+    /// surviving group keeps its remaining marks. A fresh scan is never started here; failure
+    /// outcomes never reach here.
+    private func preserveContactsAfterMutation(removing deletedContactIDs: Set<String>) {
         contactReviewChoice = nil
-        contactSelection.reset()
+        // A scan started before the mutation would complete with pre-mutation data: cancel it
+        // and supersede any late write so it can never overwrite the pruned dataset.
         contactScanGeneration += 1
         contactScanTask?.cancel()
         contactScanTask = nil
-        contactScanState = .notStarted
+        if !deletedContactIDs.isEmpty, case .completed(let dataset) = contactScanState {
+            contactScanState = .completed(dataset.removingContacts(deletedContactIDs))
+        }
+        synchronizeContactDataset()
     }
 
     /// Single gate for every contacts action state change: legal transitions are applied,

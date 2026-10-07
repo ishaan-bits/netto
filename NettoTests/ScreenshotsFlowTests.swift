@@ -387,7 +387,7 @@ struct ScreenshotsFlowTests {
         }
     }
 
-    @Test func deletionSuccessResetsScreenshotSelectionAndCatalog() async {
+    @Test func deletionSuccessPrunesTheScreenshotDatasetAndKeepsTheCatalog() async {
         let (env, _) = makeScreenshotEnv()
         selectScreenshots(["shot-01"], in: env)
         env.prepareDeletionPlan(from: .screenshots)
@@ -396,10 +396,17 @@ struct ScreenshotsFlowTests {
         env.beginConfirmation()
         await env.confirmDeletion()
 
-        // The library changed: every dataset-derived fact is dropped.
-        #expect(env.screenshotSelection.datasetIDs.isEmpty)
+        // The deleted screenshot leaves the catalog-derived selection; everything else
+        // stands — the catalog stays completed (pruned in place) and no scan starts.
+        #expect(env.screenshotSelection.datasetCount == ScreenshotsFixture.screenshots.count - 1)
+        #expect(!env.screenshotSelection.datasetIDs.contains("shot-01"))
         #expect(env.screenshotSelection.selectedIDs.isEmpty)
-        #expect(env.catalogState == .notStarted)
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected the catalog to stay completed, got \(env.catalogState)")
+            return
+        }
+        #expect(!catalog.records.contains { $0.localIdentifier == "shot-01" })
+        #expect(catalog.records.count == ScreenshotsFixture.records.count - 1)
         #expect(env.analysisState == .notStarted)
     }
 
@@ -499,6 +506,8 @@ private func makeScreenshotEnv(
         makePhotoLibrary: { FakeLibrary(records: ScreenshotsFixture.records) },
         sizeProvider: sizeProvider,
         deletionService: service,
+        // Completions in this suite must never touch the app's real persisted snapshot.
+        scanSnapshotStore: InMemoryScanSnapshotStore(),
         sessionToken: "session-1"
     )
     env.photoPermissionState = .authorized

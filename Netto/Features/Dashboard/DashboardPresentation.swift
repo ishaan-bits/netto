@@ -84,9 +84,9 @@ enum DashboardPresentation {
     enum ScanStatus: Equatable, Sendable {
         case permissionRequired
         case permissionDenied
-        case scanning(stage: String, fraction: Double?)
+        case scanning(stage: String, fraction: Double?, eta: ScanETA)
         case idle
-        case finished(analyzed: Int, total: Int, groups: Int)
+        case finished(analyzed: Int, total: Int, groups: Int, lastScannedAt: Date?)
         case cancelled
         case emptyLibrary
         case failed(String)
@@ -111,7 +111,9 @@ enum DashboardPresentation {
     static func scanStatus(
         permission: PermissionState,
         catalog: CatalogScanState,
-        analysis: PhotoAnalysisState
+        analysis: PhotoAnalysisState,
+        lastScannedAt: Date? = nil,
+        eta: ScanETA = .calculating
     ) -> ScanStatus {
         switch libraryAction(permission: permission, catalog: catalog, analysis: analysis) {
         case .requestAccess:
@@ -119,9 +121,9 @@ enum DashboardPresentation {
         case .openSettings:
             return .permissionDenied
         case .analyzing(let stage, let fraction):
-            return .scanning(stage: stage, fraction: fraction)
+            return .scanning(stage: stage, fraction: fraction, eta: eta)
         case .catalogRunning(let stage, let fraction):
-            return .scanning(stage: stage, fraction: fraction)
+            return .scanning(stage: stage, fraction: fraction, eta: eta)
         case .retry(let message):
             return .failed(message)
         case .analyze:
@@ -131,9 +133,14 @@ enum DashboardPresentation {
         switch analysis {
         case .completed(let result):
             guard result.totalRecordCount > 0 else { return .emptyLibrary }
-            let analyzed = max(0, result.totalRecordCount - result.unavailableAssets.count)
+            let analyzed = result.effectiveAnalyzedCount
             let groups = result.exactGroups.count + result.similarGroups.count
-            return .finished(analyzed: analyzed, total: result.totalRecordCount, groups: groups)
+            return .finished(
+                analyzed: analyzed,
+                total: result.totalRecordCount,
+                groups: groups,
+                lastScannedAt: lastScannedAt
+            )
         case .cancelled:
             return .cancelled
         case .notStarted, .running, .failed:
@@ -173,11 +180,15 @@ enum DashboardPresentation {
                 tone: .warning
             )
 
-        case .scanning(let stage, _):
+        case .scanning(let stage, _, let eta):
+            // Stage copy first (it already carries the counts when the stage has a
+            // denominator), then the time-remaining line when the estimator has something
+            // honest to say. `.indeterminate` adds no line — no denominator, no countdown.
+            let lines = [stage, ScanETAEstimator.etaLine(for: eta)].compactMap { $0 }
             return ScanCopy(
                 icon: "arrow.triangle.2.circlepath",
                 title: "Scanning your library",
-                body: stage,
+                body: lines.joined(separator: "\n"),
                 buttonTitle: "Cancel",
                 tone: .brand
             )
@@ -192,14 +203,27 @@ enum DashboardPresentation {
                 tone: .brand
             )
 
-        case .finished(let analyzed, let total, let groups):
+        case .finished(let analyzed, let total, let groups, let lastScannedAt):
             let outcome = groups > 0
                 ? "Results are ready to review."
                 : "There is nothing marked for cleanup."
+            // "Last scanned" + a live relative time derived from the persisted completion
+            // date at render time (the periodic TimelineView in the dashboard re-renders the
+            // card, so the text keeps aging naturally). A missing date (fixtures) falls back
+            // to the original wording.
+            let body: String
+            let title: String
+            if let lastScannedAt {
+                title = "Last scanned"
+                body = "\(relativeLastScanned(from: lastScannedAt)) · \(analyzed) of \(total) items analyzed. \(outcome)"
+            } else {
+                title = "Last scan finished"
+                body = "\(analyzed) of \(total) items analyzed. \(outcome)"
+            }
             return ScanCopy(
                 icon: "checkmark.circle",
-                title: "Last scan finished",
-                body: "\(analyzed) of \(total) items analyzed. \(outcome)",
+                title: title,
+                body: body,
                 buttonTitle: "Analyze again",
                 tone: .success
             )
@@ -232,5 +256,14 @@ enum DashboardPresentation {
                 tone: .failure
             )
         }
+    }
+
+    /// "5 minutes ago" / "2 hours ago" / "yesterday" — Foundation's localized relative date
+    /// formatting over the persisted completion `Date`, recomputed at every render (never a
+    /// stored string, never hand-rolled arithmetic). `now` is injectable for tests.
+    static func relativeLastScanned(from completedAt: Date, now: Date = Date()) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: completedAt, relativeTo: now)
     }
 }

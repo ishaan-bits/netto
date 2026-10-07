@@ -8,9 +8,15 @@ import Foundation
 /// `n(n-1)/2` to roughly `n × maxBucketSize / 2` — bounded by `maxBucketSize`, not library size.
 /// The output is a true partition: every eligible record lands in exactly one bucket, so nothing
 /// is dropped silently. The *candidate contract* is "pairs that share a bucket" — documented,
-/// tested, and the only pairs compared. Exact-duplicate detection does not depend on buckets at
-/// all: byte-identical content is found by the fingerprint path regardless of aspect or date, so
-/// metadata can never exclude a true exact duplicate from being reported.
+/// tested, and the only pairs compared.
+///
+/// Under cheap-first, buckets also scope the *content* work: single-record buckets are skipped
+/// entirely (no partner can exist inside them), videos get their own aspect+duration buckets so
+/// a byte-length stat runs only for clips plausibly sharing content, and image exact detection is
+/// confirmed only for perceptually identical pairs (see `PhotoSimilarityEngine`). The trade-off
+/// this buys is bounded: a byte-identical pair whose creation dates differ by more than
+/// `maxTemporalGap` (or whose aspect rounds differently) lands in different buckets and is not
+/// confirmed — narrow, because identical files share dimensions and nearly always share a date.
 struct CandidateBucketsConfiguration: Sendable, Equatable {
     /// Width/height ratios that round to the same key are treated as the same aspect. 0.01 means
     /// photos whose aspect ratios differ by under ~1% can still match (small crops).
@@ -22,6 +28,10 @@ struct CandidateBucketsConfiguration: Sendable, Equatable {
     var maxBucketSize: Int = 64
     /// Pixel dimensions at or below this are treated as invalid metadata.
     var minPixelDimension: Int = 1
+    /// Video durations are quantised to this many seconds for content bucketing: clips whose
+    /// durations round to the same quantum and share an aspect ratio are the ones plausibly
+    /// byte-identical, so only they cost a content-length stat.
+    var videoDurationTolerance: TimeInterval = 0.1
 
     static let `default` = CandidateBucketsConfiguration()
 }
@@ -42,8 +52,12 @@ struct BucketingExclusion: Sendable, Equatable {
 }
 
 struct BucketingOutput: Sendable, Equatable {
-    /// All eligible records, each in exactly one bucket (the partition).
+    /// All eligible image records, each in exactly one bucket (the partition).
     let buckets: [CandidateBucket]
+    /// Video records partitioned by aspect + duration quantum with the same temporal chain
+    /// rules. Videos have no visual descriptor; these buckets scope *content* work (length
+    /// stat, SHA on collision) so a run never stats a video nobody could duplicate.
+    let videoBuckets: [CandidateBucket]
     /// Records excluded from bucketing, with reasons. Fingerprinting still runs for non-image
     /// exclusions of video type; these drive `PhotoAnalysisResult.unavailableAssets`.
     let exclusions: [BucketingExclusion]
@@ -66,14 +80,17 @@ enum CandidateBuckets {
         let minDimension = max(1, config.minPixelDimension)
 
         var eligible: [PhotoAssetRecord] = []
+        var videoEligible: [PhotoAssetRecord] = []
         var exclusions: [BucketingExclusion] = []
 
         for record in records {
-            guard record.isImage else {
-                // Videos are fingerprinted (exact duplicates) but have no visual descriptor, so
-                // they never enter a bucket.
+            if record.isVideo {
+                // Videos have no visual descriptor, so dimensions never disqualify them —
+                // their buckets only decide which clips cost a content-length stat.
+                videoEligible.append(record)
                 continue
             }
+            guard record.isImage else { continue }
             guard record.pixelWidth >= minDimension, record.pixelHeight >= minDimension else {
                 exclusions.append(
                     BucketingExclusion(assetID: record.localIdentifier, reason: .invalidDimensions)
@@ -105,15 +122,34 @@ enum CandidateBuckets {
 
         // Largest buckets first: bounds work under the task group early and makes progress
         // reach the interesting comparisons quickly. Ties broken by id for determinism.
-        buckets.sort { lhs, rhs in
-            if lhs.records.count != rhs.records.count {
-                return lhs.records.count > rhs.records.count
-            }
-            return lhs.id < rhs.id
+        buckets.sort(by: bucketOrder)
+
+        var videoBuckets: [CandidateBucket] = []
+        var byVideoKey: [VideoKey: [PhotoAssetRecord]] = [:]
+        for record in videoEligible {
+            byVideoKey[
+                VideoKey(
+                    aspect: aspectKey(for: record, tolerance: config.aspectTolerance),
+                    durationBucket: durationKey(for: record, tolerance: config.videoDurationTolerance)
+                ),
+                default: []
+            ].append(record)
         }
+        for (key, group) in byVideoKey {
+            let sorted = group.sorted(by: sortKey)
+            for (index, chunk) in chain(sorted, configuration: config).enumerated() {
+                videoBuckets.append(
+                    CandidateBucket(
+                        id: "v\(key.aspect)-d\(key.durationBucket)-b\(index)-\(chunk.first?.localIdentifier ?? "")",
+                        records: chunk
+                    )
+                )
+            }
+        }
+        videoBuckets.sort(by: bucketOrder)
 
         exclusions.sort { $0.assetID < $1.assetID }
-        return BucketingOutput(buckets: buckets, exclusions: exclusions)
+        return BucketingOutput(buckets: buckets, videoBuckets: videoBuckets, exclusions: exclusions)
     }
 
     /// Pairs that `records.count` records would require with no bucketing at all. Exposed so
@@ -124,6 +160,28 @@ enum CandidateBuckets {
     }
 
     // MARK: - Internals
+
+    /// Grouping key for videos: aspect ratio plus a duration quantum. Two clips land together
+    /// only when both agree — the worst case of a wrong grouping is one wasted length stat.
+    struct VideoKey: Hashable, Sendable {
+        let aspect: Int
+        let durationBucket: Int
+    }
+
+    /// Duration quantum: `round(duration / tolerance)`. Equal durations always share a key;
+    /// clips within half a quantum round together (a 0.1 s quantum covers re-export jitter).
+    static func durationKey(for record: PhotoAssetRecord, tolerance: TimeInterval) -> Int {
+        Int((record.duration / max(tolerance, 1e-9)).rounded())
+    }
+
+    /// Largest buckets first (bounds work under the task group early), ties broken by id so
+    /// iteration order is deterministic regardless of input order.
+    static func bucketOrder(_ lhs: CandidateBucket, _ rhs: CandidateBucket) -> Bool {
+        if lhs.records.count != rhs.records.count {
+            return lhs.records.count > rhs.records.count
+        }
+        return lhs.id < rhs.id
+    }
 
     /// Aspect key: `round((longer / shorter) / tolerance)`. Equal pixel dimensions always land on
     /// the same key; near-equal aspect ratios match when they round together. The rounding grid is

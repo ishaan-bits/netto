@@ -62,6 +62,18 @@ struct ContactDataset: Sendable, Equatable {
         Set(records.lazy.map(\.identifier))
     }
 
+    /// The same scan minus the confirmed removals: the deleted contacts leave the records
+    /// and the groups are re-derived over what remains — exactly what a fresh read would
+    /// find, computed locally without touching the store.
+    func removingContacts(_ contactIDs: Set<String>) -> ContactDataset {
+        guard !contactIDs.isEmpty else { return self }
+        let remaining = records.filter { !contactIDs.contains($0.identifier) }
+        return ContactDataset(
+            records: remaining,
+            groups: ContactDuplicateDetector().findDuplicates(in: remaining)
+        )
+    }
+
     /// Content fingerprint over *every* record's grouping-relevant fields — membership,
     /// names, organizations, phones, and emails. Any change to any contact the app can see
     /// (including changes made outside Netto) produces a different signature, so a plan

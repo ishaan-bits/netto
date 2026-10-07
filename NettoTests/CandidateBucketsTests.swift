@@ -9,7 +9,8 @@ private func makeRecord(
     mediaType: PhotoMediaType = .image,
     pixelWidth: Int = 4032,
     pixelHeight: Int = 3024,
-    creationDate: Date? = Date(timeIntervalSince1970: 1_700_000_000)
+    creationDate: Date? = Date(timeIntervalSince1970: 1_700_000_000),
+    duration: TimeInterval = 0
 ) -> PhotoAssetRecord {
     PhotoAssetRecord(
         localIdentifier: id,
@@ -19,7 +20,7 @@ private func makeRecord(
         pixelHeight: pixelHeight,
         creationDate: creationDate,
         modificationDate: nil,
-        duration: 0,
+        duration: duration,
         isFavorite: false,
         isHidden: false,
         sourceType: [.library],
@@ -159,7 +160,7 @@ struct CandidateBucketsTests {
         #expect(output.buckets.flatMap(\.records).count == 1)
     }
 
-    @Test func nonImageRecordsAreLeftOutOfBucketsEntirely() {
+    @Test func nonAnalyzableRecordsAreExcludedWhileVideosPartitionIntoTheirOwnBuckets() {
         let records = [
             makeRecord(id: "photo"),
             makeRecord(id: "movie", mediaType: .video),
@@ -167,7 +168,63 @@ struct CandidateBucketsTests {
         ]
         let output = CandidateBuckets.make(records: records)
         #expect(output.buckets.flatMap(\.records).map(\.localIdentifier) == ["photo"])
-        // Videos are fingerprinted elsewhere, not bucketed; exclusions only cover invalid dims.
+        // Videos partition into their own content buckets (they have no visual pairs);
+        // audio is not analyzable at all and belongs to neither side.
+        #expect(output.videoBuckets.flatMap(\.records).map(\.localIdentifier) == ["movie"])
+        #expect(output.exclusions.isEmpty)
+    }
+
+    @Test func videosBucketByAspectDurationAndTimeSeparatelyFromStills() {
+        // A video's partner must agree on all three keys: aspect, duration quantum (0.1 s),
+        // and the temporal chain rule. Stills live in a different partition entirely.
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            makeRecord(id: "clip-1", mediaType: .video, creationDate: base, duration: 12.0),
+            makeRecord(id: "clip-2", mediaType: .video, creationDate: base.addingTimeInterval(5), duration: 12.0),
+            makeRecord(id: "clip-long", mediaType: .video, creationDate: base, duration: 40.0),
+            makeRecord(id: "photo-1", creationDate: base),
+        ]
+        let output = CandidateBuckets.make(records: records)
+
+        #expect(output.buckets.count == 1)
+        #expect(output.buckets[0].records.map(\.localIdentifier) == ["photo-1"])
+        let videoSets = Set(
+            output.videoBuckets.map { Set($0.records.map(\.localIdentifier)) }
+        )
+        #expect(videoSets == Set([["clip-1", "clip-2"], ["clip-long"]]))
+        #expect(output.exclusions.isEmpty)
+    }
+
+    @Test func videosRespectTemporalGapsAndAreNeverExcludedForInvalidDimensions() {
+        // Two hard rules: the temporal chain split applies to videos too, and a video with
+        // zero pixel dimensions is bucketed anyway — its bucket only decides which clips
+        // could plausibly duplicate, so bad dimensions never make it an "unavailable" claim.
+        var configuration = CandidateBucketsConfiguration.default
+        configuration.maxTemporalGap = 600
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let records = [
+            makeRecord(id: "near-1", mediaType: .video, creationDate: base, duration: 10),
+            makeRecord(id: "near-2", mediaType: .video, creationDate: base.addingTimeInterval(30), duration: 10),
+            makeRecord(id: "far", mediaType: .video, creationDate: base.addingTimeInterval(631), duration: 10),
+            makeRecord(id: "noDims", mediaType: .video, pixelWidth: 0, pixelHeight: 0, creationDate: base, duration: 10),
+        ]
+        let output = CandidateBuckets.make(records: records, configuration: configuration)
+
+        let videoSets = Set(
+            output.videoBuckets.map { Set($0.records.map(\.localIdentifier)) }
+        )
+        #expect(videoSets == Set([["near-1", "near-2"], ["far"], ["noDims"]]))
+        #expect(output.exclusions.isEmpty, "a video is never an exclusion")
+    }
+
+    @Test func aLoneVideoFormsASingletonVideoBucket() {
+        // The engine — not bucketing — decides to skip it (no partner → no content stat).
+        // Singleton video buckets must exist so the skip is countable, never invisible.
+        let records = [makeRecord(id: "lone-clip", mediaType: .video, duration: 3)]
+        let output = CandidateBuckets.make(records: records)
+        #expect(output.buckets.isEmpty)
+        #expect(output.videoBuckets.count == 1)
+        #expect(output.videoBuckets[0].records.map(\.localIdentifier) == ["lone-clip"])
         #expect(output.exclusions.isEmpty)
     }
 
@@ -176,19 +233,32 @@ struct CandidateBucketsTests {
         configuration.maxBucketSize = 3
 
         let base = Date(timeIntervalSince1970: 1_700_000_000)
-        let records = (0..<20).map { index in
+        let photoRecords = (0..<20).map { index in
             makeRecord(
                 id: String(format: "s%02d", index),
                 creationDate: base.addingTimeInterval(Double(index) * 30)
             )
         }
+        let videoRecords = (0..<8).map { index in
+            makeRecord(
+                id: String(format: "v%02d", index),
+                mediaType: .video,
+                creationDate: base.addingTimeInterval(Double(index) * 45),
+                duration: 30
+            )
+        }
+        let records = photoRecords + videoRecords
 
         let first = CandidateBuckets.make(records: records, configuration: configuration)
         let shuffled = CandidateBuckets.make(records: records.reversed(), configuration: configuration)
         let identity: (BucketingOutput) -> [[String]] = { output in
-            output.buckets.map { bucket in
+            let photos = output.buckets.map { bucket in
                 [bucket.id] + bucket.records.map(\.localIdentifier)
             }
+            let videos = output.videoBuckets.map { bucket in
+                [bucket.id] + bucket.records.map(\.localIdentifier)
+            }
+            return photos + videos
         }
         #expect(identity(first) == identity(shuffled))
     }

@@ -63,6 +63,18 @@ struct CatalogScanResult: Sendable, Equatable {
             total + (record.sizeInBytes ?? 0)
         }
     }
+
+    /// The same completed catalog with the given asset identifiers removed — in-place pruning
+    /// after a confirmed deletion, never a rebuild. `libraryAssetCount` stays the count the
+    /// enumeration reported: the next build is what reports the library's new size.
+    func removingAssetIDs(_ assetIDs: Set<String>) -> CatalogScanResult {
+        guard !assetIDs.isEmpty else { return self }
+        return CatalogScanResult(
+            records: records.filter { !assetIDs.contains($0.localIdentifier) },
+            libraryAssetCount: libraryAssetCount,
+            accessLevel: accessLevel
+        )
+    }
 }
 
 /// Explicit state machine for the catalog stage. No booleans, no implicit transitions.

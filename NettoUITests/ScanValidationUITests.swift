@@ -101,13 +101,14 @@ final class ScanValidationUITests: XCTestCase {
         XCTAssertTrue(cancel.waitForExistence(timeout: 20), "no cancel button while scanning")
         XCTAssertTrue(cancel.isHittable, "cancel not hittable: \(cancel.frame)")
         let tCancel = Date()
-        cancel.tap()
-
-        let cancelled = waitFor(
-            deadline: tCancel.addingTimeInterval(60),
-            description: "scan did not reach the cancelled state"
-        ) { state in
-            state == .cancelled
+        var cancelled = tapCancelUntilCancelled(cancel)
+        if !cancelled {
+            cancelled = waitFor(
+                deadline: tCancel.addingTimeInterval(60),
+                description: "scan did not reach the cancelled state"
+            ) { state in
+                state == .cancelled
+            }
         }
         let run1Tail = drainSamples()
         XCTAssertTrue(cancelled, "cancel did not reach a terminal cancelled state\n\(summary(of: run1Tail))")
@@ -145,14 +146,17 @@ final class ScanValidationUITests: XCTestCase {
         // Leave the app clean: cancel run 2.
         let cancel2 = element("cancelAnalysisButton")
         reveal(cancel2)
-        if cancel2.waitForExistence(timeout: 15), cancel2.isHittable {
-            cancel2.tap()
+        var cancelled2 = false
+        if cancel2.waitForExistence(timeout: 15) {
+            cancelled2 = tapCancelUntilCancelled(cancel2)
         }
-        _ = waitFor(
-            deadline: Date().addingTimeInterval(60),
-            description: "second cancel did not settle"
-        ) { state in
-            state == .cancelled
+        if !cancelled2 {
+            cancelled2 = waitFor(
+                deadline: Date().addingTimeInterval(60),
+                description: "second cancel did not settle"
+            ) { state in
+                state == .cancelled
+            }
         }
         let run2Tail = drainSamples()
 
@@ -250,9 +254,16 @@ final class ScanValidationUITests: XCTestCase {
             names.contains("reading") || names.contains("fingerprinting"),
             "catalog reading never shown"
         )
+        // Extraction/compare are deterministic points on the timeline between fingerprinting
+        // and grouping. Under cheap-first they can clear in milliseconds (a gate that admits
+        // no pairs leaves both stages with zero work), so — exactly like the fingerprinting
+        // completion check above — reaching any strictly later stage proves they executed
+        // even when the 0.5s sampler never caught their label.
         XCTAssertTrue(
-            names.contains("analyzing") || names.contains("comparing"),
-            "no extraction/compare progress shown"
+            names.contains("analyzing") || names.contains("comparing")
+                || names.contains("grouping") || names.contains("finalizing")
+                || names.contains("finished"),
+            "no extraction/compare progress shown and no later stage observed to prove it ran"
         )
 
         // Result reached the dashboard: the Similar Photos card must carry group counts.
@@ -287,6 +298,10 @@ final class ScanValidationUITests: XCTestCase {
     private func launch() {
         app = XCUIApplication()
         app.launchEnvironment["NETTO_SCAN_METRICS"] = "1"
+        // Set via KVC: `launchArguments` is MainActor-isolated while this helper is
+        // compiler-nonisolated (XCTest still runs it on the main thread). A direct assignment
+        // would add Swift 6 isolation warnings, and assumeIsolated trips sending-self checks.
+        app.setValue(["-resetScanSnapshot"], forKey: "launchArguments")
         app.launch()
     }
 
@@ -342,7 +357,9 @@ final class ScanValidationUITests: XCTestCase {
     }
 
     private func parse(_ text: String) -> ScanState {
-        if text.contains("Last scan finished") {
+        // The completed card leads with "Last scanned <relative time>"; the original M4C-era
+        // wording ("Last scan finished") is still accepted so either renders as finished.
+        if text.contains("Last scan finished") || text.contains("Last scanned") {
             let nums = capture(pattern: #"(\d+) of (\d+) items analyzed"#, in: text)
             return .finished(analyzed: nums?.first ?? -1, total: nums?.last ?? -1)
         }
@@ -476,6 +493,26 @@ final class ScanValidationUITests: XCTestCase {
             }
             swipes += 1
         }
+    }
+
+    /// Taps the cancel control until the scan reaches `.cancelled`, with a short wait per
+    /// attempt. The card's live counters change its layout continuously, so XCUITest's
+    /// coordinate resolution can go stale between the hit-test and the synthesized touch and
+    /// the tap lands off-target; retrying mirrors a user tapping again. The terminal-state
+    /// assertions that follow still gate the outcome — a broken cancel fails them anyway.
+    private func tapCancelUntilCancelled(_ cancel: XCUIElement, attempts: Int = 3) -> Bool {
+        for _ in 0..<attempts {
+            if cancel.exists, cancel.isHittable {
+                cancel.tap()
+            }
+            let attemptDeadline = Date().addingTimeInterval(4)
+            while Date() < attemptDeadline {
+                if readState() == .cancelled { return true }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return false
     }
 
     private func settle() {

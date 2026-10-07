@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// Everything the review screen can be showing, derived — never stored.
@@ -87,14 +88,21 @@ enum SimilarPhotosPresentation {
     }
 
     /// The "nothing to review" message. Only items the analysis actually ran over are counted:
-    /// unavailable assets could not be analyzed (the notice naming them shows alongside), so
-    /// folding them into an "Analyzed N" claim would overstate coverage.
+    /// unavailable assets could not be analyzed (the notice naming them shows alongside) and
+    /// skipped assets had no candidate partner, so folding either into an "Analyzed N" claim
+    /// would overstate coverage.
     static func noDuplicatesMessage(result: PhotoAnalysisResult) -> String {
-        let analyzed = max(0, result.totalRecordCount - result.unavailableAssets.count)
+        let analyzed = result.effectiveAnalyzedCount
         guard analyzed > 0 else {
+            if result.unavailableAssets.isEmpty, result.skippedNoCandidateCount > 0 {
+                return "Every item was the only candidate in its group, so there is nothing marked for cleanup."
+            }
             return "None of the items in this scan could be analyzed, so there is nothing marked for cleanup."
         }
-        return "Analyzed \(analyzed) items — every one is distinct, so there is nothing marked for cleanup."
+        let skippedNote = result.skippedNoCandidateCount > 0
+            ? " \(result.skippedNoCandidateCount) more had no similar candidates to compare."
+            : ""
+        return "Analyzed \(analyzed) items — every one is distinct, so there is nothing marked for cleanup.\(skippedNote)"
     }
 
     /// Honest, clamped progress for the determinate bar. `nil` for stages without a meaningful
@@ -102,6 +110,66 @@ enum SimilarPhotosPresentation {
     static func barFraction(for progress: PhotoAnalysisProgress) -> Double? {
         progress.fraction.map { min(max($0, 0), 1) }
     }
+
+    /// Whether the global "Deselect All" control should be on screen.
+    ///
+    /// Shown only while at least one photo is selected: a zero selection has nothing to
+    /// clear, so the action would just be a confusing control that does nothing.
+    static func showsDeselectAll(selectedCount: Int) -> Bool {
+        selectedCount > 0
+    }
+
+    /// The actions the top selection toolbar exposes, in menu order, with their exact
+    /// user-facing labels.
+    ///
+    /// Deliberately **not** including "Select All": Netto's cleanup workflow never bulk-marks
+    /// photos for deletion, so the toolbar offers only clearing and restoring. The view
+    /// builds its menu from this list, so what is tested here is what ships.
+    enum SelectionToolbarAction: String, CaseIterable, Sendable, Equatable {
+        case deselectAll = "Deselect All"
+        case resetToRecommended = "Reset to Recommended"
+    }
+
+    static let selectionToolbarActions: [SelectionToolbarAction] = [.deselectAll, .resetToRecommended]
+
+    /// Visibility per toolbar action: "Deselect All" only while there is something to clear;
+    /// "Reset to Recommended" stays available whenever a recommended selection exists (a
+    /// no-op when the selection already equals it).
+    static func shows(_ action: SelectionToolbarAction, selectedCount: Int) -> Bool {
+        switch action {
+        case .deselectAll:
+            return showsDeselectAll(selectedCount: selectedCount)
+        case .resetToRecommended:
+            return true
+        }
+    }
+
+    /// Stable accessibility identifier per toolbar action (for UI tests).
+    static func selectionActionIdentifier(_ action: SelectionToolbarAction) -> String {
+        switch action {
+        case .deselectAll:
+            return "deselectAllButton"
+        case .resetToRecommended:
+            return "resetToRecommendedButton"
+        }
+    }
+
+    /// The top toolbar's menu label — selection-specific by design.
+    ///
+    /// "Actions" was rejected: this screen's primary action is Review (cleanup/deletion
+    /// review), so a generic "Actions" menu would collide with that hierarchy. "Selection"
+    /// reads as secondary management of the current selection, which is exactly what it is.
+    static let selectionToolbarMenuLabel = "Selection"
+
+    /// VoiceOver value for the selection menu: "Selection, 234 photos selected".
+    static func selectionToolbarAccessibilityValue(selectedCount: Int) -> String {
+        selectedCount == 1 ? "1 photo selected" : "\(selectedCount) photos selected"
+    }
+
+    /// The bottom bar's primary action — the screen's dominant call-to-action, kept
+    /// distinct from the selection menu so the hierarchy stays explicit: Review is primary;
+    /// Selection → Deselect All / Reset to Recommended is secondary.
+    static let primaryReviewActionLabel = "Review"
 
     /// User-facing copy per analysis stage. Kept here so the same wording is used everywhere the
     /// stage is shown and is unit-testable.
@@ -131,6 +199,51 @@ enum SimilarPhotosPresentation {
             return "Finalizing…"
         }
     }
+
+    // MARK: Photo Details preview
+
+    /// Pixel budget for the large Photo Details preview and its full-screen viewer: one
+    /// rendition of ~1000–1500 px on the long side, device-scale independent. Enough to
+    /// inspect detail without ever decoding full-resolution pixels into memory.
+    static let previewTargetPixelSize = 1_400
+
+    /// Height of the preview box on the detail sheet. The *image* inside is aspect-fit
+    /// (never cropped) and letterboxes against the box's dark background, so the box adapts
+    /// to the asset's aspect ratio instead of forcing a square crop.
+    static let previewBoxHeight: CGFloat = 340
+
+    /// Loading headline for the preview skeleton.
+    static let previewLoadingMessage = "Loading photo…"
+
+    /// Failure headline shown in place of the preview.
+    static let previewUnavailableTitle = "Photo unavailable"
+
+    /// User-facing preview failure copy. PhotoKit's vocabulary stays distinct — "only in
+    /// iCloud", "no longer in the library", and "Photos access is off" are different problems
+    /// for the user — and every state is retryable: the preview request is uncached, so
+    /// "Try Again" issues a fresh load instead of replaying a poisoned cache entry.
+    static func previewUnavailableMessage(for error: PhotoContentError) -> String {
+        switch error {
+        case .onlyInICloud:
+            return "This photo is only in iCloud and couldn't be downloaded right now. Check your connection and tap Try Again."
+        case .assetNotFound:
+            return "This photo is no longer in your library, so Netto can't show it."
+        case .permissionDenied:
+            return "Photos access is off. Enable it in Settings to view this photo."
+        case .unavailable:
+            return "Netto couldn't load this photo on this iPhone. Tap Try Again."
+        }
+    }
+
+    /// Failure symbol per preview error — the same distinction the copy makes, in icon form.
+    static func previewFailureSymbol(for error: PhotoContentError) -> String {
+        switch error {
+        case .onlyInICloud: return "icloud.and.arrow.down"
+        case .assetNotFound: return "photo.badge.exclamationmark"
+        case .permissionDenied: return "lock.shield"
+        case .unavailable: return "exclamationmark.triangle"
+        }
+    }
 }
 
 /// Countable facts about a finished run, computed once from the result.
@@ -139,22 +252,27 @@ struct SimilarPhotosSummary: Sendable, Equatable {
     let similarGroupCount: Int
     let groupedAssetCount: Int
     let unavailableCount: Int
+    /// Assets never requested because no candidate partner could exist — honest "not analyzed"
+    /// without pretending anything failed.
+    let skippedCount: Int
     let totalRecords: Int
+    /// Items with evidence this run (or, for legacy results, everything not unavailable).
+    let analyzedCount: Int
 
     init(result: PhotoAnalysisResult) {
         exactGroupCount = result.exactGroups.count
         similarGroupCount = result.similarGroups.count
         groupedAssetCount = result.totalGroupedAssetCount
         unavailableCount = result.unavailableAssets.count
+        skippedCount = result.skippedNoCandidateCount
         totalRecords = result.totalRecordCount
+        analyzedCount = result.effectiveAnalyzedCount
     }
 
     /// No groups at all — the "nothing to review" result state.
     var hasNoGroups: Bool { exactGroupCount == 0 && similarGroupCount == 0 }
 
-    /// Items the analysis actually produced descriptors for — unavailable assets were never
-    /// analyzed, so counting them in an "Analyzed N" claim would overstate coverage.
-    var analyzedCount: Int {
-        max(0, totalRecords - unavailableCount)
-    }
+    /// Items the analysis did not produce evidence for — unavailable (failed, reported) plus
+    /// skipped (no partner, reported): never folded into an "Analyzed N" claim.
+    var notAnalyzedCount: Int { unavailableCount + skippedCount }
 }

@@ -34,6 +34,14 @@ struct PhotoSelectionModel: Sendable, Equatable {
     /// Asset identifiers the user has marked for cleanup. Unique by construction.
     private(set) var selectedIDs: Set<String>
 
+    /// The selection exactly as it was when these groups were first presented — the
+    /// recommended selection "Reset to Recommended" restores.
+    ///
+    /// Captured once at init from the same deterministic default the results opened with.
+    /// User changes never touch it, and it is never recalculated: a rescan produces a new
+    /// `PhotoAnalysisResult` and therefore a brand-new model with its own snapshot.
+    private let originalSelectionIDs: Set<String>
+
     /// Group id → members, in the group's declared order.
     private let membersByGroup: [String: [String]]
     /// Group id → that group's recommended "keep" asset.
@@ -42,10 +50,16 @@ struct PhotoSelectionModel: Sendable, Equatable {
     private let groupIDsByAsset: [String: Set<String>]
     /// Every asset recommended as a keep *somewhere*. Group-level defaults never select these.
     private let protectedRecommendedIDs: Set<String>
+    /// Library assets outside every group that a standalone, library-wide review (the
+    /// dashboard's Swipe Review feature) has admitted for marking. Admission only widens
+    /// *which* assets accept a decision; it never selects anything by itself, and it is
+    /// deliberately not part of the group universe — the group APIs above stay group-only.
+    private var admittedLibraryAssets: Set<String> = []
 
     /// An empty selection over no groups — a valid starting state (and a valid end state).
     init() {
         selectedIDs = []
+        originalSelectionIDs = []
         membersByGroup = [:]
         recommendedByGroup = [:]
         groupIDsByAsset = [:]
@@ -56,6 +70,16 @@ struct PhotoSelectionModel: Sendable, Equatable {
     /// every group is selected except assets protected as a recommendation.
     init(result: PhotoAnalysisResult) {
         self.init(groups: result.exactGroups + result.similarGroups)
+    }
+
+    /// Rebuilds over an updated result while keeping the user's exact choices for the members
+    /// that still exist — used after a confirmed deletion removes assets from a completed
+    /// result. Choices for vanished assets (and for members of dissolved groups) drop out;
+    /// the reset snapshot is the updated result's deterministic default, so "Reset to
+    /// Recommended" stays meaningful over the new groups.
+    init(result: PhotoAnalysisResult, preserving previous: PhotoSelectionModel) {
+        self.init(result: result)
+        selectedIDs = previous.selectedIDs.intersection(groupIDsByAsset.keys)
     }
 
     init(groups: [PhotoSimilarityGroup]) {
@@ -84,6 +108,7 @@ struct PhotoSelectionModel: Sendable, Equatable {
             if !groupIDs.isEmpty { initial.insert(assetID) }
         }
         selectedIDs = initial
+        originalSelectionIDs = initial
     }
 
     // MARK: Queries
@@ -121,12 +146,26 @@ struct PhotoSelectionModel: Sendable, Equatable {
         groupIDsByAsset[assetID] ?? []
     }
 
+    /// Whether a per-asset decision may touch this identifier: a group member, or an asset
+    /// a library-wide review explicitly admitted. Everything else is still ignored.
+    private func accepts(_ assetID: String) -> Bool {
+        groupIDsByAsset[assetID] != nil || admittedLibraryAssets.contains(assetID)
+    }
+
     // MARK: Mutations
 
-    /// Explicit per-asset override. Unknown assets are ignored (the review UI only ever shows
-    /// group members, and a stray identifier must not silently enter the cleanup set).
+    /// Admits general-library assets (outside every group) so a standalone library-wide
+    /// review can mark them for cleanup. Idempotent; selecting is still always explicit —
+    /// admission alone never changes `selectedIDs`.
+    mutating func admitLibraryAssets(_ assetIDs: Set<String>) {
+        admittedLibraryAssets.formUnion(assetIDs)
+    }
+
+    /// Explicit per-asset override. Assets that are neither group members nor admitted
+    /// library assets are ignored (the review UI only ever shows one of those two sets,
+    /// and a stray identifier must not silently enter the cleanup set).
     mutating func setSelected(_ selected: Bool, forAsset assetID: String) {
-        guard groupIDsByAsset[assetID] != nil else { return }
+        guard accepts(assetID) else { return }
         if selected {
             selectedIDs.insert(assetID)
         } else {
@@ -136,7 +175,7 @@ struct PhotoSelectionModel: Sendable, Equatable {
 
     /// Flips one asset. Toggling twice restores the previous state exactly.
     mutating func toggle(_ assetID: String) {
-        guard groupIDsByAsset[assetID] != nil else { return }
+        guard accepts(assetID) else { return }
         if selectedIDs.contains(assetID) {
             selectedIDs.remove(assetID)
         } else {
@@ -165,6 +204,34 @@ struct PhotoSelectionModel: Sendable, Equatable {
         for assetID in members {
             selectedIDs.remove(assetID)
         }
+    }
+
+    /// "Deselect all": clears every user-selected cleanup candidate at once.
+    ///
+    /// Touches only `selectedIDs` — the groups, membership, and protected recommendations are
+    /// immutable by construction, so results, KEEP recommendations, and per-group state are
+    /// exactly what they were. Empty selection is a first-class state (the model says so at
+    /// the top), and individual selection works normally afterwards.
+    mutating func deselectAll() {
+        selectedIDs.removeAll()
+    }
+
+    /// "Select all": every member of every group — the full set of valid cleanup candidates.
+    ///
+    /// An explicit bulk action, so unlike the default it may include recommended photos (the
+    /// user can already select them one by one). The groups' KEEP recommendations themselves
+    /// are untouched; only the selection changes.
+    mutating func selectAll() {
+        selectedIDs = Set(membersByGroup.values.flatMap { $0 })
+    }
+
+    /// "Reset to Recommended": restore exactly the selection these results were presented
+    /// with, whatever the user has done since (deselect-all, select-all, individual changes).
+    ///
+    /// Reads only the snapshot captured at init — no rescan, no recomputation, and the
+    /// groups, membership, and KEEP recommendations are never touched.
+    mutating func resetToRecommended() {
+        selectedIDs = originalSelectionIDs
     }
 
     /// "Keep recommended": deselects this group's recommended asset; everything else — including

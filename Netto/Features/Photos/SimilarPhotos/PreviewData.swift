@@ -156,7 +156,11 @@ enum PreviewData {
 
     /// Thumbnail loader that serves synthesized images — previews never touch PhotoKit.
     struct ThumbnailLoader: PhotoThumbnailLoading {
-        func thumbnail(for assetID: String, targetPixelSize: Int) async throws -> CGImage {
+        func thumbnail(
+            for assetID: String,
+            targetPixelSize: Int,
+            mode: PhotoThumbnailRequestMode
+        ) async throws -> CGImage {
             let side = CGFloat(max(1, targetPixelSize))
             return PreviewData.image(seed: assetID, size: CGSize(width: side, height: side))
         }
