@@ -94,6 +94,11 @@ final class SwipeReviewModel: ObservableObject {
 ///   environment's loader (uncached, released on close or on reaching the completion state) —
 ///   no second PhotoKit loader, no whole-library prefetch.
 ///
+/// A persistent bottom bar (live count + "Review Cleanup") is on screen for the whole
+/// session — finishing the deck is not a precondition for reviewing — and the completion
+/// screen repeats the same handoff with "Back to Similar Photos" as the way out. Both
+/// preserve the shared selection exactly: this screen never instantiates or resets it.
+///
 /// Exiting early (back gesture / system back) simply pops the stack: decisions already live
 /// in the shared selection, so every selection count updates immediately.
 struct SwipeReviewView: View {
@@ -184,6 +189,12 @@ struct SwipeReviewView: View {
         }
         .padding(Theme.Spacing.lg)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Persistent bottom action area: the live count plus the handoff into the existing
+        // review flow, on screen for the whole session — finishing the deck is not a
+        // precondition for reviewing what has been marked.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            reviewCleanupBar
+        }
     }
 
     private func header(_ item: SwipeReviewItem) -> some View {
@@ -486,6 +497,41 @@ struct SwipeReviewView: View {
         .accessibilityIdentifier(SwipeReviewPresentation.undoAccessibilityID)
     }
 
+    // MARK: Persistent review bar
+
+    /// The bottom action area shown for the whole swipe session: the live count out of the
+    /// *shared* selection, then the handoff into the existing `ReviewSelectionView` — the
+    /// identical destination the Similar Photos bottom bar and the completion screen use.
+    /// Always visible while swiping, clearly unavailable (disabled) while nothing is
+    /// selected. It reads `env.selection` directly; there is no local copy to drift, fork,
+    /// or reset when navigating away and back.
+    private var reviewCleanupBar: some View {
+        let enabled = SwipeReviewPresentation.reviewCleanupEnabled(
+            selectedCount: env.selection.selectedCount
+        )
+        return VStack(spacing: Theme.Spacing.sm) {
+            Text(SwipeReviewPresentation.selectedForCleanupText(env.selection.selectedCount))
+                .font(NettoType.secondaryBody.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(NettoColor.brandDeep)
+                .nettoCount(env.selection.selectedCount)
+                .accessibilityIdentifier(SwipeReviewPresentation.selectedCountAccessibilityID)
+
+            NavigationLink {
+                ReviewSelectionView()
+            } label: {
+                Text(SwipeReviewPresentation.completionPrimaryTitle)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(NettoPrimaryButtonStyle())
+            .disabled(!enabled)
+            .opacity(enabled ? 1 : 0.45)
+            .accessibilityIdentifier(SwipeReviewPresentation.reviewCleanupAccessibilityID)
+        }
+        .frame(maxWidth: .infinity)
+        .nettoFloatingBar()
+    }
+
     // MARK: Completion
 
     private var completionView: some View {
@@ -517,6 +563,8 @@ struct SwipeReviewView: View {
                     .font(NettoType.secondaryBody.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(NettoColor.brandDeep)
+                    .nettoCount(env.selection.selectedCount)
+                    .accessibilityIdentifier(SwipeReviewPresentation.selectedCountAccessibilityID)
             }
 
             reviewCleanupButton
@@ -529,21 +577,30 @@ struct SwipeReviewView: View {
     }
 
     /// Into the *existing* review flow — the identical destination the Similar Photos bottom
-    /// bar uses. The review screen prepares its plan from the shared selection on appear;
-    /// swipe mode adds no deletion surface of its own.
+    /// bar and the persistent swipe-time bar use. The review screen prepares its plan from
+    /// the shared selection on appear; swipe mode adds no deletion surface of its own. Gated
+    /// by the same predicate as the persistent bar, so "nothing selected" reads identically
+    /// on both screens.
     private var reviewCleanupButton: some View {
-        NavigationLink {
+        let enabled = SwipeReviewPresentation.reviewCleanupEnabled(
+            selectedCount: env.selection.selectedCount
+        )
+        return NavigationLink {
             ReviewSelectionView()
         } label: {
             Text(SwipeReviewPresentation.completionPrimaryTitle)
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(NettoPrimaryButtonStyle())
-        .disabled(env.selection.selectedCount == 0)
-        .opacity(env.selection.selectedCount == 0 ? 0.45 : 1)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
         .accessibilityIdentifier(SwipeReviewPresentation.reviewCleanupAccessibilityID)
     }
 
+    /// Leaves the swipe session (back gesture / this button both end at the same stack pop).
+    /// The action itself performs no mutation: every decision already lives in the shared
+    /// selection, so the screen underneath — Similar Photos or wherever the session was
+    /// entered from — reads the exact counts that were swiped.
     private var doneButton: some View {
         Button(SwipeReviewPresentation.completionSecondaryTitle) {
             dismiss()

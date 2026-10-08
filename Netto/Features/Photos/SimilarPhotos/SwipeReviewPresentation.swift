@@ -113,7 +113,21 @@ enum SwipeReviewPresentation {
 
     static let completionTitle = "You're all caught up."
     static let completionPrimaryTitle = "Review Cleanup"
-    static let completionSecondaryTitle = "Done"
+    static let completionSecondaryTitle = "Back to Similar Photos"
+
+    // MARK: Persistent review bar (while swiping)
+
+    /// The live count line in the persistent bottom area — the same copy the completion
+    /// screen shows, so "N photos selected for cleanup" reads identically everywhere.
+    static let selectedCountAccessibilityID = "swipeSelectedCountLabel"
+
+    /// Whether the "Review Cleanup" affordance is actionable. It gates *both* the persistent
+    /// bar's button and the completion screen's primary button: with nothing marked for
+    /// cleanup there is nothing to review, so the control is present but clearly unavailable
+    /// instead of opening an empty review.
+    static func reviewCleanupEnabled(selectedCount: Int) -> Bool {
+        selectedCount > 0
+    }
 
     /// The completion state's primary action target: the *existing* Review flow
     /// (`ReviewSelectionView`, which enters through `reviewDidAppear(from: .similarPhotos)`).

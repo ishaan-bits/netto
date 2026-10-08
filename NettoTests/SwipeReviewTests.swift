@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import Netto
 
-// MARK: - Swipe Review (M4K): session semantics over the existing PhotoSelectionModel
+// MARK: - Swipe Review (M4K/M4L): session semantics over the existing PhotoSelectionModel
 //
 // The swipe session is pure cursor/history logic; every decision is written through the
 // *shared* selection exactly as the view does (`env.mutateSelection { model.decide(…) }`),
@@ -10,6 +10,11 @@ import Testing
 // undo is an exact restore, decisions outlive the session, completion counts are honest —
 // and none of it can reach the scanner or the deletion pipeline. No photo library, no
 // network: the loader and PhotoKit are never touched.
+//
+// M4L adds the persistent review bar: the live count + "Review Cleanup" is available for the
+// whole session (not only at completion), it hands off to the *existing* `ReviewSelectionView`
+// with exactly the swiped selections, "Back to Similar Photos" leaves with the selection
+// intact, and with nothing selected the affordance is clearly unavailable.
 
 @MainActor
 struct SwipeReviewTests {
@@ -255,6 +260,134 @@ struct SwipeReviewTests {
         #expect(plan.selectionSnapshot == env.selection.selectedIDs)
     }
 
+    // MARK: Persistent review bar & completion (M4L)
+
+    @Test func fiveDecisionsAcrossFivePhotosAreAllPreserved() {
+        let env = makeEnv()
+        let items = libraryDeck(count: 5)
+        let model = SwipeReviewModel(items: items)
+        // Exactly what `SwipeReviewView.onAppear` does: the deck enters the shared
+        // selection's accepted set — admission alone selects nothing.
+        env.mutateSelection { $0.admitLibraryAssets(Set(items.map(\.assetID))) }
+        #expect(env.selection.selectedCount == 0)
+
+        for _ in items {
+            env.mutateSelection { model.decide(.delete, selection: &$0) }
+        }
+
+        #expect(model.cursor == 5)
+        #expect(model.isComplete)
+        // All five decisions preserved in the shared selection — no reset, no shadow copy.
+        for assetID in items.map(\.assetID) {
+            #expect(env.selection.isSelected(assetID))
+        }
+        #expect(env.selection.selectedCount == 5)
+        #expect(SwipeReviewPresentation.selectedForCleanupText(env.selection.selectedCount)
+                == "5 photos selected for cleanup")
+    }
+
+    @Test func midSessionReviewCleanupHandsExactSelectionsToTheExistingReviewFlow() async {
+        let env = makeReviewReadyEnv()
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+
+        env.mutateSelection { model.decide(.delete, selection: &$0) } // e1 marked
+        env.mutateSelection { model.decide(.keep, selection: &$0) }   // e2 cleared
+        #expect(!model.isComplete) // the persistent bar — not only completion — is an entry
+        #expect(env.selection.selectedIDs == ["e1", "e3"])
+        // The bar shares the completion screen's primary destination: the *existing* review.
+        #expect(SwipeReviewPresentation.completionPrimaryDestination == .existingReviewFlow)
+        #expect(SwipeReviewPresentation.completionPrimaryTitle == "Review Cleanup")
+
+        // Same handoff the bar's NavigationLink performs: the existing review screen appears
+        // over the shared selection and prepares exactly those photos.
+        env.reviewDidAppear(from: .similarPhotos)
+        await waitForPlanReady(env)
+
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == env.selection.selectedIDs)
+        #expect(plan.selectionSnapshot == ["e1", "e3"])
+    }
+
+    @Test func finishingTheLastPhotoReachesTheCompletionState() {
+        let env = makeEnv()
+        let result = fixtureResult()
+        env.selection = PhotoSelectionModel(result: result)
+        let items = SwipeReviewPresentation.items(from: result)
+        let model = SwipeReviewModel(items: items)
+
+        // First three decisions: a photo is still on screen, the session is live.
+        env.mutateSelection { model.decide(.delete, selection: &$0) }
+        env.mutateSelection { model.decide(.keep, selection: &$0) }
+        env.mutateSelection { model.decide(.delete, selection: &$0) }
+        #expect(!model.isComplete)
+        #expect(model.currentItem != nil)
+
+        // The last photo decides → the completion screen's exact contract.
+        env.mutateSelection { model.decide(.keep, selection: &$0) }
+        #expect(model.isComplete)
+        #expect(model.currentItem == nil)
+        #expect(model.reviewedCount == items.count)
+        #expect(SwipeReviewPresentation.completionTitle == "You're all caught up.")
+        #expect(SwipeReviewPresentation.selectedForCleanupText(env.selection.selectedCount)
+                == "2 photos selected for cleanup")
+        #expect(SwipeReviewPresentation.completionPrimaryTitle == "Review Cleanup")
+        #expect(SwipeReviewPresentation.completionSecondaryTitle == "Back to Similar Photos")
+        // Both completion actions are offered only when there is something to review.
+        #expect(SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: env.selection.selectedCount))
+    }
+
+    @Test func completionSecondaryReturnsOutPreservingEverySelection() {
+        let env = makeEnv()
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+
+        env.mutateSelection { model.decide(.delete, selection: &$0) }
+        env.mutateSelection { model.decide(.keep, selection: &$0) }
+        let decided = env.selection
+
+        // The secondary action's contract: dismiss the session ("Back to Similar Photos")
+        // without touching the shared model — the screen underneath reads the exact
+        // selections that were swiped, and the review-facing count agrees.
+        #expect(SwipeReviewPresentation.completionSecondaryDestination == .dismissToSimilarPhotos)
+        #expect(SwipeReviewPresentation.completionSecondaryTitle == "Back to Similar Photos")
+        #expect(env.selection == decided) // dismiss() mutates nothing
+        #expect(env.selectionCount(for: .similarPhotos) == decided.selectedCount)
+        #expect(env.selection.isSelected("e1"))
+        #expect(!env.selection.isSelected("e2"))
+    }
+
+    @Test func reviewCleanupIsUnavailableWhileNothingIsSelected() {
+        let env = makeEnv()
+        let items = libraryDeck(count: 2)
+        let model = SwipeReviewModel(items: items)
+        env.mutateSelection { $0.admitLibraryAssets(Set(items.map(\.assetID))) }
+
+        // Fresh session: zero selected → the bar's button is present but clearly
+        // unavailable rather than opening an empty review.
+        #expect(env.selection.selectedCount == 0)
+        #expect(!SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: env.selection.selectedCount))
+
+        // A keep still leaves nothing to review → still unavailable.
+        env.mutateSelection { model.decide(.keep, selection: &$0) }
+        #expect(env.selection.selectedCount == 0)
+        #expect(!SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: env.selection.selectedCount))
+
+        // The first delete marks a photo → the same shared predicate enables the button.
+        env.mutateSelection { model.decide(.delete, selection: &$0) }
+        #expect(env.selection.selectedCount == 1)
+        #expect(SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: env.selection.selectedCount))
+        // And the enabled gate covers every nonzero count the bar can show.
+        #expect(SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: 5))
+    }
+
     // MARK: Scanner & deletion safety (spec 10–11)
 
     @Test func swipingNeverInvokesTheScanner() {
@@ -368,6 +501,21 @@ private func fixtureResult() -> PhotoAnalysisResult {
 
 private func item(_ assetID: String) -> SwipeReviewItem {
     SwipeReviewItem(assetID: assetID, groupKind: .exactDuplicates, groupOrdinal: 1, isRecommended: false)
+}
+
+/// The standalone library deck the dashboard's Swipe Review pushes: items outside every
+/// group, marked `isLibraryItem` exactly as `SwipeReviewPresentation.items(from: catalog)`
+/// builds them — the path the persistent review bar's zero-at-start state runs on.
+private func libraryDeck(count: Int) -> [SwipeReviewItem] {
+    (1...count).map { index in
+        SwipeReviewItem(
+            assetID: "lib\(index)",
+            groupKind: .nearDuplicates,
+            groupOrdinal: 0,
+            isRecommended: false,
+            isLibraryItem: true
+        )
+    }
 }
 
 @MainActor
