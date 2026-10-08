@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import Photos
 import Testing
+import UIKit
 @testable import Netto
 
 // MARK: - Photo Details preview: loader policy + preview model lifecycle
@@ -94,6 +95,42 @@ struct PhotoPreviewTests {
         #expect(terminalFailure(finalWithoutPixels) as? PhotoContentError == .unavailable)
     }
 
+    @Test func finalFrameWithPixelsIsAcceptedEvenWhenICloudFlagged() {
+        // The bug this pins: a delivered final image carrying `PHImageResultIsInCloudKey`
+        // must settle as success — the pixels are present, so failing with onlyInICloud
+        // blanked a working preview with "Photo unavailable".
+        let pixels = UIImage(cgImage: solidImage(width: 6, height: 4, level: 200))
+        let outcome = PhotoKitThumbnailLoader.previewOutcome(
+            image: pixels,
+            info: [PHImageResultIsInCloudKey: true]
+        )
+        guard case .terminal(let result) = outcome else {
+            Issue.record("expected a terminal outcome, got \(outcome)")
+            return
+        }
+        guard case .success(let frame) = result else {
+            Issue.record("expected success, got \(result)")
+            return
+        }
+        #expect(frame.width == 6)
+        #expect(frame.height == 4)
+    }
+
+    @Test func degradedFramesWithPixelsStayInterim() {
+        // Opportunistic delivery hands back a low-resolution frame first — pixels or not,
+        // a degraded callback is progress, so the interim channel must win over the
+        // accept-the-pixels rule.
+        let pixels = UIImage(cgImage: solidImage(width: 3, height: 3, level: 64))
+        let outcome = PhotoKitThumbnailLoader.previewOutcome(
+            image: pixels,
+            info: [PHImageResultIsDegradedKey: true, PHImageResultIsInCloudKey: true]
+        )
+        guard case .interim = outcome else {
+            Issue.record("expected interim, got \(outcome)")
+            return
+        }
+    }
+
     @Test func previewSeamForwardsIDSizeAndInterimFrames() async throws {
         let final = solidImage(width: 4, height: 4)
         let interim = solidImage(width: 3, height: 3, level: 64)
@@ -116,6 +153,131 @@ struct PhotoPreviewTests {
         #expect(sizeBox.read() == 1_400)
         #expect(interimBox.read() === interim)
         #expect(received === final)
+    }
+
+    // MARK: Automatic recovery (primary → local-rendition fallback)
+
+    @Test func aFailedPrimaryFallsBackAndReturnsLocalPixels() async throws {
+        let primaryBox = Box<Int>(0)
+        let fallbackBox = Box<Int>(0)
+        let local = solidImage(width: 5, height: 5, level: 90)
+        let loader = PhotoKitThumbnailLoader(
+            previewRequest: { _, _, _ in
+                primaryBox.write(primaryBox.read() + 1)
+                throw PhotoContentError.onlyInICloud
+            },
+            fallbackRequest: { _, _ in
+                fallbackBox.write(fallbackBox.read() + 1)
+                return local
+            }
+        )
+
+        let received = try await loader.previewImage(for: "photo-7", targetPixelSize: 1_400) { _ in }
+
+        #expect(primaryBox.read() == 1)
+        #expect(fallbackBox.read() == 1)
+        #expect(received === local)
+    }
+
+    @Test func aPersistentlyFailingPreviewSurfacesThePrimaryError() async {
+        let fallbackBox = Box<Int>(0)
+        let loader = PhotoKitThumbnailLoader(
+            previewRequest: { _, _, _ in throw PhotoContentError.onlyInICloud },
+            fallbackRequest: { _, _ in
+                fallbackBox.write(fallbackBox.read() + 1)
+                throw PhotoContentError.unavailable
+            }
+        )
+
+        // The primary reason ("only in iCloud") explains the screen better than the ladder's
+        // last miss, so it — not the fallback's error — is what reaches the user.
+        await #expect(throws: PhotoContentError.onlyInICloud) {
+            _ = try await loader.previewImage(for: "photo-8", targetPixelSize: 1_400) { _ in }
+        }
+        #expect(fallbackBox.read() == 1)
+    }
+
+    @Test func aCancelledPreviewIsNeverRetried() async {
+        let fallbackBox = Box<Int>(0)
+        let loader = PhotoKitThumbnailLoader(
+            previewRequest: { _, _, _ in throw CancellationError() },
+            fallbackRequest: { _, _ in
+                fallbackBox.write(fallbackBox.read() + 1)
+                return solidImage(width: 2, height: 2)
+            }
+        )
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await loader.previewImage(for: "photo-10", targetPixelSize: 1_400) { _ in }
+        }
+        #expect(fallbackBox.read() == 0)
+    }
+
+    @Test func permanentFailuresSkipTheFallback() async {
+        for permanent in [PhotoContentError.permissionDenied, .assetNotFound] {
+            let fallbackBox = Box<Int>(0)
+            let loader = PhotoKitThumbnailLoader(
+                previewRequest: { _, _, _ in throw permanent },
+                fallbackRequest: { _, _ in
+                    fallbackBox.write(fallbackBox.read() + 1)
+                    return solidImage(width: 2, height: 2)
+                }
+            )
+            await #expect(throws: permanent) {
+                _ = try await loader.previewImage(for: "photo-11", targetPixelSize: 1_400) { _ in }
+            }
+            #expect(fallbackBox.read() == 0)
+        }
+    }
+
+    @Test func fallbackLadderWalksLargestFirstAndStopsAtTheFirstSuccess() async throws {
+        let attempted = Box<[Int]>([])
+        let local = solidImage(width: 4, height: 4)
+        let image = try await PhotoKitThumbnailLoader.previewFallbackLadder(targetPixelSize: 1_400) { size in
+            attempted.write(attempted.read() + [size])
+            if size >= 512 { throw PhotoContentError.unavailable }
+            return local
+        }
+
+        #expect(attempted.read() == [768, 512, 384])
+        #expect(image === local)
+    }
+
+    @Test func fallbackLadderSkipsSizesThePrimaryRequestAlreadyCovered() async throws {
+        let attempted = Box<[Int]>([])
+        _ = try await PhotoKitThumbnailLoader.previewFallbackLadder(targetPixelSize: 300) { size in
+            attempted.write(attempted.read() + [size])
+            return solidImage(width: 2, height: 2)
+        }
+        #expect(attempted.read() == [256])
+    }
+
+    @Test func fallbackLadderNeverSwallowsCancellation() async {
+        await #expect(throws: CancellationError.self) {
+            _ = try await PhotoKitThumbnailLoader.previewFallbackLadder(targetPixelSize: 1_400) { _ in
+                throw CancellationError()
+            }
+        }
+    }
+
+    @Test func fallbackPolicyKeepsTheScannerAndCopyContracts() {
+        let sizes = PhotoKitThumbnailLoader.previewFallbackPixelSizes
+        #expect(sizes == sizes.sorted(by: >))
+        #expect(Set(sizes).count == sizes.count)
+        #expect(sizes.last == 256)
+        #expect(sizes.allSatisfy { $0 < SimilarPhotosPresentation.previewTargetPixelSize })
+
+        // The ladder keeps the preview's network exception; the scanner policy is untouched.
+        let fallback = PhotoKitThumbnailLoader.makePreviewFallbackRequestOptions()
+        #expect(fallback.isNetworkAccessAllowed == true)
+        #expect(fallback.deliveryMode == .highQualityFormat)
+        #expect(fallback.version == .current)
+        #expect(PhotoKitThumbnailLoader.makeImageRequestOptions().isNetworkAccessAllowed == false)
+
+        // Cloud-download failures read as iCloud on the preview path only.
+        let cloudDownload = NSError(domain: "CloudPhotoLibraryErrorDomain", code: 1006)
+        #expect(PhotoKitThumbnailLoader.mapPreviewError(cloudDownload) as? PhotoContentError == .onlyInICloud)
+        #expect(PhotoKitThumbnailLoader.mapPreviewError(PhotoContentError.unavailable) as? PhotoContentError == .unavailable)
     }
 
     // MARK: Model lifecycle

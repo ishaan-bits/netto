@@ -97,7 +97,10 @@ extension PhotoThumbnailLoading {
 ///   surrounding task is cancelled.
 /// - The **preview path is separate and explicit**: `previewImage` / `makePreviewRequestOptions`
 ///   (large box, network allowed, opportunistic frames) exist only for the Photo Details screen
-///   the user just opened; nothing above — and no scanner call site — reaches them.
+///   the user just opened; nothing above — and no scanner call site — reaches them. It is
+///   uncached (failures are never stored); when the primary request fails for a recoverable
+///   reason, a local-rendition fallback ladder (`previewFallbackPixelSizes`) walks down to
+///   whatever pixels Photos still has on disk before the screen shows an error.
 struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     /// Failsafe for one analysis thumbnail request. Generous enough for a slow local decode to
     /// finish, finite enough that a stuck request costs one asset, not the scan.
@@ -120,15 +123,25 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
         _ onInterim: @escaping @Sendable (CGImage) -> Void
     ) async throws -> CGImage
 
+    /// The preview's local-rendition fallback, injectable for the same reason. It runs only
+    /// after a failed primary request and returns the best locally available pixels.
+    typealias PreviewFallbackRequest = @Sendable (
+        _ assetID: String,
+        _ targetPixelSize: Int
+    ) async throws -> CGImage
+
     private let request: ImageRequest
     private let previewRequest: PreviewImageRequest
+    private let fallbackRequest: PreviewFallbackRequest
 
     init(
         request: @escaping ImageRequest = Self.liveRequest,
-        previewRequest: @escaping PreviewImageRequest = Self.livePreviewRequest
+        previewRequest: @escaping PreviewImageRequest = Self.livePreviewRequest,
+        fallbackRequest: @escaping PreviewFallbackRequest = Self.livePreviewFallbackRequest
     ) {
         self.request = request
         self.previewRequest = previewRequest
+        self.fallbackRequest = fallbackRequest
     }
 
     func thumbnail(
@@ -139,12 +152,38 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
         try await request(assetID, max(1, targetPixelSize), mode)
     }
 
+    /// The large Photo Details rendition: the primary network-enabled request, then — when it
+    /// fails for a recoverable reason — one automatic fallback to the local-rendition ladder.
+    ///
+    /// The primary request can fail without the photo being gone: an edited asset whose large
+    /// rendition only exists in iCloud (whose download may be broken on this device), a
+    /// network blip, a timeout. Rather than showing "Photo unavailable" while a smaller local
+    /// copy of the same photo sits on disk, `fallbackRequest` walks down `previewFallbackPixelSizes`
+    /// and returns the best pixels Photos can serve locally — fresh requests throughout, never
+    /// a replay of a cached miss. Cancellation and permanent failures (permission, missing
+    /// asset) skip the fallback; if the fallback also fails, the *primary* error surfaces,
+    /// because it explains the screen better than the ladder's last miss.
     func previewImage(
         for assetID: String,
         targetPixelSize: Int,
         onInterim: @escaping @Sendable (CGImage) -> Void
     ) async throws -> CGImage {
-        try await previewRequest(assetID, max(1, targetPixelSize), onInterim)
+        let side = max(1, targetPixelSize)
+        let primaryError: any Error
+        do {
+            return try await previewRequest(assetID, side, onInterim)
+        } catch {
+            primaryError = error
+        }
+        guard Self.isPreviewFallbackCandidate(primaryError), !Task.isCancelled else {
+            throw primaryError
+        }
+        do {
+            return try await fallbackRequest(assetID, side)
+        } catch {
+            if error is CancellationError || Task.isCancelled { throw error }
+            throw primaryError
+        }
     }
 
     /// The production path: exactly one bounded, orientation-baked thumbnail.
@@ -183,7 +222,10 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     /// PhotoKit request and resumes exactly once — but the callback first asks
     /// `previewOutcome` whether this callback is intermediate: an interim frame is forwarded
     /// to `onInterim` and the continuation keeps waiting, so a degraded image is progress, not
-    /// a result, and never a failure.
+    /// a result, and never a failure. A final frame settles with its pixels even if PhotoKit
+    /// still flags the rendition as iCloud-origin; a final callback without pixels fails
+    /// recoverably, and `previewImage` falls back to the local-rendition ladder before any
+    /// error reaches the screen.
     private static func livePreviewRequest(
         assetID: String,
         targetPixelSize: Int,
@@ -217,6 +259,83 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
         }
     }
 
+    /// Sizes the preview fallback tries, largest first, each strictly below the primary
+    /// preview budget. Photos serves a local rendition only when the target fits what is on
+    /// disk — verified: an edited asset whose 1400 px download fails still returns its ~256 px
+    /// local thumbnail — so the ladder descends to the thumbnail floor (256 px), where every
+    /// analyzed asset has served pixels at least once.
+    static let previewFallbackPixelSizes: [Int] = [768, 512, 384, 256]
+
+    /// Failsafe for one fallback step. Steps are local-or-fast-fail by construction (single-shot
+    /// delivery at thumbnail-ish sizes), so 10 s bounds the pathological case — a step that is
+    /// actually waiting on a download — without stacking another full preview timeout per rung.
+    static let previewFallbackTimeoutNanos: UInt64 = 10_000_000_000
+
+    /// The production fallback: fresh, direct `PHImageManager` requests descending
+    /// `previewFallbackPixelSizes` until one returns pixels. Network stays allowed — a small
+    /// target is satisfied by a local thumbnail without downloading (verified), while an asset
+    /// with no local copy still gets its one chance to fetch — but these are the fallback's own
+    /// options (single-shot, never the scanner's network-disabled path).
+    private static func livePreviewFallbackRequest(
+        assetID: String,
+        targetPixelSize: Int
+    ) async throws -> CGImage {
+        try await previewFallbackLadder(targetPixelSize: targetPixelSize) { size in
+            try await PendingPhotoRequest.run(timeoutNanos: previewFallbackTimeoutNanos) { resolve in
+                let asset = try fetchAsset(assetID)
+                let options = makePreviewFallbackRequestOptions()
+
+                let side = CGFloat(size)
+                let targetSize = CGSize(width: side, height: side)
+
+                let requestID = PHImageManager.default().requestImage(
+                    for: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFit,
+                    options: options
+                ) { image, info in
+                    resolve(result(image: image, info: info))
+                }
+                return { PHImageManager.default().cancelImageRequest(requestID) }
+            }
+        }
+    }
+
+    /// The ladder itself, extracted so its policy — largest first, stop at the first success,
+    /// skip sizes the primary request already covered, never retry cancellation — is testable
+    /// without a photo library. The last failure is what surfaces if no rung serves.
+    static func previewFallbackLadder(
+        targetPixelSize: Int,
+        attempt: @Sendable (Int) async throws -> CGImage
+    ) async throws -> CGImage {
+        var lastError: (any Error)?
+        for size in previewFallbackPixelSizes where size < targetPixelSize {
+            if Task.isCancelled { throw CancellationError() }
+            do {
+                return try await attempt(size)
+            } catch {
+                if error is CancellationError { throw error }
+                lastError = error
+            }
+        }
+        throw lastError ?? PhotoContentError.unavailable
+    }
+
+    /// Whether a primary-preview failure is worth one local-rendition attempt. Cancellation is
+    /// the user leaving — never retried. Permission and missing-asset failures are permanent
+    /// (a ladder rung would fail identically). Everything else — iCloud, unavailable, timeout,
+    /// foreign cloud/network errors — is exactly the case the ladder exists for.
+    static func isPreviewFallbackCandidate(_ error: any Error) -> Bool {
+        if error is CancellationError { return false }
+        if let content = error as? PhotoContentError {
+            switch content {
+            case .permissionDenied, .assetNotFound: return false
+            case .onlyInICloud, .unavailable: return true
+            }
+        }
+        return true
+    }
+
     /// What one PhotoKit callback means for a preview request. Extracted from the closure so
     /// the interim/terminal rule is testable without a photo library.
     enum PreviewOutcome {
@@ -235,11 +354,22 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
             return .terminal(.failure(CancellationError()))
         }
         if let error = info?[PHImageErrorKey] as? any Error {
-            return .terminal(.failure(mapError(error)))
+            return .terminal(.failure(mapPreviewError(error)))
         }
         if info?[PHImageResultIsDegradedKey] as? Bool == true {
             return .interim
         }
+        // Final, non-degraded callback. Valid pixels settle the preview even when PhotoKit
+        // still flags the rendition as iCloud-origin: the SDK documents `PHImageResultIsInCloudKey`
+        // as "a new request will need to get issued (with networkAccessAllowed set)" — the flag
+        // describes where the pixels came from, not that they are absent, and this request
+        // already allows the network. Rejecting a delivered final image here would blank a
+        // working screen with "Photo unavailable".
+        if let image, let frame = normalizedCGImage(from: image) {
+            return .terminal(.success(frame))
+        }
+        // No pixels on the final callback: classify exactly like the analysis result path
+        // (cloud-only vs. genuinely missing); the loader's single retry re-issues the request.
         return .terminal(result(image: image, info: info))
     }
 
@@ -261,6 +391,25 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
         options.isNetworkAccessAllowed = true
         options.version = .current
         options.deliveryMode = .opportunistic
+        options.resizeMode = .exact
+        options.isSynchronous = false
+        return options
+    }
+
+    /// Options for one rung of the local-rendition ladder:
+    /// - `isNetworkAccessAllowed = true` → a small target is satisfied by a local thumbnail
+    ///   without downloading (verified on a download-broken asset), while an asset with no
+    ///   local copy still gets its one chance to fetch. The ladder is the preview's own
+    ///   recovery path — it never adopts the scanner's network-disabled policy.
+    /// - `.highQualityFormat` → exactly one callback: this request *is* the retry, so there is
+    ///   no degraded-then-final dance, just a fast local answer or a fast failure.
+    /// - `.version = .current` / `.resizeMode = .exact` / `isSynchronous = false` → same
+    ///   provenance, bound, and threading rules as the primary preview request.
+    static func makePreviewFallbackRequestOptions() -> PHImageRequestOptions {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.version = .current
+        options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         options.isSynchronous = false
         return options
@@ -344,6 +493,18 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
         default:
             return PhotoContentError.unavailable
         }
+    }
+
+    /// Preview-only mapping on top of `mapError`: Photos' cloud-download failures surface as
+    /// `CloudPhotoLibraryErrorDomain` (e.g. code 1006, "Failed to download JPEGMedium") — an
+    /// iCloud-download problem, so the honest copy is "only in iCloud", not the generic bucket.
+    /// The scanner never issues a network request and therefore never observes this domain,
+    /// which is why the shared `mapError` stays untouched.
+    static func mapPreviewError(_ error: any Error) -> any Error {
+        let nsError = error as NSError
+        guard nsError.domain == "CloudPhotoLibraryErrorDomain" else { return mapError(error) }
+        PhotoKitFailureTally.record(error)
+        return PhotoContentError.onlyInICloud
     }
 
     /// Bakes `imageOrientation` into the pixel data once, at the boundary. Without this, an
