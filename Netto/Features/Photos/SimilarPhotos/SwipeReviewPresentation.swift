@@ -113,7 +113,7 @@ enum SwipeReviewPresentation {
 
     static let completionTitle = "You're all caught up."
     static let completionPrimaryTitle = "Review Cleanup"
-    static let completionSecondaryTitle = "Back to Similar Photos"
+    static let completionSecondaryTitle = "Done"
 
     // MARK: Persistent review bar (while swiping)
 

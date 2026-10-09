@@ -70,7 +70,7 @@ struct DuplicateContactsView: View {
             systemImage: "info.circle"
         )
         .font(.caption)
-        .foregroundStyle(Theme.Palette.warning)
+        .foregroundStyle(NettoColor.warning)
         .padding(.horizontal, Theme.Spacing.lg)
         .padding(.top, Theme.Spacing.lg)
     }
@@ -130,8 +130,13 @@ struct DuplicateContactsView: View {
             PhaseMessage(
                 systemImage: "person.crop.circle.badge.questionmark",
                 title: "No contacts found",
-                message: "Netto can’t see any contacts on this iPhone. Add contacts in the Contacts app, then scan again."
-            )
+                message: "Netto can’t see any contacts on this iPhone. Add contacts in the Contacts app, then scan again.",
+                // The body names the next step — offer it instead of leaving the
+                // instruction without an action (U2).
+                buttonTitle: "Scan Again"
+            ) {
+                env.startContactScan()
+            }
 
         case .noDuplicates:
             PhaseMessage(

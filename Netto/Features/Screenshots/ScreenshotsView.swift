@@ -116,8 +116,13 @@ struct ScreenshotsView: View {
                     title: "No screenshots found",
                     message: env.photoPermissionState == .limited
                         ? "None of the photos you granted Netto are flagged as screenshots. If you granted limited access, add more photos in Settings."
-                        : "Nothing in your library is flagged as a screenshot."
-                )
+                        : "Nothing in your library is flagged as a screenshot.",
+                    // The limited copy tells the user to act in Settings — offer the
+                    // action (U2); the non-limited copy names no next step.
+                    buttonTitle: env.photoPermissionState == .limited ? "Open Settings" : nil
+                ) {
+                    openSettings()
+                }
             }
 
         case .results(let records):
@@ -168,15 +173,15 @@ struct ScreenshotsView: View {
             .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.sm))
             .overlay {
                 RoundedRectangle(cornerRadius: Theme.Radius.sm)
-                    .stroke(isSelected ? NettoColor.brand : .clear, lineWidth: 3)
+                    .stroke(isSelected ? NettoColor.brandIndicator : .clear, lineWidth: 3)
             }
             .overlay(alignment: .topTrailing) {
                 if isSelected {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.subheadline)
-                        .foregroundStyle(.white)
+                        .foregroundStyle(NettoColor.onBrandIndicator)
                         .padding(5)
-                        .background(Circle().fill(NettoColor.brand))
+                        .background(Circle().fill(NettoColor.brandIndicator))
                         .padding(6)
                         .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
@@ -184,7 +189,12 @@ struct ScreenshotsView: View {
         }
         .nettoPress()
         .nettoAnimate(.selection, value: isSelected)
-        .accessibilityLabel("Screenshot")
+        // Every cell otherwise announced the same "Screenshot" — the date distinguishes them.
+        .accessibilityLabel(
+            "Screenshot" + (record.creationDate.map {
+                ", \($0.formatted(date: .abbreviated, time: .omitted))"
+            } ?? "")
+        )
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
@@ -207,7 +217,7 @@ struct ScreenshotsView: View {
             systemImage: "info.circle"
         )
         .font(.caption)
-        .foregroundStyle(Theme.Palette.warning)
+        .foregroundStyle(NettoColor.warning)
     }
 
     // MARK: Bottom bar

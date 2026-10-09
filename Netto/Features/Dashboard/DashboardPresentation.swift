@@ -157,7 +157,11 @@ enum DashboardPresentation {
         }
     }
 
-    static func scanCopy(for status: ScanStatus) -> ScanCopy {
+    /// - Parameter limitedAccess: when the empty library is due to *limited* permission,
+    ///   the copy gains the action its body already asks for — an "Open Settings" button
+    ///   (U2). A genuinely empty authorized library keeps no button: Settings has nothing
+    ///   to offer there.
+    static func scanCopy(for status: ScanStatus, limitedAccess: Bool = false) -> ScanCopy {
         switch status {
         case .permissionRequired:
             return ScanCopy(
@@ -243,7 +247,7 @@ enum DashboardPresentation {
                 title: "No photos visible to Netto",
                 body: "There is nothing to analyze. If you granted limited access, choose the "
                     + "photos Netto can see in Settings.",
-                buttonTitle: nil,
+                buttonTitle: limitedAccess ? "Open Settings" : nil,
                 tone: .warning
             )
 

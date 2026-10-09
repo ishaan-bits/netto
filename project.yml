@@ -33,10 +33,42 @@ targets:
         PRODUCT_NAME: Netto
         INFOPLIST_FILE: Netto/Info.plist
         GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Netto/Netto.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ENABLE_PREVIEWS: YES
         CURRENT_PROJECT_VERSION: 1
+    dependencies:
+      - target: NettoWidget
+        embed: true
+
+  # Home screen widget (WidgetKit extension): reads only the shared App Group summary
+  # written by Netto/Core/Widget. Shares Theme/NettoColor/NettoLogo and the asset catalog
+  # with the app; never links PhotoKit, Vision, or the deletion path.
+  NettoWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NettoWidget
+      - path: Netto/Core/Widget
+      - path: Netto/UI/Theme/Theme.swift
+      - path: Netto/UI/DesignSystem/NettoColor.swift
+      - path: Netto/UI/Brand/NettoLogo.swift
+      - path: Netto/Assets.xcassets
+      - path: Netto/Resources/PrivacyInfo.xcprivacy
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ishaanparimal.netto.widget
+        PRODUCT_NAME: NettoWidget
+        INFOPLIST_FILE: NettoWidget/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: NettoWidget/NettoWidget.entitlements
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        APPLICATION_EXTENSION_API_ONLY: YES
+        ENABLE_PREVIEWS: YES
+        CURRENT_PROJECT_VERSION: 1
+        SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
 
   NettoTests:
     type: bundle.unit-test

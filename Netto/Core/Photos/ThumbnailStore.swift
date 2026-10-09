@@ -89,11 +89,18 @@ actor ThumbnailStore {
     }
 
     /// Cancellation is a property of the caller, not of the asset: caching it would poison the
-    /// entry for every later viewer.
+    /// entry for every later viewer. Only reasons that cannot change within a session are
+    /// cached — a timeout (not a `PhotoContentError` at all), a cloud rendition that arrives
+    /// later, or a permission restored from Settings must stay retryable on the next
+    /// appearance instead of pinning the cell on a failure badge for the rest of the run.
     private static func cachedFailure(for error: any Error) -> PhotoContentError? {
-        if error is CancellationError { return nil }
-        if let content = error as? PhotoContentError { return content }
-        return .unavailable
+        guard let content = error as? PhotoContentError else { return nil }
+        switch content {
+        case .assetNotFound:
+            return content
+        case .permissionDenied, .onlyInICloud, .unavailable:
+            return nil
+        }
     }
 
     private func touch(_ key: String) {

@@ -7,6 +7,43 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		4D5FA11C0000000000000012 /* WidgetSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000013 /* WidgetSummary.swift */; };
+		4D5FA11C0000000000000014 /* WidgetSummaryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000015 /* WidgetSummaryStore.swift */; };
+		4D5FA11C0000000000000016 /* WidgetSummaryPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000017 /* WidgetSummaryPresentation.swift */; };
+		4D5FA11C0000000000000018 /* WidgetDeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000019 /* WidgetDeepLink.swift */; };
+		4D5FA11C000000000000001A /* WidgetSummaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C000000000000001B /* WidgetSummaryTests.swift */; };
+		4D5FA11C000000000000001C /* WidgetSummaryStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C000000000000001D /* WidgetSummaryStoreTests.swift */; };
+		4D5FA11C000000000000001E /* WidgetSummaryPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C000000000000001F /* WidgetSummaryPresentationTests.swift */; };
+		4D5FA11C0000000000000020 /* WidgetDeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000021 /* WidgetDeepLinkTests.swift */; };
+		4D5FA11C0000000000000022 /* AppEnvironmentWidgetSummaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000023 /* AppEnvironmentWidgetSummaryTests.swift */; };
+		4D5FA11C0000000000000024 /* WidgetSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000013 /* WidgetSummary.swift */; };
+		4D5FA11C0000000000000025 /* WidgetSummaryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000015 /* WidgetSummaryStore.swift */; };
+		4D5FA11C0000000000000026 /* WidgetSummaryPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000017 /* WidgetSummaryPresentation.swift */; };
+		4D5FA11C0000000000000027 /* WidgetDeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000019 /* WidgetDeepLink.swift */; };
+		4D5FA11C0000000000000028 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09642FE6A1B0F2A3193A82BF /* Theme.swift */; };
+		4D5FA11C0000000000000029 /* NettoColor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 513F8DAB1340C2E4EC3B9676 /* NettoColor.swift */; };
+		4D5FA11C000000000000002A /* NettoLogo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DD74ED5A05947717DBFA025 /* NettoLogo.swift */; };
+		4D5FA11C000000000000002B /* NettoWidgetBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000003 /* NettoWidgetBundle.swift */; };
+		4D5FA11C000000000000002C /* NettoWidgetProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000004 /* NettoWidgetProvider.swift */; };
+		4D5FA11C000000000000002D /* NettoWidgetViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000005 /* NettoWidgetViews.swift */; };
+		4D5FA11C000000000000002E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 506C282CBE3E31B208667CEC /* Assets.xcassets */; };
+		4D5FA11C000000000000002F /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = AE519B787BA6F89B1633FEE2 /* PrivacyInfo.xcprivacy */; };
+		4D5FA11C0000000000000030 /* NettoWidget.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000001 /* NettoWidget.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		4D5FA11A0000000000000002 /* SpaceFreedSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11A0000000000000001 /* SpaceFreedSummary.swift */; };
+		4D5FA11A0000000000000004 /* SpaceFreedSummaryPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11A0000000000000003 /* SpaceFreedSummaryPresentation.swift */; };
+		4D5FA11A0000000000000006 /* SpaceFreedSummaryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11A0000000000000005 /* SpaceFreedSummaryView.swift */; };
+		4D5FA11A0000000000000008 /* SpaceFreedSummaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11A0000000000000007 /* SpaceFreedSummaryTests.swift */; };
+		4D5FA11B0000000000000002 /* BlurSharpness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000001 /* BlurSharpness.swift */; };
+		4D5FA11B0000000000000004 /* BlurAnalysisModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000003 /* BlurAnalysisModels.swift */; };
+		4D5FA11B0000000000000006 /* BlurAnalysisEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000005 /* BlurAnalysisEngine.swift */; };
+		4D5FA11B0000000000000008 /* BlurDataset.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000007 /* BlurDataset.swift */; };
+		4D5FA11B000000000000000A /* PotentiallyBlurryPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000009 /* PotentiallyBlurryPresentation.swift */; };
+		4D5FA11B000000000000000C /* PotentiallyBlurryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B000000000000000B /* PotentiallyBlurryView.swift */; };
+		4D5FA11B000000000000000E /* BlurPhotoDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B000000000000000D /* BlurPhotoDetailView.swift */; };
+		4D5FA11B0000000000000010 /* BlurSharpnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B000000000000000F /* BlurSharpnessTests.swift */; };
+		4D5FA11B0000000000000015 /* BlurCorpusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000014 /* BlurCorpusTests.swift */; };
+		4D5FA11B0000000000000017 /* BlurScanBenchmarkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000016 /* BlurScanBenchmarkTests.swift */; };
+		4D5FA11B0000000000000012 /* BlurAnalysisFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11B0000000000000011 /* BlurAnalysisFlowTests.swift */; };
 		028525730B588887B78ED390 /* AssetSizeProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7B632CEF701ED1C6442BB4BF /* AssetSizeProvider.swift */; };
 		042F5E4296C65CFA5E2055D3 /* ContentFingerprintTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C376C12DF3E6CB22CBF9FD5 /* ContentFingerprintTests.swift */; };
 		07AFFAEC977744C492FAF769 /* ContactDuplicateDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E7B3CF58E7995FDEDA10F1 /* ContactDuplicateDetectorTests.swift */; };
@@ -160,9 +197,62 @@
 			remoteGlobalIDString = 3E18C8E14263B709C87035B4;
 			remoteInfo = Netto;
 		};
+		4D5FA11C0000000000000032 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A6C3853DA8D95082108DA10F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 4D5FA11C0000000000000009;
+			remoteInfo = NettoWidget;
+		};
 /* End PBXContainerItemProxy section */
 
+
+/* Begin PBXCopyFilesBuildPhase section */
+		4D5FA11C000000000000000F /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				4D5FA11C0000000000000030 /* NettoWidget.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
+		4D5FA11C0000000000000001 /* NettoWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = NettoWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		4D5FA11C0000000000000003 /* NettoWidgetBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoWidgetBundle.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000004 /* NettoWidgetProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoWidgetProvider.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000005 /* NettoWidgetViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoWidgetViews.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		4D5FA11C0000000000000007 /* NettoWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = NettoWidget.entitlements; sourceTree = "<group>"; };
+		4D5FA11C0000000000000008 /* Netto.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Netto.entitlements; sourceTree = "<group>"; };
+		4D5FA11C0000000000000013 /* WidgetSummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummary.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000015 /* WidgetSummaryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummaryStore.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000017 /* WidgetSummaryPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummaryPresentation.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000019 /* WidgetDeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetDeepLink.swift; sourceTree = "<group>"; };
+		4D5FA11C000000000000001B /* WidgetSummaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummaryTests.swift; sourceTree = "<group>"; };
+		4D5FA11C000000000000001D /* WidgetSummaryStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummaryStoreTests.swift; sourceTree = "<group>"; };
+		4D5FA11C000000000000001F /* WidgetSummaryPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummaryPresentationTests.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000021 /* WidgetDeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetDeepLinkTests.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000023 /* AppEnvironmentWidgetSummaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironmentWidgetSummaryTests.swift; sourceTree = "<group>"; };
+		4D5FA11A0000000000000001 /* SpaceFreedSummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummary.swift; sourceTree = "<group>"; };
+		4D5FA11A0000000000000003 /* SpaceFreedSummaryPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummaryPresentation.swift; sourceTree = "<group>"; };
+		4D5FA11A0000000000000005 /* SpaceFreedSummaryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummaryView.swift; sourceTree = "<group>"; };
+		4D5FA11A0000000000000007 /* SpaceFreedSummaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummaryTests.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000001 /* BlurSharpness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurSharpness.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000003 /* BlurAnalysisModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurAnalysisModels.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000005 /* BlurAnalysisEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurAnalysisEngine.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000007 /* BlurDataset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurDataset.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000009 /* PotentiallyBlurryPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PotentiallyBlurryPresentation.swift; sourceTree = "<group>"; };
+		4D5FA11B000000000000000B /* PotentiallyBlurryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PotentiallyBlurryView.swift; sourceTree = "<group>"; };
+		4D5FA11B000000000000000D /* BlurPhotoDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurPhotoDetailView.swift; sourceTree = "<group>"; };
+		4D5FA11B000000000000000F /* BlurSharpnessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurSharpnessTests.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000014 /* BlurCorpusTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurCorpusTests.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000016 /* BlurScanBenchmarkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurScanBenchmarkTests.swift; sourceTree = "<group>"; };
+		4D5FA11B0000000000000011 /* BlurAnalysisFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlurAnalysisFlowTests.swift; sourceTree = "<group>"; };
 		02B9FBE9DC0E816A8936BAC4 /* VideosPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideosPresentation.swift; sourceTree = "<group>"; };
 		0429F98F13017FB2E687E7C8 /* ContactsPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContactsPresentation.swift; sourceTree = "<group>"; };
 		05419C07696FA302FF9424F6 /* FixtureContacts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureContacts.swift; sourceTree = "<group>"; };
@@ -339,6 +429,7 @@
 				2D4A3D3599E58D56494B43CC /* DeletionPlan.swift */,
 				B1E2A1C0855CA25170E0A43D /* DeletionPlanner.swift */,
 				1D0321EF7CA5B8B4470112DB /* DeletionState.swift */,
+				4D5FA11A0000000000000001 /* SpaceFreedSummary.swift */,
 				F46B10B5900513A25D9F1D3F /* PhotoDeletionService.swift */,
 			);
 			path = Deletion;
@@ -354,6 +445,7 @@
 				F993D913AF69BC330693DB90 /* Resources */,
 				1431D4EFF64419B66E77009D /* UI */,
 				506C282CBE3E31B208667CEC /* Assets.xcassets */,
+				4D5FA11C0000000000000008 /* Netto.entitlements */,
 				1E39F5E4C991D6BEC4232803 /* Info.plist */,
 			);
 			path = Netto;
@@ -368,6 +460,7 @@
 				8F58C2E9142A1BB65082B24F /* Photos */,
 				FE4DFA6429A8257C1AF2C223 /* Scanning */,
 				6A12B3AE92A1207AEAF3DF6A /* Storage */,
+				4D5FA11C0000000000000010 /* Widget */,
 			);
 			path = Core;
 			sourceTree = "<group>";
@@ -378,6 +471,7 @@
 				594128439C64BC2C9B6A0471 /* Netto.app */,
 				BD56D425E7D69DD8688AE332 /* NettoTests.xctest */,
 				A6BE278DE6D0620001F67557 /* NettoUITests.xctest */,
+				4D5FA11C0000000000000001 /* NettoWidget.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -451,6 +545,7 @@
 				3748CBDCD0BA1311124CF910 /* Netto */,
 				94EFC6E5E6C8AEAEA78AA62B /* NettoTests */,
 				4BBF42A15B85DDD5F4AB1979 /* NettoUITests */,
+				4D5FA11C0000000000000002 /* NettoWidget */,
 				42C81FE5009045C73FE7964E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -467,6 +562,9 @@
 			isa = PBXGroup;
 			children = (
 				7CD17CC7FB81BFD5B3B93A0E /* BestPhotoScoring.swift */,
+				4D5FA11B0000000000000005 /* BlurAnalysisEngine.swift */,
+				4D5FA11B0000000000000003 /* BlurAnalysisModels.swift */,
+				4D5FA11B0000000000000001 /* BlurSharpness.swift */,
 				500A8B5DAAC6C788646AC806 /* CandidateBuckets.swift */,
 				FE1A5B6D2B3430AA64C823B2 /* ContentFingerprint.swift */,
 				FB4D47BF1817B180CFFDF486 /* FeaturePrint.swift */,
@@ -496,6 +594,7 @@
 			children = (
 				7D69E8D9F0B7856A6A8D5966 /* Analysis */,
 				7B632CEF701ED1C6442BB4BF /* AssetSizeProvider.swift */,
+				4D5FA11B0000000000000007 /* BlurDataset.swift */,
 				14AEB207B447845D11F9DEDF /* CatalogScanState.swift */,
 				A3C5715E605D7649B58356D2 /* DatasetSelectionModel.swift */,
 				17F429B710E347326529434D /* PendingPhotoRequest.swift */,
@@ -518,6 +617,10 @@
 			children = (
 				8D531A076C2BD1D08B966BA9 /* AnalysisProgressReporterTests.swift */,
 				946932D807CD166442661DCC /* BestPhotoScoringTests.swift */,
+				4D5FA11B0000000000000011 /* BlurAnalysisFlowTests.swift */,
+				4D5FA11B000000000000000F /* BlurSharpnessTests.swift */,
+				4D5FA11B0000000000000014 /* BlurCorpusTests.swift */,
+				4D5FA11B0000000000000016 /* BlurScanBenchmarkTests.swift */,
 				79397A40046B7AFA13ABDF4D /* CandidateBucketsTests.swift */,
 				83293904F7829127DA7E399F /* ContactActionPlanTests.swift */,
 				28E7B3CF58E7995FDEDA10F1 /* ContactDuplicateDetectorTests.swift */,
@@ -547,11 +650,17 @@
 				1F27E4C8311BCDDB26B348F4 /* ScreenshotsTests.swift */,
 				3F868C13A2E5CFCE085D446B /* SimilarityGroupingTests.swift */,
 				40CAC5C0C03A90EA94BA1A13 /* SimilarPhotosFlowTests.swift */,
+				4D5FA11A0000000000000007 /* SpaceFreedSummaryTests.swift */,
 				EBE3A4CE30F4416BF49C15E8 /* ThumbnailStoreTests.swift */,
 				BCC546F89ED563D9561B485E /* VideoDatasetTests.swift */,
 				B39F70D6965684E17BC532DF /* VideoPreviewTests.swift */,
 				29B5419B73458620E4DDB7CC /* VideosFlowTests.swift */,
 				4182805472F9FBB0BA7646FC /* VisionPhotoFeatureExtractorTests.swift */,
+				4D5FA11C000000000000001B /* WidgetSummaryTests.swift */,
+				4D5FA11C000000000000001D /* WidgetSummaryStoreTests.swift */,
+				4D5FA11C000000000000001F /* WidgetSummaryPresentationTests.swift */,
+				4D5FA11C0000000000000021 /* WidgetDeepLinkTests.swift */,
+				4D5FA11C0000000000000023 /* AppEnvironmentWidgetSummaryTests.swift */,
 			);
 			path = NettoTests;
 			sourceTree = "<group>";
@@ -567,13 +676,34 @@
 		A5C7D819C1ABC0B74669F5FE /* Features */ = {
 			isa = PBXGroup;
 			children = (
+				4D5FA11B0000000000000013 /* Blur */,
 				48DEBE941D2C88BDAB805813 /* Contacts */,
 				6606EA4E1CE0C97B7FB352A8 /* Dashboard */,
 				48FF485BD30B045C677921A1 /* Photos */,
+				4D5FA11A0000000000000009 /* Review */,
 				C3C4E587ADDAB070EB0707A8 /* Screenshots */,
 				B11BF50FA4A19D031BFA25D4 /* Videos */,
 			);
 			path = Features;
+			sourceTree = "<group>";
+		};
+		4D5FA11B0000000000000013 /* Blur */ = {
+			isa = PBXGroup;
+			children = (
+				4D5FA11B000000000000000D /* BlurPhotoDetailView.swift */,
+				4D5FA11B0000000000000009 /* PotentiallyBlurryPresentation.swift */,
+				4D5FA11B000000000000000B /* PotentiallyBlurryView.swift */,
+			);
+			path = Blur;
+			sourceTree = "<group>";
+		};
+		4D5FA11A0000000000000009 /* Review */ = {
+			isa = PBXGroup;
+			children = (
+				4D5FA11A0000000000000003 /* SpaceFreedSummaryPresentation.swift */,
+				4D5FA11A0000000000000005 /* SpaceFreedSummaryView.swift */,
+			);
+			path = Review;
 			sourceTree = "<group>";
 		};
 		B11BF50FA4A19D031BFA25D4 /* Videos */ = {
@@ -660,6 +790,29 @@
 			path = Scanning;
 			sourceTree = "<group>";
 		};
+		4D5FA11C0000000000000002 /* NettoWidget */ = {
+			isa = PBXGroup;
+			children = (
+				4D5FA11C0000000000000003 /* NettoWidgetBundle.swift */,
+				4D5FA11C0000000000000004 /* NettoWidgetProvider.swift */,
+				4D5FA11C0000000000000005 /* NettoWidgetViews.swift */,
+				4D5FA11C0000000000000006 /* Info.plist */,
+				4D5FA11C0000000000000007 /* NettoWidget.entitlements */,
+			);
+			path = NettoWidget;
+			sourceTree = "<group>";
+		};
+		4D5FA11C0000000000000010 /* Widget */ = {
+			isa = PBXGroup;
+			children = (
+				4D5FA11C0000000000000019 /* WidgetDeepLink.swift */,
+				4D5FA11C0000000000000017 /* WidgetSummaryPresentation.swift */,
+				4D5FA11C0000000000000013 /* WidgetSummary.swift */,
+				4D5FA11C0000000000000015 /* WidgetSummaryStore.swift */,
+			);
+			path = Widget;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -705,10 +858,12 @@
 			buildPhases = (
 				E8D13E2ACF334D5080CA71D8 /* Sources */,
 				F2EBCE8A94CB37BFE5877285 /* Resources */,
+				4D5FA11C000000000000000F /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				4D5FA11C0000000000000031 /* PBXTargetDependency */,
 			);
 			name = Netto;
 			packageProductDependencies = (
@@ -716,6 +871,24 @@
 			productName = Netto;
 			productReference = 594128439C64BC2C9B6A0471 /* Netto.app */;
 			productType = "com.apple.product-type.application";
+		};
+		4D5FA11C0000000000000009 /* NettoWidget */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4D5FA11C000000000000000A /* Build configuration list for PBXNativeTarget "NettoWidget" */;
+			buildPhases = (
+				4D5FA11C000000000000000D /* Sources */,
+				4D5FA11C000000000000000E /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NettoWidget;
+			packageProductDependencies = (
+			);
+			productName = NettoWidget;
+			productReference = 4D5FA11C0000000000000001 /* NettoWidget.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -738,6 +911,9 @@
 					3E18C8E14263B709C87035B4 = {
 						ProvisioningStyle = Automatic;
 					};
+					4D5FA11C0000000000000009 = {
+						ProvisioningStyle = Automatic;
+					};
 				};
 			};
 			buildConfigurationList = 54ACA6B14FE2B4A245E60D30 /* Build configuration list for PBXProject "Netto" */;
@@ -757,6 +933,7 @@
 				3E18C8E14263B709C87035B4 /* Netto */,
 				187411129C89294BCB00AE9F /* NettoTests */,
 				3C714AD286ED2BDA2ECCDF58 /* NettoUITests */,
+				4D5FA11C0000000000000009 /* NettoWidget */,
 			);
 		};
 /* End PBXProject section */
@@ -768,6 +945,15 @@
 			files = (
 				62B243344AEB07EB95519181 /* Assets.xcassets in Resources */,
 				85D968C92D0661B8EB23A30B /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4D5FA11C000000000000000E /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4D5FA11C000000000000002E /* Assets.xcassets in Resources */,
+				4D5FA11C000000000000002F /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -808,12 +994,22 @@
 				9F3A329F9E3CDBE6705B351F /* ScreenshotsFlowTests.swift in Sources */,
 				879450E54EAD9617F9BC1191 /* ScreenshotsTests.swift in Sources */,
 				3EA190358D3FCF453FF34CB2 /* SimilarPhotosFlowTests.swift in Sources */,
+				4D5FA11A0000000000000008 /* SpaceFreedSummaryTests.swift in Sources */,
+				4D5FA11B0000000000000010 /* BlurSharpnessTests.swift in Sources */,
+				4D5FA11B0000000000000015 /* BlurCorpusTests.swift in Sources */,
+				4D5FA11B0000000000000017 /* BlurScanBenchmarkTests.swift in Sources */,
+				4D5FA11B0000000000000012 /* BlurAnalysisFlowTests.swift in Sources */,
 				87B6E0E2B637D9972ACC06A7 /* SimilarityGroupingTests.swift in Sources */,
 				74D3FA254BA920E7D9B8C705 /* ThumbnailStoreTests.swift in Sources */,
 				414E63B68303DADA98C355A3 /* VideoDatasetTests.swift in Sources */,
 				615DC2D1778AE130BCF3F310 /* VideoPreviewTests.swift in Sources */,
 				E32CB82D634F336AA57125EE /* VideosFlowTests.swift in Sources */,
 				51A21AFD35657F7D8E6B2366 /* VisionPhotoFeatureExtractorTests.swift in Sources */,
+				4D5FA11C000000000000001A /* WidgetSummaryTests.swift in Sources */,
+				4D5FA11C000000000000001C /* WidgetSummaryStoreTests.swift in Sources */,
+				4D5FA11C000000000000001E /* WidgetSummaryPresentationTests.swift in Sources */,
+				4D5FA11C0000000000000020 /* WidgetDeepLinkTests.swift in Sources */,
+				4D5FA11C0000000000000022 /* AppEnvironmentWidgetSummaryTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -852,6 +1048,16 @@
 				462AD510CB428CD390BCCBA3 /* DeletionPlanner.swift in Sources */,
 				E22F04471698C27FF7AEB7E3 /* DeletionPresentation.swift in Sources */,
 				38772CABF1097FEFE2E41A21 /* DeletionState.swift in Sources */,
+				4D5FA11A0000000000000002 /* SpaceFreedSummary.swift in Sources */,
+				4D5FA11A0000000000000004 /* SpaceFreedSummaryPresentation.swift in Sources */,
+				4D5FA11A0000000000000006 /* SpaceFreedSummaryView.swift in Sources */,
+				4D5FA11B0000000000000002 /* BlurSharpness.swift in Sources */,
+				4D5FA11B0000000000000004 /* BlurAnalysisModels.swift in Sources */,
+				4D5FA11B0000000000000006 /* BlurAnalysisEngine.swift in Sources */,
+				4D5FA11B0000000000000008 /* BlurDataset.swift in Sources */,
+				4D5FA11B000000000000000A /* PotentiallyBlurryPresentation.swift in Sources */,
+				4D5FA11B000000000000000C /* PotentiallyBlurryView.swift in Sources */,
+				4D5FA11B000000000000000E /* BlurPhotoDetailView.swift in Sources */,
 				F9464636A74319D6D4E55275 /* DesignSystemGallery.swift in Sources */,
 				4C11916AF4AB42A237F813DC /* DuplicateContactsView.swift in Sources */,
 				60DDF322DF698CA658F87958 /* FeaturePrint.swift in Sources */,
@@ -917,6 +1123,10 @@
 				81DD282830974F12C6FEBDCD /* VideoSizeResolution.swift in Sources */,
 				B7EC05AF373EACD7450D3F9B /* VideosPresentation.swift in Sources */,
 				652297CD333732C25877417F /* VideosView.swift in Sources */,
+				4D5FA11C0000000000000018 /* WidgetDeepLink.swift in Sources */,
+				4D5FA11C0000000000000016 /* WidgetSummaryPresentation.swift in Sources */,
+				4D5FA11C0000000000000012 /* WidgetSummary.swift in Sources */,
+				4D5FA11C0000000000000014 /* WidgetSummaryStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -926,6 +1136,23 @@
 			files = (
 				6458D60CD6159929159D8F00 /* DashboardLayoutQATests.swift in Sources */,
 				D6EFA8ABD848333A6C7B10C1 /* ScanValidationUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4D5FA11C000000000000000D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4D5FA11C000000000000002B /* NettoWidgetBundle.swift in Sources */,
+				4D5FA11C000000000000002C /* NettoWidgetProvider.swift in Sources */,
+				4D5FA11C000000000000002D /* NettoWidgetViews.swift in Sources */,
+				4D5FA11C0000000000000024 /* WidgetSummary.swift in Sources */,
+				4D5FA11C0000000000000025 /* WidgetSummaryStore.swift in Sources */,
+				4D5FA11C0000000000000026 /* WidgetSummaryPresentation.swift in Sources */,
+				4D5FA11C0000000000000027 /* WidgetDeepLink.swift in Sources */,
+				4D5FA11C0000000000000028 /* Theme.swift in Sources */,
+				4D5FA11C0000000000000029 /* NettoColor.swift in Sources */,
+				4D5FA11C000000000000002A /* NettoLogo.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -941,6 +1168,11 @@
 			isa = PBXTargetDependency;
 			target = 3E18C8E14263B709C87035B4 /* Netto */;
 			targetProxy = E24F1C7E0E4EB1F0267812A5 /* PBXContainerItemProxy */;
+		};
+		4D5FA11C0000000000000031 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 4D5FA11C0000000000000009 /* NettoWidget */;
+			targetProxy = 4D5FA11C0000000000000032 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -1067,6 +1299,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Netto/Netto.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 47JUYY9KHQ;
@@ -1089,6 +1322,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Netto/Netto.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 47JUYY9KHQ;
@@ -1196,6 +1430,56 @@
 			};
 			name = Debug;
 		};
+		4D5FA11C000000000000000B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = NettoWidget/NettoWidget.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 47JUYY9KHQ;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = NettoWidget/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.widget;
+				PRODUCT_NAME = NettoWidget;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		4D5FA11C000000000000000C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = NettoWidget/NettoWidget.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 47JUYY9KHQ;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = NettoWidget/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.widget;
+				PRODUCT_NAME = NettoWidget;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -1231,6 +1515,15 @@
 			buildConfigurations = (
 				9B18E7D2C7253DCCBD6E1BFB /* Debug */,
 				72AECCA60E4DAB4A0C77CE56 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		4D5FA11C000000000000000A /* Build configuration list for PBXNativeTarget "NettoWidget" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4D5FA11C000000000000000B /* Debug */,
+				4D5FA11C000000000000000C /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

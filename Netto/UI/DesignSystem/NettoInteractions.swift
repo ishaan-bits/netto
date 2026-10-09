@@ -47,7 +47,7 @@ private struct NettoSelectedModifier: ViewModifier {
             .scaleEffect(active && !reduceMotion ? 1.02 : 1)
             .overlay {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(NettoColor.brand, lineWidth: active ? 2 : 0)
+                    .strokeBorder(NettoColor.brandIndicator, lineWidth: active ? 2 : 0)
             }
             .animation(NettoMotion.animation(for: .selection, reduceMotion: reduceMotion), value: active)
     }

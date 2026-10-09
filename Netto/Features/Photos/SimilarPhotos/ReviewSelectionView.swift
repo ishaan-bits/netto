@@ -29,6 +29,8 @@ struct ReviewSelectionView: View {
             return "No screenshots are selected. Choose screenshots first, then come back to review them."
         case .videos:
             return "No videos are selected. Choose videos on the Large Videos screen first, then come back to review them."
+        case .blurReview:
+            return "No photos are selected. Choose photos on the Potentially Blurry screen first, then come back to review them."
         case .similarPhotos:
             return "No photos are selected for cleanup. Pick photos inside a group first."
         }
@@ -256,7 +258,7 @@ struct ReviewSelectionView: View {
         VStack(spacing: NettoLayout.Spacing.lg) {
             Spacer(minLength: NettoLayout.Spacing.xxl)
             ProgressView()
-                .tint(NettoColor.brand)
+                .tint(NettoColor.brandIndicator)
             Text("Deleting…")
                 .font(NettoType.sectionTitle)
                 .foregroundStyle(NettoColor.textPrimary)
@@ -384,7 +386,7 @@ private struct ReviewPhaseMessage: View {
     private var iconTint: Color {
         if isPositive { return NettoColor.success }
         if isDestructiveOutcome { return NettoColor.warning }
-        return NettoColor.brand
+        return NettoColor.brandIndicator
     }
 }
 

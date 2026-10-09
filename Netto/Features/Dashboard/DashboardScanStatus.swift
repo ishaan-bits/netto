@@ -13,6 +13,10 @@ struct DashboardScanStatusCard: View {
     let onOpenSettings: () -> Void
     let onAnalyze: () -> Void
     let onCancel: () -> Void
+    /// Whether the empty-library state is a *limited* permission state — only then does
+    /// its copy get the "Open Settings" action its body asks for (U2); a genuinely empty
+    /// authorized library has no Settings action to offer.
+    var isLimitedAccess: Bool = false
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Drives the indicator's breathing while a scan runs. It is always the *same* indicator
@@ -20,7 +24,7 @@ struct DashboardScanStatusCard: View {
     @State private var pulsing = false
 
     private var copy: DashboardPresentation.ScanCopy {
-        DashboardPresentation.scanCopy(for: status)
+        DashboardPresentation.scanCopy(for: status, limitedAccess: isLimitedAccess)
     }
 
     private var isScanning: Bool {
@@ -143,6 +147,14 @@ struct DashboardScanStatusCard: View {
             }
             .buttonStyle(NettoPrimaryButtonStyle())
             .accessibilityIdentifier("retryAnalysisButton")
+        case .emptyLibrary where isLimitedAccess:
+            // The settings action, in the same secondary treatment the denied state uses.
+            Button(action: primaryAction) {
+                Text(title)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(NettoSecondaryButtonStyle())
+            .accessibilityIdentifier("openSettingsButton")
         case .idle, .finished, .cancelled, .emptyLibrary:
             Button(action: primaryAction) {
                 Text(title)
@@ -161,6 +173,8 @@ struct DashboardScanStatusCard: View {
             return onOpenSettings
         case .scanning:
             return onCancel
+        case .emptyLibrary where isLimitedAccess:
+            return onOpenSettings
         case .idle, .finished, .cancelled, .emptyLibrary, .failed:
             return onAnalyze
         }
@@ -169,7 +183,7 @@ struct DashboardScanStatusCard: View {
     private var toneColor: Color {
         switch copy.tone {
         case .brand:
-            return NettoColor.brand
+            return NettoColor.brandIndicator
         case .success:
             return NettoColor.success
         case .warning:
@@ -232,7 +246,7 @@ private struct ScanProgressBar: View {
 
     private var barGradient: LinearGradient {
         LinearGradient(
-            colors: [NettoColor.brand, NettoColor.brandDeep],
+            colors: [NettoColor.brandIndicator, NettoColor.brandDeep],
             startPoint: .leading,
             endPoint: .trailing
         )

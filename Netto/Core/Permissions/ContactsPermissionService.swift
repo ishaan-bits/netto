@@ -13,11 +13,15 @@ struct ContactsPermissionService: ContactsPermissionServicing {
 
     func requestAccess() async -> PermissionState {
         do {
-            let granted = try await CNContactStore().requestAccess(for: .contacts)
-            return granted ? .authorized : .denied
+            _ = try await CNContactStore().requestAccess(for: .contacts)
         } catch {
-            return Self.map(CNContactStore.authorizationStatus(for: .contacts))
+            // The error itself carries no state — fall through to the authoritative read.
         }
+        // Read the real status back instead of synthesizing from the Bool: iOS can grant
+        // *limited* access on this very prompt, and `granted ? .authorized : .denied`
+        // would report it as full access (hiding the partial-library notice) or, when the
+        // system returns `false` for a limited grant, as a denial that blocks the scan.
+        return Self.map(CNContactStore.authorizationStatus(for: .contacts))
     }
 
     static func map(_ status: CNAuthorizationStatus) -> PermissionState {

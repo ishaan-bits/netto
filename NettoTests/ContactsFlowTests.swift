@@ -334,6 +334,36 @@ struct ContactsFlowTests {
         #expect(env.contactActionState == .permissionRequired(.denied))
     }
 
+    /// A4: a permission restored while the contact review sat on its locked state must not
+    /// keep it stuck there — the foreground re-read (`refreshPermissions`, driven by the
+    /// scene-phase return) falls back through the universal reset so the review rebuilds
+    /// its plan against the now-readable library.
+    @Test func refreshedPermissionUnlocksAParkedPermissionRequiredState() {
+        let (env, _) = makeEnv() // fake contacts permission reads .authorized
+        env.contactsPermissionState = .denied
+        env.contactActionState = .permissionRequired(.denied)
+        env.contactReviewChoice = .merge
+
+        env.refreshPermissions()
+
+        #expect(env.contactsPermissionState == .authorized)
+        #expect(env.contactActionState == .noSelection)
+        #expect(env.contactReviewChoice == nil)
+    }
+
+    /// The inverse direction: while the status is still unusable, `.permissionRequired` is
+    /// the accurate report and must stand — only a *usable* permission unlocks it.
+    @Test func refreshKeepsTheLockedStateWhilePermissionStaysUnusable() {
+        let env = AppEnvironment(contactsPermission: FakeContactsPermission(.denied))
+        env.contactsPermissionState = .denied
+        env.contactActionState = .permissionRequired(.denied)
+
+        env.refreshPermissions()
+
+        #expect(env.contactsPermissionState == .denied)
+        #expect(env.contactActionState == .permissionRequired(.denied))
+    }
+
     @Test func storeFailureLandsInFailedWithActionableCopy() async {
         let (env, _) = makeEnv(outcome: .mutationFailed("underlying store error"))
         await prepareDelete(in: env)

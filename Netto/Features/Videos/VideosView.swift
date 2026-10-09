@@ -131,9 +131,14 @@ struct VideosView: View {
                     systemImage: "checkmark.seal",
                     title: "No videos found",
                     message: env.photoPermissionState == .limited
-                        ? "None of the photos you granted Netto are videos. If you granted limited access, add more in Settings."
-                        : "Nothing in your library is a video."
-                )
+                        ? "None of the photos you granted Netto are videos. If you granted limited access, add more photos in Settings."
+                        : "Nothing in your library is a video.",
+                    // The limited copy tells the user to act in Settings — offer the
+                    // action (U2); the non-limited copy names no next step.
+                    buttonTitle: env.photoPermissionState == .limited ? "Open Settings" : nil
+                ) {
+                    openSettings()
+                }
             }
 
         case .measuringVideos(let measured, let total):
@@ -168,7 +173,7 @@ struct VideosView: View {
                             systemImage: "exclamationmark.circle"
                         )
                         .font(.caption)
-                        .foregroundStyle(Theme.Palette.warning)
+                        .foregroundStyle(NettoColor.warning)
                         Button("Measure Sizes") {
                             env.resumeVideoSizeMeasurement()
                         }
@@ -221,7 +226,7 @@ struct VideosView: View {
                         } else {
                             Text("Size unavailable")
                                 .font(.subheadline)
-                                .foregroundStyle(Theme.Palette.warning)
+                                .foregroundStyle(NettoColor.warning)
                         }
                     }
                 }
@@ -237,8 +242,12 @@ struct VideosView: View {
             } label: {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
+                    // ~20 pt glyph with no frame — the toggle needs the 44 pt minimum
+                    // target; the glyph stays optically identical, centred by the frame.
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
                     .foregroundStyle(
-                        isSelected ? NettoColor.brand : Theme.Palette.secondaryLabel
+                        isSelected ? NettoColor.brandIndicator : Theme.Palette.secondaryLabel
                     )
             }
             .nettoPress()
@@ -311,7 +320,7 @@ struct VideosView: View {
             systemImage: "info.circle"
         )
         .font(.caption)
-        .foregroundStyle(Theme.Palette.warning)
+        .foregroundStyle(NettoColor.warning)
     }
 
     // MARK: Bottom bar

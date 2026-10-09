@@ -34,7 +34,7 @@ struct ContactGroupDetailView: View {
                     Spacer()
                     Image(systemName: "checkmark.circle")
                         .font(.system(size: 44))
-                        .foregroundStyle(Theme.Palette.success)
+                        .foregroundStyle(NettoColor.success)
                     Text("Group no longer exists")
                         .font(.title3.weight(.semibold))
                     Text("These contacts changed since you opened them. The list has the current groups.")
@@ -114,7 +114,7 @@ struct ContactGroupDetailView: View {
                     }
                     .overlay {
                         Circle()
-                            .stroke(isSelected ? NettoColor.brand : .clear, lineWidth: 2)
+                            .stroke(isSelected ? NettoColor.brandIndicator : .clear, lineWidth: 2)
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -139,7 +139,7 @@ struct ContactGroupDetailView: View {
 
                     Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                         .font(.title3)
-                        .foregroundStyle(isSelected ? NettoColor.brand : Theme.Palette.separator)
+                        .foregroundStyle(isSelected ? NettoColor.brandIndicator : Theme.Palette.separator)
                 }
             }
             .nettoPress()
@@ -158,11 +158,14 @@ struct ContactGroupDetailView: View {
                 VStack(spacing: 2) {
                     Image(systemName: isDestination ? "star.circle.fill" : "star.circle")
                         .font(.title3)
-                        .foregroundStyle(isDestination ? Theme.Palette.warning : Theme.Palette.separator)
+                        .foregroundStyle(isDestination ? NettoColor.warning : Theme.Palette.separator)
                     Text("Keep")
                         .font(.caption2)
-                        .foregroundStyle(isDestination ? Theme.Palette.warning : Theme.Palette.secondaryLabel)
+                        .foregroundStyle(isDestination ? NettoColor.warning : Theme.Palette.secondaryLabel)
                 }
+                // ~25×34 pt control — the button needs the 44 pt minimum target.
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
             }
             .nettoPress()
             .nettoAnimate(.selection, value: isDestination)

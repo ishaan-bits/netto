@@ -110,8 +110,13 @@ struct SimilarPhotosView: View {
             PhaseMessage(
                 systemImage: "photo.badge.exclamationmark",
                 title: "No photos visible to Netto",
-                message: "There is nothing to analyze. If you granted limited access, add the photos you want Netto to see in Settings."
-            )
+                message: "There is nothing to analyze. If you granted limited access, add the photos you want Netto to see in Settings.",
+                // The body asks the user to act in Settings — offer the action (U2);
+                // a genuinely empty authorized library has no Settings action to offer.
+                buttonTitle: env.photoPermissionState == .limited ? "Open Settings" : nil
+            ) {
+                openSettings()
+            }
 
         case .results(let result):
             resultsContent(result)
@@ -150,7 +155,7 @@ struct SimilarPhotosView: View {
                         systemImage: "info.circle"
                     )
                     .font(.caption)
-                    .foregroundStyle(Theme.Palette.warning)
+                    .foregroundStyle(NettoColor.warning)
                 }
             }
 
@@ -302,7 +307,7 @@ struct SimilarPhotosView: View {
             systemImage: "info.circle"
         )
         .font(.caption)
-        .foregroundStyle(Theme.Palette.warning)
+        .foregroundStyle(NettoColor.warning)
         .padding(.horizontal, Theme.Spacing.lg)
         .padding(.top, Theme.Spacing.lg)
     }

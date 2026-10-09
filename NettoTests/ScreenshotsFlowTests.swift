@@ -32,18 +32,25 @@ struct ScreenshotsFlowTests {
         #expect(plan.sessionToken == "session-1")
     }
 
-    @Test func similarPhotosPrepareStillRequiresCompletedAnalysis() {
+    /// U1 (behavior change, justified): the similar-photos review can open on a library
+    /// that was never analysed — Swipe Review's deck is the scanned catalog and needs no
+    /// similarity result — so the plan falls back to the empty result exactly like the
+    /// screenshot plans in this suite, instead of dead-ending its "Review Cleanup".
+    @Test func similarPhotosPrepareOpensWithoutCompletedAnalysis() async {
         let env = makeScreenshotEnv().env
         env.selection = PhotoSelectionModel(groups: [Fixtures.photoGroup])
         env.selection.toggle("photo-01")
         precondition(env.selection.selectedCount > 0)
 
         env.prepareDeletionPlan(from: .similarPhotos)
+        await waitForPlanReady(env)
 
-        guard case .failed = env.deletionState else {
-            Issue.record("expected failed without analysis, got \(env.deletionState)")
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("expected readyForReview without analysis, got \(env.deletionState)")
             return
         }
+        #expect(plan.selectionSnapshot == env.selection.selectedIDs)
+        #expect(plan.analysisSignature == DeletionPlanner.analysisSignature(for: .empty))
     }
 
     @Test func emptyScreenshotSelectionNeverLeavesNoSelection() {
@@ -383,6 +390,67 @@ struct ScreenshotsFlowTests {
         )
         guard case .succeeded = env.deletionState else {
             Issue.record("expected succeeded, got \(env.deletionState)")
+            return
+        }
+    }
+
+    /// S3: a completed deletion keeps the source that produced it — observable as the
+    /// foreign-review entry dropping this outcome instead of replaying it. The old
+    /// unconditional `planSource = .similarPhotos` rewrite made the screenshots success
+    /// look like a similar-photos result: opening Similar Photos then took the
+    /// same-source branch and showed the wrong deletion's summary instead of preparing
+    /// its own plan.
+    /// S2: a deletion from *another* feature must not erase the shared similar-photos
+    /// marks — including Swipe Review's groupless admitted marks, which the post-deletion
+    /// selection rebuild used to drop wholesale (they live in the admitted set, not in any
+    /// group). Only the confirmed removals leave; every other mark stands.
+    @Test func similarPhotosMarksSurviveADeletionFromAnotherSource() async {
+        let (env, _) = makeScreenshotEnv(analysis: .completed(Fixtures.analysisResult))
+        env.selection = PhotoSelectionModel(groups: [Fixtures.photoGroup])
+        env.selection.toggle("photo-01") // photo-02 is selected by default → both marked
+        env.selection.toggle("photo-02") // …leave only photo-01 marked
+        env.mutateSelection { $0.admitLibraryAssets(["photo-03", "photo-04"]) }
+        env.mutateSelection { $0.toggle("photo-03") } // groupless swipe-style mark
+        #expect(env.selection.selectedIDs == ["photo-01", "photo-03"])
+
+        selectScreenshots(["shot-01"], in: env)
+        env.prepareDeletionPlan(from: .screenshots)
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        guard case .succeeded = env.deletionState else {
+            Issue.record("expected succeeded, got \(env.deletionState)")
+            return
+        }
+
+        // Nothing about the screenshot deletion touched these marks.
+        #expect(env.selection.selectedIDs == ["photo-01", "photo-03"])
+        #expect(env.selection.isSelected("photo-01"))
+        #expect(env.selection.isSelected("photo-03"))
+    }
+
+    @Test func aForeignReviewEntryNeverReplaysAnotherSourcesOutcome() async {
+        let (env, _) = makeScreenshotEnv()
+        selectScreenshots(["shot-01", "shot-02"], in: env)
+        env.prepareDeletionPlan(from: .screenshots)
+        await waitForPlanReady(env)
+
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        guard case .succeeded = env.deletionState else {
+            Issue.record("expected succeeded, got \(env.deletionState)")
+            return
+        }
+
+        // The user walks into Similar Photos with their own marks: that review must drop
+        // the screenshots outcome and prepare its own plan, never present it.
+        env.selection = PhotoSelectionModel(groups: [Fixtures.photoGroup])
+        env.selection.toggle("photo-01")
+        env.reviewDidAppear(from: .similarPhotos)
+        await waitForPlanReady(env)
+
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected the foreign outcome to be replaced by a similar-photos plan, got \(env.deletionState)")
             return
         }
     }

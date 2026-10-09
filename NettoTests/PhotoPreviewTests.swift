@@ -32,9 +32,10 @@ struct PhotoPreviewTests {
     }
 
     @Test func analysisOptionsRemainLocalOnly() {
-        // Scanner safety: this milestone must not change analysis policy — both passes keep
-        // the local-only, single-callback settings regardless of the preview exception.
-        for mode in [PhotoThumbnailRequestMode.perceptual, .verification] {
+        // Scanner safety: this milestone must not change analysis policy — every analysis
+        // pass (perceptual, verification, sharpness) keeps the local-only, single-callback
+        // settings regardless of the preview exception.
+        for mode in [PhotoThumbnailRequestMode.perceptual, .verification, .sharpness] {
             let options = PhotoKitThumbnailLoader.makeImageRequestOptions(mode: mode)
             #expect(options.isNetworkAccessAllowed == false)
             #expect(options.deliveryMode == .highQualityFormat)

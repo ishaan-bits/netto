@@ -397,6 +397,20 @@ extension AppEnvironment {
         synchronizeContactDataset()
     }
 
+    /// A permission restored while the contact review sat on its locked state must not keep
+    /// it stuck there: once the status is usable again, fall back through the universal reset
+    /// so the review rebuilds its plan against the now-readable library (its screen re-prepares
+    /// on the next appearance). The inverse direction — usable → unusable — is left alone: the
+    /// locked state is the accurate report and the mutation path fail-closes on its own.
+    /// Called from every permission re-read (`refreshPermissions`, `requestContactsAccess`).
+    func reconcileContactReviewPermission() {
+        guard contactsPermissionState.isUsable else { return }
+        if case .permissionRequired = contactActionState {
+            applyContactAction(.noSelection)
+            contactReviewChoice = nil
+        }
+    }
+
     /// Single gate for every contacts action state change: legal transitions are applied,
     /// illegal ones trip an assertion in debug instead of silently corrupting the machine.
     private func applyContactAction(_ target: ContactActionState) {

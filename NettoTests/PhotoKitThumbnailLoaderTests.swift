@@ -66,6 +66,10 @@ struct PhotoKitThumbnailLoaderTests {
         let verification = PhotoKitThumbnailLoader.makeImageRequestOptions(mode: .verification)
         #expect(verification.isNetworkAccessAllowed == false)
         #expect(verification.resizeMode == .exact)
+
+        let sharpness = PhotoKitThumbnailLoader.makeImageRequestOptions(mode: .sharpness)
+        #expect(sharpness.isNetworkAccessAllowed == false)
+        #expect(sharpness.resizeMode == .exact)
     }
 
     @Test func requestModeIsForwardedToTheSeam() async throws {
@@ -82,6 +86,9 @@ struct PhotoKitThumbnailLoaderTests {
 
         _ = try await loader.thumbnail(for: "photo-1", targetPixelSize: 256, mode: .verification)
         #expect(recordedMode.read() == .verification)
+
+        _ = try await loader.thumbnail(for: "photo-1", targetPixelSize: 256, mode: .sharpness)
+        #expect(recordedMode.read() == .sharpness)
 
         // The 2-arg convenience defaults to the accurate rendition.
         _ = try await loader.thumbnail(for: "photo-1", targetPixelSize: 256)

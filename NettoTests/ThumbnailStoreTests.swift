@@ -27,6 +27,8 @@ private struct StubLoader: PhotoThumbnailLoading {
     let log: CallLog
     var delayNanoseconds: UInt64 = 0
     var failures: Set<String> = []
+    var cloudOnlyFailures: Set<String> = []
+    var timeouts: Set<String> = []
     var cancellations: Set<String> = []
 
     func thumbnail(
@@ -43,6 +45,12 @@ private struct StubLoader: PhotoThumbnailLoading {
         }
         if failures.contains(assetID) {
             throw PhotoContentError.assetNotFound
+        }
+        if cloudOnlyFailures.contains(assetID) {
+            throw PhotoContentError.onlyInICloud
+        }
+        if timeouts.contains(assetID) {
+            throw PhotoRequestTimeoutError()
         }
         return Self.solidImage(side: targetPixelSize)
     }
@@ -149,6 +157,34 @@ struct ThumbnailStoreTests {
         }
 
         #expect(log.count("flaky") == 2)
+    }
+
+    /// P1: only failures that cannot change within a session are cached. A cloud-only
+    /// rendition can arrive later and a timeout is a property of that moment — pinning
+    /// either for the whole run left the cell on a failure badge with no way to retry.
+    @Test func transientFailuresAreRetriedOnTheNextRequest() async {
+        let log = CallLog()
+        let store = ThumbnailStore(
+            loader: StubLoader(log: log, cloudOnlyFailures: ["cloud"], timeouts: ["slow"]),
+            capacity: 8
+        )
+
+        for assetID in ["cloud", "slow"] {
+            do {
+                _ = try await store.image(for: assetID, targetPixelSize: 96)
+                Issue.record("expected the first load to throw for \(assetID)")
+            } catch {
+                // expected — the reason differs (onlyInICloud vs timeout) by assetID
+            }
+            do {
+                _ = try await store.image(for: assetID, targetPixelSize: 96)
+                Issue.record("expected the retry to throw for \(assetID)")
+            } catch {
+                // expected
+            }
+            // Both attempts reached the loader: nothing transient was pinned.
+            #expect(log.count(assetID) == 2)
+        }
     }
 
     @Test func leastRecentlyUsedEntriesAreEvictedAtCapacity() async throws {

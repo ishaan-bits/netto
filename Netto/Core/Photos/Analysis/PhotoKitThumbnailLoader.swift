@@ -24,6 +24,13 @@ enum PhotoThumbnailRequestMode: Sendable, Equatable {
     /// Descriptor input: the exact requested size (256 px). This pixel data *is* the evidence
     /// the near-duplicate decision rests on, so it must be the accurate rendition.
     case verification
+    /// Blur-analysis input: aspect-FILL into an exact `targetPixelSize × targetPixelSize`
+    /// bitmap (center-cropped). PhotoKit's `.aspectFit` delivers a non-square rendition
+    /// (e.g. 256×192 for 4:3), which the analyzer would then have to aspect-fill — a ~1.33×
+    /// upscale that smooths the very signal blur detection measures. Requesting the fill
+    /// from PhotoKit itself delivers an exact square with no post-scale smoothing.
+    /// Same local-only, single-callback, `.exact` resize policy as `.verification`.
+    case sharpness
 }
 
 /// Seam over thumbnail delivery. The engine must run against synthetic images in tests, without
@@ -78,8 +85,10 @@ extension PhotoThumbnailLoading {
 /// iOS 17-compatible thumbnail loading.
 ///
 /// Choices and their reasons:
-/// - `.aspectFit` within a `targetPixelSize × targetPixelSize` box → thumbnails sized for
-///   analysis, never full-resolution decoding of the library.
+/// - `.aspectFit` within a `targetPixelSize × targetPixelSize` box (perceptual and
+///   verification) → thumbnails sized for analysis, never full-resolution decoding of the
+///   library. The blur pass requests `.aspectFill` instead so PhotoKit delivers an exact
+///   square (center-cropped) with no analyzer-side upscale smoothing.
 /// - `isNetworkAccessAllowed = false` with a **bounded failsafe**: local-only, the same
 ///   policy as the content-fingerprint path. Measured on a 41k library: with the network
 ///   allowed, every non-local asset enters Photos' make-available path at ~2.5 s per request,
@@ -202,11 +211,12 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
 
             let side = CGFloat(max(1, targetPixelSize))
             let targetSize = CGSize(width: side, height: side)
+            let contentMode: PHImageContentMode = mode == .sharpness ? .aspectFill : .aspectFit
 
             let requestID = PHImageManager.default().requestImage(
                 for: asset,
                 targetSize: targetSize,
-                contentMode: .aspectFit,
+                contentMode: contentMode,
                 options: options
             ) { image, info in
                 resolve(Self.result(image: image, info: info))
@@ -423,10 +433,12 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     /// - `.highQualityFormat` → exactly one callback (no degraded-then-final double fire).
     /// - `.version = .current` → the thumbnail reflects the user's edits, matching the
     ///   visible-content provenance rule the fingerprinting path uses.
-    /// - `.resizeMode = .exact` + `.aspectFit` request → the delivered bitmap respects the
-    ///   requested bound; combined with `targetPixelSize` full-resolution pixels are never
-    ///   decoded into memory. `.fast` on the perceptual pass trades exactness for speed on
-    ///   a gate that only needs approximate pixels.
+    /// - `.resizeMode = .exact` → the delivered bitmap respects the requested bound;
+    ///   combined with `targetPixelSize` full-resolution pixels are never decoded into
+    ///   memory. Content mode is not an options knob — it is chosen in `liveRequest`:
+    ///   `.aspectFit` for perceptual/verification, `.aspectFill` for the `.sharpness`
+    ///   blur pass (exact square, no analyzer-side upscale). `.fast` on the perceptual
+    ///   pass trades exactness for speed on a gate that only needs approximate pixels.
     /// - `isSynchronous = false` → callback off the calling thread; no main-thread blocking.
     static func makeImageRequestOptions(
         mode: PhotoThumbnailRequestMode = .verification

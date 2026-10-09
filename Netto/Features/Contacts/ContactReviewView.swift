@@ -212,7 +212,7 @@ struct ContactReviewView: View {
             Spacer()
 
             Image(systemName: isDestination ? "star.circle.fill" : (plan.isDelete ? "trash" : "arrow.right.circle"))
-                .foregroundStyle(isDestination ? Theme.Palette.warning : Theme.Palette.danger)
+                .foregroundStyle(isDestination ? NettoColor.warning : NettoColor.destructive)
         }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("contactReviewItem-\(item.identifier)")
@@ -299,7 +299,7 @@ struct ContactReviewView: View {
         VStack(spacing: NettoLayout.Spacing.lg) {
             Spacer(minLength: NettoLayout.Spacing.xxl)
             ProgressView()
-                .tint(NettoColor.brand)
+                .tint(NettoColor.brandIndicator)
             Text(plan.isDelete ? "Deleting contacts…" : "Merging contacts…")
                 .font(NettoType.sectionTitle)
                 .foregroundStyle(NettoColor.textPrimary)

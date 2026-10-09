@@ -22,7 +22,7 @@ struct NettoProgressPanel: View {
                 VStack(spacing: NettoLayout.Spacing.sm) {
                     ProgressView(value: fraction)
                         .progressViewStyle(.linear)
-                        .tint(NettoColor.brand)
+                        .tint(NettoColor.brandIndicator)
                     if let percent {
                         Text("\(percent)%")
                             .font(NettoType.metricLabel)
@@ -35,7 +35,7 @@ struct NettoProgressPanel: View {
                 .nettoAnimate(.progress, value: fraction)
             } else {
                 ProgressView()
-                    .tint(NettoColor.brand)
+                    .tint(NettoColor.brandIndicator)
             }
 
             Text(message)

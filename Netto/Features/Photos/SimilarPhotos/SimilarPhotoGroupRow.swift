@@ -54,6 +54,9 @@ struct SimilarPhotoGroupRow: View {
                 Image(systemName: "ellipsis.circle")
                     .font(.title3)
                     .foregroundStyle(NettoColor.textTertiary)
+                    // ~20 pt glyph — the menu needs the 44 pt minimum target.
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel("Group actions")
         }
@@ -103,7 +106,7 @@ struct SimilarPhotoGroupRow: View {
                     .overlay {
                         RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
                             .stroke(
-                                selected ? NettoColor.brand : Theme.Palette.separator,
+                                selected ? NettoColor.brandIndicator : Theme.Palette.separator,
                                 lineWidth: selected ? 2.5 : 1
                             )
                     }
@@ -121,13 +124,16 @@ struct SimilarPhotoGroupRow: View {
             } label: {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(selected ? NettoColor.onBrandIndicator : Color.white)
                     .padding(6)
                     .background(
-                        selected ? NettoColor.brand : Color.black.opacity(0.45),
+                        selected ? NettoColor.brandIndicator : Color.black.opacity(0.45),
                         in: Circle()
                     )
                     .padding(6)
+                    // 41 pt drawn disc → 44 pt minimum target; hit shape stays the circle.
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Circle())
                     .transition(.scale(scale: 0.5).combined(with: .opacity))
             }
             .nettoPress()
@@ -143,7 +149,9 @@ struct SimilarPhotoGroupRow: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background(NettoColor.success, in: Capsule())
-            .foregroundStyle(.white)
+            // Black reads on the success capsule in both appearances (4.8:1 light,
+            // 10.4:1 dark); white was 1.99:1 in dark — the badge failed there.
+            .foregroundStyle(.black)
             .padding(5)
             .accessibilityLabel("Recommended to keep")
     }

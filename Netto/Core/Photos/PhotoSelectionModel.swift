@@ -72,14 +72,32 @@ struct PhotoSelectionModel: Sendable, Equatable {
         self.init(groups: result.exactGroups + result.similarGroups)
     }
 
-    /// Rebuilds over an updated result while keeping the user's exact choices for the members
-    /// that still exist — used after a confirmed deletion removes assets from a completed
-    /// result. Choices for vanished assets (and for members of dissolved groups) drop out;
-    /// the reset snapshot is the updated result's deterministic default, so "Reset to
-    /// Recommended" stays meaningful over the new groups.
-    init(result: PhotoAnalysisResult, preserving previous: PhotoSelectionModel) {
+    /// Rebuilds over an updated result while keeping the user's exact choices for the
+    /// members that still exist — used after a confirmed deletion removes assets from a
+    /// completed result. Library-wide (non-group) marks survive too: they live in the
+    /// admitted set, and only the confirmed removals leave it, so a deletion from any
+    /// feature can no longer silently erase Swipe Review decisions for photos that were
+    /// never part of a group. Choices for vanished assets (and for members of dissolved
+    /// groups) drop out; the reset snapshot is the updated result's deterministic default,
+    /// so "Reset to Recommended" stays meaningful over the new groups.
+    init(
+        result: PhotoAnalysisResult,
+        preserving previous: PhotoSelectionModel,
+        removing removed: Set<String> = []
+    ) {
         self.init(result: result)
-        selectedIDs = previous.selectedIDs.intersection(groupIDsByAsset.keys)
+        admittedLibraryAssets = previous.admittedLibraryAssets.subtracting(removed)
+        let accepted = Set(groupIDsByAsset.keys).union(admittedLibraryAssets)
+        selectedIDs = previous.selectedIDs.subtracting(removed).intersection(accepted)
+    }
+
+    /// Confirmed removals leave both the marked set and the admitted set — the in-place
+    /// update used when there is no completed analysis to rebuild over (a catalog-only
+    /// library carrying Swipe Review marks). Never marks anything new.
+    mutating func prune(removing removed: Set<String>) {
+        guard !removed.isEmpty else { return }
+        selectedIDs.subtract(removed)
+        admittedLibraryAssets.subtract(removed)
     }
 
     init(groups: [PhotoSimilarityGroup]) {

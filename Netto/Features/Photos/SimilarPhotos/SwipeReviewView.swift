@@ -96,7 +96,9 @@ final class SwipeReviewModel: ObservableObject {
 ///
 /// A persistent bottom bar (live count + "Review Cleanup") is on screen for the whole
 /// session — finishing the deck is not a precondition for reviewing — and the completion
-/// screen repeats the same handoff with "Back to Similar Photos" as the way out. Both
+/// screen repeats the same handoff with "Done" as the way out — neutral because the deck
+/// is entered from both Similar Photos *and* the dashboard card, and a hard-coded
+/// destination would lie for one of them. Both
 /// preserve the shared selection exactly: this screen never instantiates or resets it.
 ///
 /// Exiting early (back gesture / system back) simply pops the stack: decisions already live
@@ -153,14 +155,18 @@ struct SwipeReviewView: View {
     }
 
     /// Shown when no scan exists yet (empty catalog) — the honest counterpart of a deck that
-    /// would otherwise look like an instantly-finished session.
+    /// would otherwise look like an instantly-finished session. The body tells the user to
+    /// scan, so the action comes with it (U2); `startCatalogBuild` is the catalog-only entry
+    /// point this state is defined by.
     private var emptyState: some View {
         PhaseMessage(
             systemImage: "photo.on.rectangle.angled",
             title: "No photos to review yet",
             message: "Netto reads your photo library during a scan. Scan your library, then come back to swipe through your photos.",
-            buttonTitle: nil
-        )
+            buttonTitle: "Scan Library"
+        ) {
+            env.startCatalogBuild()
+        }
     }
 
     /// Loads the photo now on screen — one preview request at a time, through the same

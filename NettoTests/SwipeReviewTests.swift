@@ -13,7 +13,7 @@ import Testing
 //
 // M4L adds the persistent review bar: the live count + "Review Cleanup" is available for the
 // whole session (not only at completion), it hands off to the *existing* `ReviewSelectionView`
-// with exactly the swiped selections, "Back to Similar Photos" leaves with the selection
+// with exactly the swiped selections, "Done" leaves with the selection
 // intact, and with nothing selected the affordance is clearly unavailable.
 
 @MainActor
@@ -337,7 +337,7 @@ struct SwipeReviewTests {
         #expect(SwipeReviewPresentation.selectedForCleanupText(env.selection.selectedCount)
                 == "2 photos selected for cleanup")
         #expect(SwipeReviewPresentation.completionPrimaryTitle == "Review Cleanup")
-        #expect(SwipeReviewPresentation.completionSecondaryTitle == "Back to Similar Photos")
+        #expect(SwipeReviewPresentation.completionSecondaryTitle == "Done")
         // Both completion actions are offered only when there is something to review.
         #expect(SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: env.selection.selectedCount))
     }
@@ -353,11 +353,12 @@ struct SwipeReviewTests {
         env.mutateSelection { model.decide(.keep, selection: &$0) }
         let decided = env.selection
 
-        // The secondary action's contract: dismiss the session ("Back to Similar Photos")
+        // The secondary action's contract: dismiss the session ("Done" — reachable from
+        // Similar Photos *and* the dashboard card, so no hard-coded destination)
         // without touching the shared model — the screen underneath reads the exact
         // selections that were swiped, and the review-facing count agrees.
         #expect(SwipeReviewPresentation.completionSecondaryDestination == .dismissToSimilarPhotos)
-        #expect(SwipeReviewPresentation.completionSecondaryTitle == "Back to Similar Photos")
+        #expect(SwipeReviewPresentation.completionSecondaryTitle == "Done")
         #expect(env.selection == decided) // dismiss() mutates nothing
         #expect(env.selectionCount(for: .similarPhotos) == decided.selectedCount)
         #expect(env.selection.isSelected("e1"))

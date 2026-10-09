@@ -8,6 +8,7 @@ enum DeletionSelectionSource: Sendable, Equatable {
     case similarPhotos
     case screenshots
     case videos
+    case blurReview
 }
 
 @MainActor
@@ -30,6 +31,9 @@ final class AppEnvironment: ObservableObject {
     /// Last completed scan, persisted so a relaunch restores results without a new scan.
     /// Injected so tests use temporary storage instead of the app's real snapshot file.
     let scanSnapshotStore: any ScanSnapshotStore
+    /// The shared App Group summary the home screen widget renders. Injected so tests
+    /// record writes (and reload requests) instead of touching the real container.
+    let widgetSummaryStore: any WidgetSummaryStoring
 
     @Published var flowState: AppFlowState = .launching
     @Published var prompt: PermissionPrompt = .none
@@ -47,11 +51,28 @@ final class AppEnvironment: ObservableObject {
     @Published var screenshotSelection = ScreenshotSelectionModel()
     /// Videos marked for cleanup — a filter over the catalog, not a second enumeration.
     @Published var videoSelection = DatasetSelectionModel()
+    /// The sharpness pass over the catalog's images (milestone 5B). In-memory only —
+    /// unlike the similarity snapshot it is never persisted, so a verdict can never
+    /// outlive the catalog it was computed over.
+    @Published var blurAnalysisState: BlurAnalysisState = .notStarted
+    /// Injected clock stamped into a completed result's `scannedAt`. Production uses the
+    /// default (`Date()`); tests pin it so a completed run is exactly reproducible.
+    var blurAnalysisClock: @Sendable () -> Date = { Date() }
+    /// Photos marked for cleanup from the Potentially Blurry grid. A *separate*
+    /// `PhotoSelectionModel` from `selection` (never the same instance): candidates are
+    /// admitted through `admitLibraryAssets` — admission alone never selects anything —
+    /// and sharing a model would let one feature's toggles mark photos in another.
+    @Published var blurSelection = PhotoSelectionModel()
     /// Measured bytes for the video list: explicit resolution state the photo flows don't need
     /// (they resolve sizes only at review time), so the largest-first ordering can be honest.
     @Published var videoSizeResolution: VideoSizeResolution = .idle
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
     @Published var deletionState: DeletionState = .noSelection
+    /// The space-freed summary for a completed deletion — set exactly once per outcome, in
+    /// `handleDeletionOutcome`, together with `flowState == .deletionCompleted`, and only
+    /// when at least one item was verified removed. Cleared the moment that result is
+    /// dismissed; never set from the view layer, never persisted.
+    @Published var spaceFreedSummary: SpaceFreedSummary?
     /// Duplicate Contacts: read + local duplicate detection state.
     @Published var contactScanState: ContactScanState = .notStarted
     /// Selection over the duplicate group currently open.
@@ -68,6 +89,11 @@ final class AppEnvironment: ObservableObject {
     let deletionSessionToken: String
     private var catalogTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
+    /// In-flight sharpness pass, if any.
+    private var blurAnalysisTask: Task<Void, Never>?
+    /// Bumped on every sharpness start and cancel. An in-flight run compares it before
+    /// each state write, so a cancelled run can never overwrite a newer one's state.
+    private var blurAnalysisGeneration = 0
     /// Bumped on every catalog start, cancel, and supersede. An in-flight catalog task compares
     /// it before each state write, so a cancelled run can never overwrite a newer one's state.
     private var catalogGeneration = 0
@@ -121,6 +147,7 @@ final class AppEnvironment: ObservableObject {
         deletionService: any PhotoDeleting = PhotoDeletionService(),
         contactMutationService: any ContactMutating = ContactMutationService(),
         scanSnapshotStore: any ScanSnapshotStore = FileScanSnapshotStore(),
+        widgetSummaryStore: any WidgetSummaryStoring = FileWidgetSummaryStore(),
         sessionToken: String = UUID().uuidString
     ) {
         self.storageProvider = storageProvider
@@ -134,6 +161,7 @@ final class AppEnvironment: ObservableObject {
         self.deletionService = deletionService
         self.contactMutationService = contactMutationService
         self.scanSnapshotStore = scanSnapshotStore
+        self.widgetSummaryStore = widgetSummaryStore
         self.deletionSessionToken = sessionToken
     }
 
@@ -144,9 +172,14 @@ final class AppEnvironment: ObservableObject {
         // Restore the last completed scan (if any) into the same state path a fresh
         // completion writes. No PhotoKit work is started: a missing, corrupt, or
         // incompatible snapshot simply leaves the existing first-run state untouched.
-        if let snapshot = scanSnapshotStore.loadLatest() {
-            restoreCompletedScan(snapshot)
+        let restoredSnapshot = scanSnapshotStore.loadLatest()
+        if let restoredSnapshot {
+            restoreCompletedScan(restoredSnapshot)
         }
+        // One widget-summary write per launch, and only when none exists yet: a launch
+        // never overwrites what a scan or cleanup wrote since — it only repairs absence
+        // (first run, wiped container, corrupt file).
+        await writeWidgetSummaryOnLaunch(snapshot: restoredSnapshot)
         flowState = .dashboard
     }
 
@@ -163,7 +196,9 @@ final class AppEnvironment: ObservableObject {
     /// Persists a newly completed scan, replacing the previous snapshot only now — cancelled,
     /// failed, and interrupted runs never reach this point. Best-effort: a failed write is
     /// ignored (the fresh result is already on screen) and never fails the scan itself.
-    private func persistCompletedScan(_ result: PhotoAnalysisResult) {
+    /// Returns the completion date so the caller can publish it to the widget summary.
+    @discardableResult
+    private func persistCompletedScan(_ result: PhotoAnalysisResult) -> Date {
         let completedAt = Date()
         let snapshot = ScanSnapshot(
             schemaVersion: ScanSnapshot.currentSchemaVersion,
@@ -173,6 +208,79 @@ final class AppEnvironment: ObservableObject {
         )
         try? scanSnapshotStore.save(snapshot)
         lastScanCompletedAt = completedAt
+        return completedAt
+    }
+
+    /// Refreshes the widget's shared summary from a completed scan: the scan's own
+    /// completion date is the truth for `.scanReady`, and a scan carries no byte figure —
+    /// the widget shows the status, never a number, until a cleanup measures one.
+    func writeWidgetSummaryAfterScanCompleted(at completedAt: Date) async {
+        await writeWidgetSummary(WidgetSummary(
+            schemaVersion: WidgetSummary.currentSchemaVersion,
+            status: .scanReady,
+            estimateBytes: nil,
+            isEstimated: false,
+            updatedAt: completedAt
+        ))
+    }
+
+    /// Refreshes the widget's shared summary after a confirmed cleanup: only a measured
+    /// figure becomes `.lastCleanup`. A cleanup with nothing measured writes nothing —
+    /// there is no zero, no fallback, and no fabricated amount to show.
+    func writeWidgetSummaryAfterCleanup(_ freed: SpaceFreedSummary) async {
+        guard freed.hasSpaceFigure else { return }
+        await writeWidgetSummary(WidgetSummary(
+            schemaVersion: WidgetSummary.currentSchemaVersion,
+            status: .lastCleanup,
+            estimateBytes: freed.measuredBytes,
+            isEstimated: true,
+            updatedAt: Date()
+        ))
+    }
+
+    /// Write-if-absent used by `bootstrap`: repairs a missing widget file (first run,
+    /// wiped container, corrupt or unsupported content) from the restored scan — and
+    /// writes `.empty` when there is nothing to restore. Never replaces a figure a scan
+    /// or cleanup wrote since the file was last read.
+    private func writeWidgetSummaryOnLaunch(snapshot: ScanSnapshot?) async {
+        if await widgetSummaryStore.load() != nil { return }
+        await writeWidgetSummary(WidgetSummary(
+            schemaVersion: WidgetSummary.currentSchemaVersion,
+            status: snapshot == nil ? .empty : .scanReady,
+            estimateBytes: nil,
+            isEstimated: false,
+            updatedAt: snapshot?.completedAt ?? Date()
+        ))
+    }
+
+    /// The one save-and-reload path for the widget summary: one atomic write, then one
+    /// WidgetKit reload request — only when the write actually happened. Best-effort by
+    /// design: the app never depends on the widget file existing.
+    private func writeWidgetSummary(_ summary: WidgetSummary?) async {
+        guard let summary else { return }
+        do {
+            try await widgetSummaryStore.save(summary)
+            widgetSummaryStore.requestWidgetReload()
+        } catch {
+            // Without a shared container the widget renders its empty state instead;
+            // scanning, deletion, and every app flow are unaffected by this write.
+        }
+    }
+
+    /// Handles a `netto://` deep link — today only from the home screen widget's tap.
+    /// Navigational only: it never starts a scan, never touches analysis, selection, or
+    /// deletion state, and is ignored outright while the launch or a deletion
+    /// (including its summary screen) owns the flow. An unknown or malformed URL still
+    /// lands on the dashboard — opening the app safely *is* the fallback.
+    func handleDeepLink(_ url: URL) {
+        guard flowState != .launching,
+              flowState != .deletionCompleted,
+              !deletionState.isDeleting
+        else { return }
+        switch WidgetDeepLink.route(from: url) {
+        case .dashboard, .unknown:
+            flowState = .dashboard
+        }
     }
 
     func refreshStorage() async {
@@ -182,6 +290,7 @@ final class AppEnvironment: ObservableObject {
     func refreshPermissions() {
         photoPermissionState = photoPermission.currentStatus()
         contactsPermissionState = contactsPermission.currentStatus()
+        reconcileContactReviewPermission()
     }
 
     func requestPhotoAccess() async {
@@ -198,6 +307,7 @@ final class AppEnvironment: ObservableObject {
             return
         }
         contactsPermissionState = await contactsPermission.requestAccess()
+        reconcileContactReviewPermission()
     }
 
     /// Builds the metadata catalog. Enumeration runs on a detached producer task; this loop only
@@ -205,8 +315,11 @@ final class AppEnvironment: ObservableObject {
     func startCatalogBuild() {
         // One library reader at a time: an analysis run owns its own catalog stage, and a
         // rebuild started underneath an in-flight deletion would complete with pre-mutation
-        // data. Both requests are explicit user actions, so dropping this one is honest.
+        // data. A sharpness pass snapshots the catalog records it was started with, so a
+        // rebuild landing mid-run would hand its results a catalog that no longer matches.
+        // All three requests are explicit user actions, so dropping this one is honest.
         guard !analysisState.isRunning else { return }
+        guard !blurAnalysisState.isRunning else { return }
         guard !deletionState.isDeleting else { return }
         catalogTask?.cancel()
         catalogGeneration += 1
@@ -293,6 +406,11 @@ final class AppEnvironment: ObservableObject {
     /// prepared deletion review: plans are bound to the dataset they were built from.
     func startSimilarityAnalysis() {
         guard !analysisState.isRunning else { return }
+        // Stage A below rebuilds the catalog, and a sharpness pass owns a snapshot of the
+        // records it was started with — a rebuild landing mid-run would hand its results a
+        // catalog that no longer matches (the same reason startCatalogBuild refuses). All
+        // three requests are explicit user actions, so dropping this one is honest.
+        guard !blurAnalysisState.isRunning else { return }
         // Never rebuild datasets underneath an in-flight Photos mutation.
         guard !deletionState.isDeleting else { return }
         guard photoPermissionState.isUsable else {
@@ -367,6 +485,15 @@ final class AppEnvironment: ObservableObject {
                             completedUnits: progress.enumeratedCount,
                             totalUnits: progress.totalCount
                         ))
+                        // Stage A of an analysis *is* a catalog build — feed the
+                        // estimator the same standalone build does, or the dashboard's
+                        // countdown sat un-updated for the whole enumeration phase.
+                        self.scanETAEstimator.record(
+                            stage: "catalog",
+                            completed: progress.enumeratedCount,
+                            total: progress.totalCount,
+                            at: ScanETAEstimator.monotonicNow()
+                        )
                     case .completed(let result):
                         built = result
                         self.noteCatalogCompleted(result)
@@ -413,7 +540,8 @@ final class AppEnvironment: ObservableObject {
                         sawCompletion = true
                         self.selection = PhotoSelectionModel(result: result)
                         self.analysisState = .completed(result)
-                        self.persistCompletedScan(result)
+                        let completedAt = self.persistCompletedScan(result)
+                        await self.writeWidgetSummaryAfterScanCompleted(at: completedAt)
                     }
                 }
                 if !sawCompletion {
@@ -495,15 +623,192 @@ final class AppEnvironment: ObservableObject {
         }
     }
 
+    // MARK: - Blur analysis (sharpness pass over the completed catalog)
+
+    /// Runs the sharpness pass over the images of the *already completed* catalog.
+    ///
+    /// Read-only and local-only: it measures bounded thumbnails through the same loader
+    /// seam every other pass uses, never touches the photo library, and never waits on
+    /// similarity analysis (the two passes are independent reads of one catalog). Starting
+    /// it also invalidates any prepared deletion review — plans are bound to the dataset
+    /// they were built from — and resets the blur selection, so a fresh run always opens
+    /// with nothing marked.
+    func startBlurAnalysis() {
+        guard !blurAnalysisState.isRunning else { return }
+        // Never rebuild datasets underneath an in-flight Photos mutation.
+        guard !deletionState.isDeleting else { return }
+        guard photoPermissionState.isUsable else {
+            blurAnalysisState = .failed(.underlying("Photos access is required to read your library."))
+            return
+        }
+        guard case .completed(let catalog) = catalogState else {
+            blurAnalysisState = .failed(.underlying("Your library scan has not finished. Build your catalog, then try again."))
+            return
+        }
+
+        // A fresh pass supersedes any prepared plan.
+        planBuildGeneration += 1
+        applyDeletion(.noSelection)
+
+        blurAnalysisGeneration += 1
+        let generation = blurAnalysisGeneration
+        blurSelection = PhotoSelectionModel()
+
+        blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 0, totalUnits: 0))
+
+        let records = catalog.records
+        #if DEBUG
+        // Same validation hook as the similarity pass: `NETTO_SCAN_METRICS=1` injects the
+        // blur metrics recorder so an end-to-end run prints one `blur-summary` line at the
+        // end (see `BlurAnalysisMetrics`). Without it the engine is exactly as before.
+        let engine: BlurAnalysisEngine
+        if ProcessInfo.processInfo.environment["NETTO_SCAN_METRICS"] == "1" {
+            engine = BlurAnalysisEngine(
+                thumbnailLoader: thumbnailLoader,
+                metrics: BlurAnalysisMetrics(),
+                now: blurAnalysisClock
+            )
+        } else {
+            engine = BlurAnalysisEngine(thumbnailLoader: thumbnailLoader, now: blurAnalysisClock)
+        }
+        #else
+        let engine = BlurAnalysisEngine(thumbnailLoader: thumbnailLoader, now: blurAnalysisClock)
+        #endif
+
+        blurAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            var sawCompletion = false
+            do {
+                for try await event in engine.makeAnalysisStream(records: records) {
+                    guard self.isCurrentBlurAnalysis(generation) else { return }
+                    switch event {
+                    case .progress(let progress):
+                        self.blurAnalysisState = .running(progress)
+                    case .completed(let result):
+                        sawCompletion = true
+                        self.blurAnalysisState = .completed(result)
+                        // Admission only: candidates become markable, nothing is marked.
+                        self.synchronizeBlurDataset()
+                    }
+                }
+                if !sawCompletion {
+                    self.finishBlurAnalysis(generation, as: .cancelled)
+                }
+            } catch is CancellationError {
+                self.finishBlurAnalysis(generation, as: .cancelled)
+            } catch let failure as BlurAnalysisFailure {
+                self.finishBlurAnalysis(
+                    generation,
+                    as: failure == .cancelled ? .cancelled : .failed(failure)
+                )
+            } catch {
+                // PhotoKit/underlying error descriptions never reach the user verbatim.
+                self.finishBlurAnalysis(
+                    generation,
+                    as: .failed(.underlying("Sharpness analysis could not finish. Please try again."))
+                )
+            }
+        }
+    }
+
+    /// Cancels the in-flight sharpness pass. The generation bump makes any late write
+    /// from the old run a no-op, so the state can never flip back after this returns.
+    func cancelBlurAnalysis() {
+        blurAnalysisGeneration += 1
+        blurAnalysisTask?.cancel()
+        blurAnalysisTask = nil
+        if blurAnalysisState.isRunning {
+            blurAnalysisState = .cancelled
+        }
+    }
+
+    private func isCurrentBlurAnalysis(_ generation: Int) -> Bool {
+        blurAnalysisGeneration == generation
+    }
+
+    private func finishBlurAnalysis(_ generation: Int, as state: BlurAnalysisState) {
+        guard isCurrentBlurAnalysis(generation) else { return }
+        blurAnalysisState = state
+    }
+
+    /// Same, for the blur selection — only stales a plan built from that source.
+    func mutateBlurSelection(_ mutation: (inout PhotoSelectionModel) -> Void) {
+        mutation(&blurSelection)
+        guard planSource == .blurReview else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            applyDeletion(.planStale(plan, [.selectionChanged]))
+        default:
+            break
+        }
+    }
+
+    /// Reconciles the blur selection with the current candidate set and stales any blur
+    /// plan built over a previous dataset. Candidates are *admitted* — the selection only
+    /// ever accepts an explicit user decision, so this can never mark anything.
+    ///
+    /// Called whenever the catalog completes, whenever the sharpness pass completes, and
+    /// whenever the Potentially Blurry screen appears (previews and tests set
+    /// `catalogState` / `blurAnalysisState` directly).
+    func synchronizeBlurDataset() {
+        // A run in flight owns the dataset: the grid is hidden behind the progress phase,
+        // every progress tick re-fires the state observation, and reconciling on each one
+        // was O(catalog) work against a dataset about to be superseded. Completion (or any
+        // terminal transition) re-enters here through the same observation and applies the
+        // final dataset exactly once.
+        guard !blurAnalysisState.isRunning else { return }
+        let candidates: Set<String>
+        switch blurAnalysisState {
+        case .completed(let result):
+            candidates = result.candidateIDs
+        case .notStarted, .running, .cancelled, .failed:
+            candidates = []
+        }
+        // A candidate whose record left the catalog (rebuild, deletion) is no longer part
+        // of the dataset: drop its selection first (while it is still admitted), then
+        // admit the surviving set and restore the user's still-valid marks.
+        let catalogImageIDs: Set<String>
+        switch catalogState {
+        case .completed(let result):
+            catalogImageIDs = Set(result.records.lazy.filter(\.isImage).map(\.localIdentifier))
+        case .notStarted, .cancelled, .failed:
+            catalogImageIDs = []
+        case .running:
+            catalogImageIDs = [] // A rebuild is in flight; reconcile again when it completes.
+        }
+        let effective = candidates.intersection(catalogImageIDs)
+
+        // Drop selections that left the dataset while they are still admitted (the guard
+        // in `setSelected` only lets admitted assets change), then admit the surviving
+        // set — admission alone never selects anything, so this can mark nothing new.
+        for assetID in blurSelection.selectedIDs where !effective.contains(assetID) {
+            blurSelection.setSelected(false, forAsset: assetID)
+        }
+        blurSelection.admitLibraryAssets(effective)
+
+        guard planSource == .blurReview else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            if blurSelection.selectedIDs != plan.selectionSnapshot {
+                applyDeletion(.planStale(plan, [.selectionChanged]))
+            } else if currentDatasetSignature(for: .blurReview) != plan.analysisSignature {
+                applyDeletion(.planStale(plan, [.analysisChanged]))
+            }
+        default:
+            break
+        }
+    }
+
     // MARK: - Deletion (plan → confirmation → mutation → verification)
 
     /// Builds an immutable deletion plan from `source`'s current selection.
     ///
     /// Never runs while a build, a confirmed deletion, or a result is on screen; requires a
-    /// completed catalog — plus a completed analysis for the similar-photos source (screenshots
-    /// and videos are filters recorded during enumeration, so they never wait on analysis);
-    /// resolves real sizes through `sizeProvider` (never during enumeration); then validates
-    /// the fresh plan against the *current* context before presenting it for review.
+    /// completed catalog — the similar-photos source falls back to an empty analysis result
+    /// when no scan has completed (screenshots and videos are filters recorded during
+    /// enumeration, so they never wait on analysis); resolves real sizes through
+    /// `sizeProvider` (never during enumeration); then validates the fresh plan against the
+    /// *current* context before presenting it for review.
     func prepareDeletionPlan(from source: DeletionSelectionSource = .similarPhotos) {
         switch deletionState {
         case .preparingPlan, .resolvingSizes, .awaitingConfirmation, .deleting, .succeeded,
@@ -529,14 +834,27 @@ final class AppEnvironment: ObservableObject {
 
         let analysisResult: PhotoAnalysisResult
         switch source {
-        case .screenshots, .videos:
-            analysisResult = .empty
-        case .similarPhotos:
-            guard case .completed(let completed) = analysisState else {
-                applyDeletion(.failed("Similarity analysis has not finished. Run analysis, then review again."))
+        case .screenshots, .videos, .blurReview:
+            // Screenshots, videos, and blur candidates are subsets recorded by their own
+            // passes — none of them needs the similarity result, and the plan's category
+            // comes from the empty result + the source's own dataset signature below.
+            if source == .blurReview, blurAnalysisState.isRunning || blurAnalysisState.result == nil {
+                applyDeletion(.failed("Sharpness analysis has not finished. Analyze sharpness, then review again."))
                 return
             }
-            analysisResult = completed
+            analysisResult = .empty
+        case .similarPhotos:
+            // Swipe Review writes its marks into this same selection and never needs the
+            // similarity result to open or run — its deck *is* the scanned catalog — so a
+            // library that has not been analysed must not dead-end its "Review Cleanup".
+            // Fall back to the empty result exactly as the catalog-only sources do: the
+            // plan is record-driven (validation, sizes, confirmation are unchanged), and a
+            // later analysis rebuilds the selection and stales any plan built without it.
+            if case .completed(let completed) = analysisState {
+                analysisResult = completed
+            } else {
+                analysisResult = .empty
+            }
         }
 
         // The fingerprint is derived from the inputs captured *now*; the self-check below
@@ -545,7 +863,8 @@ final class AppEnvironment: ObservableObject {
         let datasetSignature = Self.datasetSignature(
             for: source,
             catalog: catalogResult,
-            analysis: analysisResult
+            analysis: analysisResult,
+            blur: blurAnalysisState.result
         )
         let recordsByID = Dictionary(
             catalogResult.records.map { ($0.localIdentifier, $0) },
@@ -648,8 +967,14 @@ final class AppEnvironment: ObservableObject {
     /// User changed the similar-photos selection after a plan was shown — the plan is
     /// immediately stale. Only plans built from that source are affected.
     func mutateSelection(_ mutation: (inout PhotoSelectionModel) -> Void) {
+        let before = selection.selectedIDs
         mutation(&selection)
         guard planSource == .similarPhotos else { return }
+        // Only a change to what is *marked* stales the plan: accepted-set mutations (e.g.
+        // Swipe Review re-admitting its whole deck on appear) provably cannot alter the
+        // plan's selection snapshot, and staling on them told the user their prepared
+        // review was "out of date" when nothing they chose had changed.
+        guard selection.selectedIDs != before else { return }
         switch deletionState {
         case .readyForReview(let plan), .awaitingConfirmation(let plan):
             applyDeletion(.planStale(plan, [.selectionChanged]))
@@ -721,16 +1046,44 @@ final class AppEnvironment: ObservableObject {
         await handleDeletionOutcome(outcome)
     }
 
-    /// Leaves a terminal result state (also used to leave `.planStale`).
+    /// Leaves a terminal result state (also used to leave `.planStale`). Dismissing also
+    /// discards the presented space-freed summary: a summary exists only for the result it
+    /// describes, so a stale one can never back a later deletion.
     func dismissDeletionResult() {
+        spaceFreedSummary = nil
         applyDeletion(.noSelection)
+    }
+
+    /// Presents the space-freed summary for an outcome with at least one confirmed removal.
+    /// Called only after the outcome was applied, the results were pruned, and storage was
+    /// refreshed. `nil` plan, or a summary that would count zero removals, presents nothing —
+    /// the failure/cancellation/no-op flows below are untouched by construction. After the
+    /// screen is up, the confirmed figure (when one was measured) becomes the widget's
+    /// shared summary; a cleanup without a measured figure writes nothing at all.
+    private func presentSpaceFreedSummary(plan: DeletionPlan?, success: DeletionSuccess) async {
+        guard let plan, let summary = SpaceFreedSummary(plan: plan, success: success) else { return }
+        spaceFreedSummary = summary
+        flowState = .deletionCompleted
+        await writeWidgetSummaryAfterCleanup(summary)
+    }
+
+    /// The summary screen's Done: an idempotent return to the dashboard. It resets the
+    /// deletion state machine exactly like the in-review Done button (via
+    /// `dismissDeletionResult`, which also discards the summary) and starts nothing — no
+    /// scan, no repeated mutation, no extra snapshot write. Repeated taps are no-ops.
+    func finishSpaceFreedSummary() {
+        guard spaceFreedSummary != nil || flowState == .deletionCompleted else { return }
+        dismissDeletionResult()
+        flowState = .dashboard
     }
 
     private func handleDeletionOutcome(_ outcome: DeletionOutcome) async {
         switch outcome {
         case .succeeded(let success):
             // The plan is the source of truth for what was attempted; capture it before the
-            // state machine leaves `.deleting`.
+            // state machine leaves `.deleting` — the summary needs its measured sizes and
+            // categories while they are still reachable.
+            let deletingPlan = deletionState.plan
             let plannedIDs = deletingPlanSelectionIDs()
             if success.isFullyRemoved {
                 applyDeletion(.succeeded(success))
@@ -741,6 +1094,9 @@ final class AppEnvironment: ObservableObject {
             // completed results instead of invalidating them back to "start analysis".
             preserveResultsAfterDeletion(removing: plannedIDs.subtracting(success.remainingIDs))
             await refreshStorage()
+            // Only now — outcome applied, results pruned, storage refreshed — may a success
+            // summary exist, so the UI can never show success before the operation finished.
+            await presentSpaceFreedSummary(plan: deletingPlan, success: success)
 
         case .stale(let reasons):
             if case .deleting(let plan) = deletionState {
@@ -791,7 +1147,10 @@ final class AppEnvironment: ObservableObject {
     /// pruned catalog. No rescan is started; failure outcomes never reach here.
     private func preserveResultsAfterDeletion(removing deletedAssetIDs: Set<String>) {
         planBuildGeneration += 1
-        planSource = .similarPhotos
+        // `planSource` is deliberately left at the source that produced this deletion:
+        // overwriting it here made a foreign outcome (screenshots/videos/blur) look like a
+        // similar-photos result on the next review appearance, so that screen showed the
+        // wrong deletion's summary instead of preparing its own plan.
         cancelVideoSizeResolution()
         videoSizeResolution = .idle
 
@@ -800,10 +1159,35 @@ final class AppEnvironment: ObservableObject {
         analysisGeneration += 1
         analysisTask?.cancel()
         analysisTask = nil
+        if analysisState.isRunning {
+            // Interrupted by the mutation — cancelled, never left "running" over data that
+            // just changed underneath it (the same terminal write the sharpness pass below
+            // gets). Without it the state froze at `.running` forever: every later write is
+            // generation-guarded off, and both scan entry points refuse to start.
+            analysisState = .cancelled
+        }
+        // The sharpness pass sampled the pre-mutation catalog: cancel it the same way, and
+        // supersede any late write, so its result can only ever describe the current data.
+        blurAnalysisGeneration += 1
+        blurAnalysisTask?.cancel()
+        blurAnalysisTask = nil
+        if blurAnalysisState.isRunning {
+            // Interrupted by the mutation — cancelled, never "completed" over data that
+            // just changed underneath it.
+            blurAnalysisState = .cancelled
+        }
         let catalogWasRunning = catalogTask != nil
         catalogTask?.cancel()
         catalogTask = nil
         if catalogWasRunning { catalogGeneration += 1 }
+
+        // Whatever state the analysis is in, confirmed removals must leave the shared
+        // selection: otherwise marks on a catalog-only library (Swipe Review without an
+        // analysis) would keep referencing deleted assets — a wrong count and a plan
+        // guaranteed to fail closed on the next review.
+        if !deletedAssetIDs.isEmpty {
+            selection.prune(removing: deletedAssetIDs)
+        }
 
         if case .completed(let result) = analysisState, !deletedAssetIDs.isEmpty {
             let recordsByID: [String: PhotoAssetRecord] = {
@@ -815,8 +1199,14 @@ final class AppEnvironment: ObservableObject {
             }()
             let updated = result.removingAssets(deletedAssetIDs, catalogRecords: recordsByID)
             analysisState = .completed(updated)
-            selection = PhotoSelectionModel(result: updated, preserving: selection)
+            selection = PhotoSelectionModel(result: updated, preserving: selection, removing: deletedAssetIDs)
             persistUpdatedScanResult(updated)
+        }
+
+        // In-place prune of the sharpness result — the confirmed removals leave it, the
+        // verdicts for everything else stand (no rescan, no re-measurement).
+        if case .completed(let blurResult) = blurAnalysisState, !deletedAssetIDs.isEmpty {
+            blurAnalysisState = .completed(blurResult.removingAssets(deletedAssetIDs))
         }
 
         if case .completed(let catalog) = catalogState {
@@ -824,12 +1214,14 @@ final class AppEnvironment: ObservableObject {
                 catalogState = .completed(catalog.removingAssetIDs(deletedAssetIDs))
                 synchronizeScreenshotDataset()
                 synchronizeVideoDataset()
+                synchronizeBlurDataset()
             }
         } else if catalogWasRunning, case .running = catalogState {
             // The in-flight build carried pre-mutation records and can never finish now.
             catalogState = .notStarted
             synchronizeScreenshotDataset()
             synchronizeVideoDataset()
+            synchronizeBlurDataset()
         }
     }
 
@@ -864,19 +1256,25 @@ final class AppEnvironment: ObservableObject {
         catalogState = .completed(result)
         synchronizeScreenshotDataset()
         synchronizeVideoDataset()
+        synchronizeBlurDataset()
         if standalone {
             invalidateAnalysisAfterRebuild()
         }
     }
 
     /// A standalone rebuild supersedes every fact derived from the previous catalog: groups,
-    /// the photo selection, and any prepared plan were all computed over data that no longer
-    /// exists. The photo flows have no per-dataset signature check (screenshots and videos
-    /// reconcile themselves above), so the invalidation is explicit here. Cannot run during
-    /// an analysis (a standalone build is refused while one is running) or a deletion (same).
+    /// the photo selection, the sharpness results, and any prepared plan were all computed
+    /// over data that no longer exists. The photo flows have no per-dataset signature check
+    /// (screenshots and videos reconcile themselves above), so the invalidation is explicit
+    /// here. Cannot run during an analysis, a sharpness pass (a standalone build is refused
+    /// while either is running) or a deletion (same).
     private func invalidateAnalysisAfterRebuild() {
         guard !analysisState.isRunning, !deletionState.isDeleting else { return }
-        if case .notStarted = analysisState, selection.selectedIDs.isEmpty { return }
+        let blurIsClean: Bool = {
+            if case .notStarted = blurAnalysisState { return blurSelection.selectedIDs.isEmpty }
+            return false
+        }()
+        if case .notStarted = analysisState, selection.selectedIDs.isEmpty, blurIsClean { return }
         planBuildGeneration += 1
         selection = PhotoSelectionModel()
         applyDeletion(.noSelection)
@@ -884,6 +1282,13 @@ final class AppEnvironment: ObservableObject {
         analysisTask?.cancel()
         analysisTask = nil
         analysisState = .notStarted
+        // The sharpness pass is in-memory only: with no catalog to stand on, its state
+        // resets to "not started" — it can never show results from a superseded catalog.
+        blurAnalysisGeneration += 1
+        blurAnalysisTask?.cancel()
+        blurAnalysisTask = nil
+        blurSelection = PhotoSelectionModel()
+        blurAnalysisState = .notStarted
     }
 
     /// Reconciles the screenshot selection with the current catalog and stales any screenshot
@@ -953,6 +1358,7 @@ final class AppEnvironment: ObservableObject {
         case .similarPhotos: return selection.selectedIDs
         case .screenshots: return screenshotSelection.selectedIDs
         case .videos: return videoSelection.selectedIDs
+        case .blurReview: return blurSelection.selectedIDs
         }
     }
 
@@ -961,27 +1367,44 @@ final class AppEnvironment: ObservableObject {
     private func currentDatasetSignature(for source: DeletionSelectionSource) -> String {
         switch source {
         case .similarPhotos:
-            guard case .completed(let result) = analysisState else { return "" }
-            return DeletionPlanner.analysisSignature(for: result)
+            if case .completed(let result) = analysisState {
+                return DeletionPlanner.analysisSignature(for: result)
+            }
+            // Mirror `prepareDeletionPlan`'s empty-result fallback: a plan built over a
+            // catalog-only library stamps `.empty`'s signature, so the context check must
+            // answer with the same value instead of `""` (which would flag the plan stale
+            // the instant it was built). Any *real* analysis result still differs from the
+            // empty signature, so completion/invalidation stales the plan as it should.
+            return DeletionPlanner.analysisSignature(for: .empty)
         case .screenshots:
             guard case .completed(let result) = catalogState else { return "" }
             return ScreenshotDataset.signature(in: result)
         case .videos:
             guard case .completed(let result) = catalogState else { return "" }
             return VideoDataset.signature(in: result)
+        case .blurReview:
+            guard let result = blurAnalysisState.result else { return "" }
+            return BlurDataset.signature(in: result)
         }
     }
 
     /// The fingerprint stamped at build time, derived from the inputs captured with the plan.
+    /// `blur` carries the sharpness result *as it was when the plan was built*; sources that
+    /// do not derive their dataset from it ignore the parameter (and a `.blurReview` plan
+    /// built with no result gets `""`, which can never match a real stamp).
     private static func datasetSignature(
         for source: DeletionSelectionSource,
         catalog: CatalogScanResult,
-        analysis: PhotoAnalysisResult
+        analysis: PhotoAnalysisResult,
+        blur: BlurAnalysisResult?
     ) -> String {
         switch source {
         case .similarPhotos: return DeletionPlanner.analysisSignature(for: analysis)
         case .screenshots: return ScreenshotDataset.signature(in: catalog)
         case .videos: return VideoDataset.signature(in: catalog)
+        case .blurReview:
+            guard let blur else { return "" }
+            return BlurDataset.signature(in: blur)
         }
     }
 
@@ -1148,20 +1571,42 @@ extension AppEnvironment {
 
 struct RootView: View {
     @StateObject private var env = AppEnvironment.live()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
             switch env.flowState {
             case .launching:
                 ProgressView("Starting Netto…")
+            case .deletionCompleted:
+                // The summary and this state are set together in `presentSpaceFreedSummary`
+                // and cleared together in `finishSpaceFreedSummary`. If they ever desync,
+                // fall back to the dashboard rather than an empty screen.
+                if let summary = env.spaceFreedSummary {
+                    SpaceFreedSummaryView(summary: summary, onDone: env.finishSpaceFreedSummary)
+                } else {
+                    DashboardView()
+                        .environmentObject(env)
+                }
             case .dashboard, .scanning, .resultsAvailable, .review,
-                 .deleting, .deletionCompleted, .deletionFailed:
+                 .deleting, .deletionFailed:
                 DashboardView()
                     .environmentObject(env)
             }
         }
         .task {
             await env.bootstrap()
+        }
+        .onOpenURL { url in
+            env.handleDeepLink(url)
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Returning from Settings (or the app being foregrounded) is the only moment a
+            // permission granted elsewhere becomes visible here — without this, both
+            // permission screens read the boot-time status forever.
+            guard newPhase == .active else { return }
+            env.refreshPermissions()
+            Task { await env.refreshStorage() }
         }
     }
 }

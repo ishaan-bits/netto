@@ -12,6 +12,12 @@ is no backend, no cloud processing, and no third-party analytics.
 - **Similar / duplicate photo detection** — exact duplicates and near-duplicate shots
   found through content fingerprints, perceptual hashes, and Vision features, presented
   as reviewable groups.
+- **Potentially Blurry detection** — an on-device sharpness pass scores every scanned
+  photo on a small local thumbnail and flags candidates for review in three tabs
+  (All Flagged / Likely Blurry / Borderline, with live counts). Classification uses
+  multiple image signals (Laplacian variance, Tenengrad energy, luminance gates) with
+  thresholds calibrated against a labelled synthetic corpus; every candidate is a
+  suggestion for human review — nothing is preselected and nothing is auto-deleted.
 - **Screenshot cleanup** — every screenshot in the library, selectable in bulk.
 - **Large video cleanup** — videos ordered largest-first with measured sizes, so the
   biggest wins are reviewed first.
@@ -48,6 +54,11 @@ Beyond the core cleanup loop:
   the engine's recommended selection exactly as presented.
 - **Scan ETA** — a rolling-throughput estimate of remaining scan time shown alongside
   progress.
+- **Home screen widget** — a WidgetKit extension renders the shared scan summary from
+  the App Group; it reads only that summary and never links PhotoKit, Vision, or the
+  deletion path.
+- **Space-freed confirmation** — a completed deletion shows how much space the confirmed
+  removal actually reclaimed, computed from measured sizes and verified removals.
 
 ## Architecture & technologies
 
@@ -131,9 +142,10 @@ Netto/
                   that mutates Photos or Contacts)
   Models/         Shared value types
   Features/       UI per section: Dashboard, Photos/SimilarPhotos (details, swipe
-                  review, review), Screenshots, Videos, Contacts, Review
+                  review, review), Blur, Screenshots, Videos, Contacts, Review
   UI/             Brand, DesignSystem, Theme — design tokens and shared components
   Resources/      PrivacyInfo.xcprivacy
+NettoWidget/      WidgetKit extension (renders the App Group scan summary only)
 NettoTests/       Unit tests for pure logic (Swift Testing)
 NettoUITests/     XCUITest suites: dashboard layout QA, end-to-end scan validation
 project.yml       xcodegen manifest
@@ -142,27 +154,41 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 36 files, ~580 Swift Testing cases covering the pure logic: contact
-  normalization and matching, similarity grouping, plan construction and its
-  confirmation boundary, state machines, the mutation service's
+- **Unit suite** — 46 files, 668 Swift Testing cases across 66 suites covering the pure
+  logic: contact normalization and matching, similarity grouping, plan construction and
+  its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
-  selection persistence across navigation, and the photo-preview fallback ladder.
-  Tests use fakes and fixtures — they never mutate a real photo library or the
-  contacts store.
-- **UI suites** — XCUITest coverage for dashboard layout QA and an end-to-end scan
+  selection persistence across navigation, the photo-preview fallback ladder, the blur
+  pipeline (engine flow, instrumentation, review-tab presentation), the labelled
+  blur-classification corpus (14 categories × 3 sizes × 2 delivery paths), and the
+  widget summary. Tests use fakes and fixtures — they never mutate a real photo library
+  or the contacts store.
+- **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification** — focused suites green (Swipe Review + selection: 30/30;
-  photo preview: 41/41) and a clean `build-for-testing` with zero warnings in the app
-  and unit-test targets (only pre-existing warnings in the UI-test targets).
+- **Recent verification** — full suites green (668/668 unit, 5/5 UI) and a clean
+  `build-for-testing` with 0 errors and 251 warnings, matching the pre-existing
+  baseline exactly (all in the UI-test targets).
+- **Benchmark, bounded honestly** — `BlurScanBenchmarkTests` self-seeds a Simulator
+  library and A/B-measures the blur scan's delivery paths with stage-level
+  instrumentation. Simulator PhotoKit timing is not representative of devices, so the
+  benchmark is used only for relative comparisons, never as a device-performance claim.
 
 ## Known limitations
 
 - **Simulator PhotoKit libraries may not contain real image backing files**, so
   previews, fingerprints, sizes, and playback measured in Simulator are not
   representative. **Real-device testing is required for final validation**; the
-  real-device validation matrix has not been performed.
+  real-device validation matrix has not been performed. Photos imported via
+  `simctl addmedia` can additionally surface as cloud-only placeholders.
 - Simulated validation against the fixture data above covers flow and logic, but not
   real-world library scale or hardware performance.
+- **Blur verdicts are calibrated on a procedural synthetic corpus, not on labelled
+  real-device photographs** — accuracy on real libraries is unverified until a device
+  corpus re-validates the thresholds. Known behaviours: very smooth content (blank
+  skies, gradients) can read as likely blurry by every measured signal; whole-frame
+  intentional defocus is indistinguishable from accidental blur at thumbnail scale; the
+  result is in-memory for the session only. The classifier never acts on its own —
+  candidates are for explicit human review.
 
 ## Credits / AI development note
 

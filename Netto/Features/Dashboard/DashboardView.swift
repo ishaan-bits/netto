@@ -108,7 +108,8 @@ struct DashboardView: View {
             onAllowPhotos: { showPhotoPrePrompt = true },
             onOpenSettings: openSettings,
             onAnalyze: { env.startSimilarityAnalysis() },
-            onCancel: cancelScan
+            onCancel: cancelScan,
+            isLimitedAccess: env.photoPermissionState == .limited
         )
     }
 
@@ -209,6 +210,24 @@ struct DashboardView: View {
                     step: 9,
                     destination: { SwipeReviewView(items: swipeReviewDeck) }
                 )
+
+                // The on-device sharpness pass (milestone 5B): its own analysis over the
+                // completed catalog, its own grid, the same shared review handoff.
+                categoryLink(
+                    id: "potentiallyBlurry",
+                    identifier: "potentiallyBlurryCard",
+                    title: "Potentially Blurry",
+                    icon: "camera.metering.unknown",
+                    status: PotentiallyBlurryPresentation.statusText(
+                        permission: env.photoPermissionState,
+                        catalog: env.catalogState,
+                        blur: env.blurAnalysisState
+                    ),
+                    assetID: potentiallyBlurryAssetID,
+                    initials: nil,
+                    step: 10,
+                    destination: { PotentiallyBlurryView() }
+                )
             }
         }
     }
@@ -282,6 +301,17 @@ struct DashboardView: View {
             resolution: env.videoSizeResolution
         ) else { return nil }
         return records.first?.localIdentifier
+    }
+
+    /// First candidate's thumbnail for the Potentially Blurry card; nil when there is
+    /// nothing to show (no candidates, or the pass has not completed).
+    private var potentiallyBlurryAssetID: String? {
+        guard case .results(let result) = PotentiallyBlurryPresentation.phase(
+            permission: env.photoPermissionState,
+            catalog: env.catalogState,
+            blur: env.blurAnalysisState
+        ) else { return nil }
+        return result.candidates.first?.assetID
     }
 
     private var contactsInitials: String? {
@@ -387,7 +417,7 @@ struct PermissionPrimingView: View {
             Spacer(minLength: NettoLayout.Spacing.lg)
             Image(systemName: kind == .photos ? "photo.on.rectangle.angled" : "person.2.badge.key")
                 .font(.system(size: 44))
-                .foregroundStyle(NettoColor.brand)
+                .foregroundStyle(NettoColor.brandIndicator)
 
             Text(kind == .photos ? "Netto needs Photos access" : "Netto needs Contacts access")
                 .font(NettoType.sectionTitle)

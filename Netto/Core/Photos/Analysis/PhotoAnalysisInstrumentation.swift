@@ -247,6 +247,170 @@ final class AnalysisMetrics: @unchecked Sendable {
     }
 }
 
+/// Cumulative timing/counter metrics for one sharpness (blur) run — the same
+/// one-summary-line-per-run rules as `AnalysisMetrics`, with the stage set the sharpness
+/// performance matrix needs: how much of a run is PhotoKit request latency versus
+/// measurement, and how many requests ended each way.
+///
+/// Tests and the simulator benchmark inject an instance, run the engine, and read
+/// `snapshot()` — no log parsing. `RootView` emits the summary line only when
+/// `NETTO_SCAN_METRICS=1` is present in the environment (debug builds), mirroring the
+/// similarity pass.
+final class BlurAnalysisMetrics: @unchecked Sendable {
+    enum Duration: String, Sendable, CaseIterable {
+        /// PhotoKit thumbnail requests (summed over attempts — every attempt, successful
+        /// or not; includes queued time inside the loader's bounded request).
+        case request
+        /// Bitmap render + metric calculation (summed over successes).
+        case measure
+        /// Classification of a produced score (summed over successes; arithmetic only —
+        /// exists to prove it is negligible, not to optimize it).
+        case classify
+        /// Whole run, start to result (or cancellation).
+        case total
+    }
+
+    enum Counter: String, Sendable, CaseIterable {
+        /// Records handed to analysis (total input size).
+        case assetsConsidered
+        /// Records refused up front (non-image or zero dimensions) — no request issued.
+        case refusedUpFront
+        /// Thumbnail requests issued.
+        case requestsAttempted
+        /// Thumbnail requests that returned a bitmap.
+        case requestsSucceeded
+        /// Thumbnail requests that ended unavailable (any reason).
+        case requestsFailed
+        /// Requests that hit the bounded-request failsafe.
+        case requestsTimedOut
+        /// Requests PhotoKit reported as local-only-miss (iCloud rendition, network disabled).
+        case requestsICloud
+        /// Renditions whose shortest side was below the analysis budget — the upscale
+        /// path. Never expected after the aspect-fill 256² request mode; a non-zero count
+        /// on a device run is the signal that PhotoKit did not honor the budget.
+        case renditionsBelowBudget
+        /// Progress events actually published to the consumer (after throttling).
+        case progressTicks
+        /// Worker width the run used.
+        case workerWidth
+        /// Assets judged sharp by the thresholds.
+        case judgedSharp
+        /// Assets judged borderline.
+        case judgedBorderline
+        /// Assets judged likely blurry.
+        case judgedLikelyBlurry
+        /// Assets judged insufficient-information by the threshold gates.
+        case judgedInsufficient
+    }
+
+    struct Snapshot: Sendable, Equatable {
+        var durations: [Duration: Double] = [:]
+        var counters: [Counter: Int] = [:]
+        /// Final `PhotoAnalysisUnavailableReason` counts for the run, keyed by raw value.
+        var reasons: [String: Int] = [:]
+        /// Raw PhotoKit failure codes seen during the run (shared process-wide tally —
+        /// recorded by the thumbnail loader on failure paths).
+        var failCodes: [String: Int] = [:]
+    }
+
+    private static let logger = Logger(
+        subsystem: "com.netto.analysis",
+        category: "BlurAnalysis"
+    )
+    private static let signposter = OSSignposter(
+        subsystem: "com.netto.analysis",
+        category: .init("BlurAnalysis")
+    )
+
+    private let lock = NSLock()
+    private var durations: [Duration: Double] = [:]
+    private var counters: [Counter: Int] = [:]
+    private var reasons: [String: Int] = [:]
+
+    func record(_ category: Duration, seconds: Double) {
+        lock.lock()
+        durations[category, default: 0] += seconds
+        lock.unlock()
+    }
+
+    func set(_ counter: Counter, to value: Int) {
+        lock.lock()
+        counters[counter] = value
+        lock.unlock()
+    }
+
+    func increment(_ counter: Counter) {
+        lock.lock()
+        counters[counter, default: 0] += 1
+        lock.unlock()
+    }
+
+    /// Tallies one unavailable reason at result-build time — a partition of the run's
+    /// unavailable assets, not a running log.
+    func incrementReason(_ reason: PhotoAnalysisUnavailableReason) {
+        lock.lock()
+        reasons[reason.rawValue, default: 0] += 1
+        lock.unlock()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            durations: durations,
+            counters: counters,
+            reasons: reasons,
+            failCodes: PhotoKitFailureTally.snapshot()
+        )
+    }
+
+    /// One line per run (cancelled runs included — their timings are exactly what a
+    /// validation session wants). Counts and seconds are `privacy: .public`; they never
+    /// contain asset content.
+    func emitSummary() {
+        let values = snapshot()
+        func seconds(_ category: Duration) -> String {
+            String(format: "%.4f", values.durations[category] ?? 0)
+        }
+        func count(_ counter: Counter) -> Int { values.counters[counter] ?? 0 }
+        func breakdown(_ entries: [String: Int], limit: Int) -> String {
+            entries
+                .sorted { lhs, rhs in
+                    lhs.value != rhs.value ? lhs.value > rhs.value : lhs.key < rhs.key
+                }
+                .prefix(limit)
+                .map { "\($0.key):\($0.value)" }
+                .joined(separator: ",")
+        }
+        Self.signposter.emitEvent("blur-summary")
+        Self.logger.info(
+            """
+            blur-summary \
+            total=\(seconds(.total), privacy: .public)s \
+            request=\(seconds(.request), privacy: .public)s \
+            measure=\(seconds(.measure), privacy: .public)s \
+            classify=\(seconds(.classify), privacy: .public)s \
+            considered=\(count(.assetsConsidered), privacy: .public) \
+            refused=\(count(.refusedUpFront), privacy: .public) \
+            tried=\(count(.requestsAttempted), privacy: .public) \
+            ok=\(count(.requestsSucceeded), privacy: .public) \
+            fail=\(count(.requestsFailed), privacy: .public) \
+            timeout=\(count(.requestsTimedOut), privacy: .public) \
+            icloud=\(count(.requestsICloud), privacy: .public) \
+            belowBudget=\(count(.renditionsBelowBudget), privacy: .public) \
+            ticks=\(count(.progressTicks), privacy: .public) \
+            workers=\(count(.workerWidth), privacy: .public) \
+            sharp=\(count(.judgedSharp), privacy: .public) \
+            borderline=\(count(.judgedBorderline), privacy: .public) \
+            likelyBlurry=\(count(.judgedLikelyBlurry), privacy: .public) \
+            insufficient=\(count(.judgedInsufficient), privacy: .public) \
+            reasons=\(breakdown(values.reasons, limit: 10), privacy: .public) \
+            failCodes=\(breakdown(values.failCodes, limit: 6), privacy: .public)
+            """
+        )
+    }
+}
+
 /// Process-wide tally of the *raw* PhotoKit errors seen while resolving content or thumbnails.
 ///
 /// Why this exists: the analysis vocabulary intentionally collapses raw NSError codes into a

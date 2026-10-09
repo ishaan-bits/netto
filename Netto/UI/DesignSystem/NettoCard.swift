@@ -69,7 +69,7 @@ struct NettoCard: View {
             if let progress {
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
-                    .tint(NettoColor.brand)
+                    .tint(NettoColor.brandIndicator)
                     .frame(width: 64)
             }
         }

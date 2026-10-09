@@ -837,6 +837,16 @@ final class LockedBox<Value: Sendable>: @unchecked Sendable {
         return value
     }
 
+    /// Atomically transforms the wrapped value and returns whatever the closure produced.
+    /// The generic counterpart to the typed `write`/`append`/`insert` helpers below: the
+    /// blur engine accumulates a private tally struct that has no dedicated overload, and
+    /// every read-modify-write must stay under the same lock.
+    func mutate<Result>(_ body: (inout Value) -> Result) -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
+    }
+
     func write(_ key: String, _ newValue: ContentByteKey) where Value == [String: ContentByteKey] {
         lock.lock()
         value[key] = newValue

@@ -66,6 +66,18 @@ enum NettoColor {
     static let brandDeep = nettoDynamic(0x4F9D33, 0x3F7D24)
     static let onBrand = nettoDynamic(0x0C1A0F, 0x0C1A0F)
 
+    /// Non-text brand accent — selection rings, progress fills, glyphs. The lime brand
+    /// where it already carried (dark), the deep brand in light: 5.0:1 against light
+    /// surfaces, so "selected / active" reads in both appearances instead of 1.28:1 in
+    /// light. Never use `brand` for an indicator on a light surface; keep `brand` for
+    /// brand-colored *text* only where it sits on `onBrand`-adjacent dark fills.
+    static let brandIndicator = nettoDynamic(0xA6F04C, 0x3F7D24)
+
+    /// Glyph color for content drawn *on* a `brandIndicator` fill: black on the lime
+    /// where it already carried (dark, 15:1), white on the deep brand in light (5.0:1).
+    /// White on the lime read at 1.38:1 — the selected checkmark was invisible in dark.
+    static let onBrandIndicator = nettoDynamic(0x000000, 0xFFFFFF)
+
     static let success = nettoDynamic(0x30D158, 0x248A3D)
     static let warning = nettoDynamic(0xFF9F0A, 0xB25000)
     static let destructive = nettoDynamic(0xFF453A, 0xD70015)

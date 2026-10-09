@@ -173,7 +173,8 @@ enum PreviewData {
     static func environment(
         permission: PermissionState = .authorized,
         catalog: CatalogScanState = .notStarted,
-        analysis: PhotoAnalysisState = .notStarted
+        analysis: PhotoAnalysisState = .notStarted,
+        blur: BlurAnalysisState = .notStarted
     ) -> AppEnvironment {
         let env = AppEnvironment(
             makePhotoLibrary: { () throws -> any PhotoLibraryReading in
@@ -184,8 +185,14 @@ enum PreviewData {
         env.photoPermissionState = permission
         env.catalogState = catalog
         env.analysisState = analysis
+        env.blurAnalysisState = blur
         if case .completed(let completed) = analysis {
             env.selection = PhotoSelectionModel(result: completed)
+        }
+        if case .completed(let completed) = blur {
+            // Admission only — a preview grid renders exactly like production: candidates
+            // are markable, never preselected.
+            env.blurSelection.admitLibraryAssets(completed.candidateIDs)
         }
         env.storageSnapshot = StorageSnapshot(
             totalCapacity: 128_000_000_000,

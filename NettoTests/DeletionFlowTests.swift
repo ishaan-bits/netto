@@ -47,24 +47,37 @@ struct DeletionFlowTests {
         #expect(!plan.sizeSummary.isExact)
     }
 
-    @Test func prepareFailsCleanlyWithoutCompletedInputs() async {
+    /// U1 (behavior change, justified): a missing similarity *analysis* is no longer a
+    /// dead end — Swipe Review's marks live in this same selection and its deck is the
+    /// scanned catalog, so its "Review Cleanup" must open on a library that was never
+    /// analysed instead of behind an error screen the user cannot act on. The plan falls
+    /// back to the empty result exactly as the catalog-only sources do; the catalog gate
+    /// below still fail-closes, and records, sizes, confirmation, and staleness are
+    /// unchanged. The old test's analysis-gate half is replaced by
+    /// `prepareOpensReviewWhenTheAnalysisHasNotRun`, pinning the new intent.
+    @Test func prepareFailsCleanlyWithoutCompletedCatalog() async {
+        let (env, _) = makeEnv()
+        selectBoth(in: env)
+        env.catalogState = .notStarted
+        env.prepareDeletionPlan()
+        guard case .failed = env.deletionState else {
+            Issue.record("expected failed without catalog, got \(env.deletionState)")
+            return
+        }
+    }
+
+    @Test func prepareOpensReviewWhenTheAnalysisHasNotRun() async {
         let (env, _) = makeEnv()
         selectBoth(in: env)
         env.analysisState = .notStarted
         env.prepareDeletionPlan()
-        guard case .failed = env.deletionState else {
-            Issue.record("expected failed without analysis, got \(env.deletionState)")
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("expected readyForReview without analysis, got \(env.deletionState)")
             return
         }
-
-        let (second, _) = makeEnv()
-        selectBoth(in: second)
-        second.catalogState = .notStarted
-        second.prepareDeletionPlan()
-        guard case .failed = second.deletionState else {
-            Issue.record("expected failed without catalog, got \(second.deletionState)")
-            return
-        }
+        #expect(plan.count == 2)
+        #expect(plan.analysisSignature == DeletionPlanner.analysisSignature(for: .empty))
     }
 
     @Test func selectionChangeMakesAPreparedPlanStale() async {
@@ -84,6 +97,29 @@ struct DeletionFlowTests {
             return
         }
         #expect(reasons == [.selectionChanged])
+    }
+
+    /// S1: only a change to *what is marked* may stale the plan. Admission-only mutations
+    /// (Swipe Review re-admitting its whole deck on appear, for example) provably cannot
+    /// alter the plan's selection snapshot — staling on them told the user their prepared
+    /// review was out of date when nothing they chose had changed.
+    @Test func aMutationThatChangesNoMarksKeepsThePlanReady() async {
+        let (env, _) = makeEnv()
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+
+        env.mutateSelection { $0.admitLibraryAssets(["a", "b", "c"]) }
+
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected the plan to stay ready for a no-op mark mutation, got \(env.deletionState)")
+            return
+        }
+        #expect(env.selection.selectedCount == 2)
     }
 
     @Test func prepareIsGuardedWhileDeleting() async {
@@ -498,6 +534,34 @@ struct DeletionFlowTests {
 
         #expect(env.analysisState == before)
         #expect(env.deletionState == .deleting(plan))
+    }
+
+    /// D1: a confirmed deletion during an in-flight analysis used to strand the state at
+    /// `.running` forever — the run is cancelled and generation-superseded, but no terminal
+    /// state was ever written, and both scan entry points refuse to start over `.running`,
+    /// bricking the feature until relaunch. The mutation now lands `.cancelled`, the same
+    /// terminal write the sharpness pass already gets.
+    @Test func deletionDuringAnAnalysisCancelsItInsteadOfStrandingIt() async {
+        let (env, _) = makeEnv()
+        env.analysisState = .running(PhotoAnalysisProgress(
+            stage: .comparing, completedUnits: 1, totalUnits: 4
+        ))
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview over a running analysis, got \(env.deletionState)")
+            return
+        }
+
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .succeeded = env.deletionState else {
+            Issue.record("expected succeeded, got \(env.deletionState)")
+            return
+        }
+        #expect(env.analysisState == .cancelled)
     }
 
     @Test func reviewDidAppearDuringADeletionIsANoOp() {
