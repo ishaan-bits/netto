@@ -7,7 +7,7 @@ import SwiftUI
 /// view stores nothing itself except the currently open detail sheet. There is no deletion or
 /// mutation API anywhere in this file — the only writes are selection changes.
 struct SimilarPhotosView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var detailTarget: DetailTarget?
 
     private struct DetailTarget: Identifiable {
@@ -33,7 +33,7 @@ struct SimilarPhotosView: View {
             .onAppear { env.refreshPermissions() }
             .sheet(item: $detailTarget) { target in
                 PhotoDetailView(group: target.group, assetID: target.assetID)
-                    .environmentObject(env)
+                    .environment(env)
             }
     }
 
@@ -465,21 +465,21 @@ struct PhaseMessage: View {
     NavigationStack {
         SimilarPhotosView()
     }
-    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.result)))
+    .environment(PreviewData.environment(analysis: .completed(PreviewData.result)))
 }
 
 #Preview("Idle") {
     NavigationStack {
         SimilarPhotosView()
     }
-    .environmentObject(PreviewData.environment())
+    .environment(PreviewData.environment())
 }
 
 #Preview("Analyzing") {
     NavigationStack {
         SimilarPhotosView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             analysis: .running(PhotoAnalysisProgress(stage: .comparing, completedUnits: 7, totalUnits: 19))
         )
@@ -490,5 +490,5 @@ struct PhaseMessage: View {
     NavigationStack {
         SimilarPhotosView()
     }
-    .environmentObject(PreviewData.environment(permission: .notDetermined))
+    .environment(PreviewData.environment(permission: .notDetermined))
 }

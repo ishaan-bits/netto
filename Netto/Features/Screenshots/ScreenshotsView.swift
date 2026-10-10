@@ -10,7 +10,7 @@ import SwiftUI
 /// are selection changes. Thumbnails go through the same bounded `ThumbnailStore` as the
 /// review UI — never full-resolution pixels.
 struct ScreenshotsView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
 
     private var phase: ScreenshotsPhase {
         ScreenshotsPresentation.phase(
@@ -291,7 +291,7 @@ struct ScreenshotsView: View {
     NavigationStack {
         ScreenshotsView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(catalog: .completed(ScreenshotsFixture.completed))
     )
 }
@@ -300,14 +300,14 @@ struct ScreenshotsView: View {
     NavigationStack {
         ScreenshotsView()
     }
-    .environmentObject(PreviewData.environment())
+    .environment(PreviewData.environment())
 }
 
 #Preview("Building Catalog") {
     NavigationStack {
         ScreenshotsView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             catalog: .running(CatalogScanProgress(enumeratedCount: 40, totalCount: 120))
         )
@@ -318,7 +318,7 @@ struct ScreenshotsView: View {
     NavigationStack {
         ScreenshotsView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(catalog: .completed(ScreenshotsFixture.noScreenshotsResult))
     )
 }
@@ -327,5 +327,5 @@ struct ScreenshotsView: View {
     NavigationStack {
         ScreenshotsView()
     }
-    .environmentObject(PreviewData.environment(permission: .notDetermined))
+    .environment(PreviewData.environment(permission: .notDetermined))
 }

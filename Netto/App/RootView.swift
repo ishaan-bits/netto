@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import SwiftUI
 
 /// Which selection produced a deletion plan. Every source shares the one plan → confirmation →
@@ -11,8 +11,12 @@ enum DeletionSelectionSource: Sendable, Equatable {
     case blurReview
 }
 
+/// `@Observable` rather than `ObservableObject`: every view tracks only the properties it
+/// actually reads, so a selection toggle no longer invalidates the dashboard (and a progress
+/// tick no longer re-renders screens that never read progress).
 @MainActor
-final class AppEnvironment: ObservableObject {
+@Observable
+final class AppEnvironment {
     let storageProvider: any StorageProviding
     let photoPermission: any PhotoLibraryPermissionServicing
     let contactsPermission: any ContactsPermissionServicing
@@ -35,26 +39,30 @@ final class AppEnvironment: ObservableObject {
     /// record writes (and reload requests) instead of touching the real container.
     let widgetSummaryStore: any WidgetSummaryStoring
 
-    @Published var flowState: AppFlowState = .launching
-    @Published var prompt: PermissionPrompt = .none
-    @Published var photoPermissionState: PermissionState = .notDetermined
-    @Published var contactsPermissionState: PermissionState = .notDetermined
-    @Published var storageSnapshot: StorageSnapshot?
-    @Published var catalogState: CatalogScanState = .notStarted
-    @Published var analysisState: PhotoAnalysisState = .notStarted
+    var flowState: AppFlowState = .launching
+    var prompt: PermissionPrompt = .none
+    var photoPermissionState: PermissionState = .notDetermined
+    var contactsPermissionState: PermissionState = .notDetermined
+    var storageSnapshot: StorageSnapshot?
+    var catalogState: CatalogScanState = .notStarted {
+        didSet { blurDatasetGeneration &+= 1 }
+    }
+    var analysisState: PhotoAnalysisState = .notStarted
     /// When the current completed result reached its terminal state — from the restored
     /// snapshot on launch, or `Date()` on a fresh completion. `nil` before any scan has
     /// completed; drives the dashboard's dynamic "Last scanned …" text.
-    @Published var lastScanCompletedAt: Date?
-    @Published var selection = PhotoSelectionModel()
+    var lastScanCompletedAt: Date?
+    var selection = PhotoSelectionModel()
     /// Screenshots marked for cleanup — a filter over the catalog, not a second enumeration.
-    @Published var screenshotSelection = ScreenshotSelectionModel()
+    var screenshotSelection = ScreenshotSelectionModel()
     /// Videos marked for cleanup — a filter over the catalog, not a second enumeration.
-    @Published var videoSelection = DatasetSelectionModel()
+    var videoSelection = DatasetSelectionModel()
     /// The sharpness pass over the catalog's images (milestone 5B). In-memory only —
     /// unlike the similarity snapshot it is never persisted, so a verdict can never
     /// outlive the catalog it was computed over.
-    @Published var blurAnalysisState: BlurAnalysisState = .notStarted
+    var blurAnalysisState: BlurAnalysisState = .notStarted {
+        didSet { blurDatasetGeneration &+= 1 }
+    }
     /// Injected clock stamped into a completed result's `scannedAt`. Production uses the
     /// default (`Date()`); tests pin it so a completed run is exactly reproducible.
     var blurAnalysisClock: @Sendable () -> Date = { Date() }
@@ -62,23 +70,23 @@ final class AppEnvironment: ObservableObject {
     /// `PhotoSelectionModel` from `selection` (never the same instance): candidates are
     /// admitted through `admitLibraryAssets` — admission alone never selects anything —
     /// and sharing a model would let one feature's toggles mark photos in another.
-    @Published var blurSelection = PhotoSelectionModel()
+    var blurSelection = PhotoSelectionModel()
     /// Measured bytes for the video list: explicit resolution state the photo flows don't need
     /// (they resolve sizes only at review time), so the largest-first ordering can be honest.
-    @Published var videoSizeResolution: VideoSizeResolution = .idle
+    var videoSizeResolution: VideoSizeResolution = .idle
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
-    @Published var deletionState: DeletionState = .noSelection
+    var deletionState: DeletionState = .noSelection
     /// The space-freed summary for a completed deletion — set exactly once per outcome, in
     /// `handleDeletionOutcome`, together with `flowState == .deletionCompleted`, and only
     /// when at least one item was verified removed. Cleared the moment that result is
     /// dismissed; never set from the view layer, never persisted.
-    @Published var spaceFreedSummary: SpaceFreedSummary?
+    var spaceFreedSummary: SpaceFreedSummary?
     /// Duplicate Contacts: read + local duplicate detection state.
-    @Published var contactScanState: ContactScanState = .notStarted
+    var contactScanState: ContactScanState = .notStarted
     /// Selection over the duplicate group currently open.
-    @Published var contactSelection = ContactGroupSelection()
+    var contactSelection = ContactGroupSelection()
     /// The contacts action state machine (§16). Every change goes through `applyContactAction`.
-    @Published var contactActionState: ContactActionState = .noSelection
+    var contactActionState: ContactActionState = .noSelection
 
     private let makePhotoLibrary: @Sendable () throws -> any PhotoLibraryReading
     /// Contact enumeration seam (real store by default; fixtures in DEBUG/preview/tests).
@@ -101,7 +109,7 @@ final class AppEnvironment: ObservableObject {
     /// so a cancelled run can never overwrite a newer one's state.
     private var analysisGeneration = 0
     /// Progress coalescing (milestone 4C): the engine already throttles emissions, but every
-    /// event still lands in `@Published` storage — on a long scan the resulting update stream
+    /// event still lands in observed storage — on a long scan the resulting update stream
     /// starves the main actor and delays the terminal state by minutes (measured: ~18 min of
     /// drain after the pre-4C engine finished its own ~20 min). Apply a progress event only when the stage
     /// changes, a stage reaches its terminal count, or `progressCoalesceInterval` has passed
@@ -111,7 +119,7 @@ final class AppEnvironment: ObservableObject {
     private var lastAppliedStage: PhotoAnalysisStage?
     private let progressCoalesceInterval: TimeInterval = 0.25
     /// Rolling-throughput ETA for the active scan. Fed only at the coalesced progress points
-    /// below (analysis and catalog), read on demand by the dashboard — no extra @Published
+    /// below (analysis and catalog), read on demand by the dashboard — no extra observation
     /// traffic per asset, no second progress system.
     private var scanETAEstimator = ScanETAEstimator()
     /// Bumped on every plan build; a superseded build discards its result instead of writing it.
@@ -131,6 +139,16 @@ final class AppEnvironment: ObservableObject {
     var contactReviewChoice: ContactActionChoice?
     /// Which source the current/last plan was built from; confirmation validates against it.
     private var planSource: DeletionSelectionSource = .similarPhotos
+    /// Bumped by the `didSet`s on `catalogState` and `blurAnalysisState` — the two inputs of
+    /// the blur-candidate record cache. Selection and progress-unrelated writes never bump it.
+    @ObservationIgnored private var blurDatasetGeneration: UInt64 = 0
+    /// What `blurDatasetGeneration` the cache below reflects; starts as `UInt64.max` so the
+    /// first read always builds.
+    @ObservationIgnored private var builtBlurDatasetGeneration: UInt64 = .max
+    /// The cached blur-candidate records. Ignored by observation: it is written *during* the
+    /// read that misses, and mutating observed state inside a view update would re-invalidate
+    /// the very reader that is asking.
+    @ObservationIgnored private var builtBlurDatasetRecords: [PhotoAssetRecord] = []
 
     init(
         storageProvider: any StorageProviding = SystemStorageProvider(),
@@ -163,6 +181,32 @@ final class AppEnvironment: ObservableObject {
         self.scanSnapshotStore = scanSnapshotStore
         self.widgetSummaryStore = widgetSummaryStore
         self.deletionSessionToken = sessionToken
+    }
+
+    /// Blur-candidate records in catalog order, cached across renders.
+    ///
+    /// `BlurDataset.records` filters the *entire* catalog on every call — O(library) work
+    /// that used to run inside the blurry grid's render. Both inputs are read first (which
+    /// registers them with whatever observer is asking, so a change to either still
+    /// invalidates the reader), then the filter runs only when a `didSet` generation bump
+    /// says the cached build is stale. A progress tick never re-filters: the grid is not on
+    /// screen while the pass runs, and reads are what build the cache.
+    var blurDatasetRecords: [PhotoAssetRecord] {
+        guard case .completed(let catalog) = catalogState, !catalog.isEmpty else {
+            builtBlurDatasetRecords = []
+            builtBlurDatasetGeneration = blurDatasetGeneration
+            return []
+        }
+        guard case .completed(let blurResult) = blurAnalysisState else {
+            builtBlurDatasetRecords = []
+            builtBlurDatasetGeneration = blurDatasetGeneration
+            return []
+        }
+        if builtBlurDatasetGeneration != blurDatasetGeneration {
+            builtBlurDatasetRecords = BlurDataset.records(in: blurResult, catalog: catalog)
+            builtBlurDatasetGeneration = blurDatasetGeneration
+        }
+        return builtBlurDatasetRecords
     }
 
     func bootstrap() async {
@@ -1570,7 +1614,7 @@ extension AppEnvironment {
 }
 
 struct RootView: View {
-    @StateObject private var env = AppEnvironment.live()
+    @State private var env = AppEnvironment.live()
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -1586,12 +1630,12 @@ struct RootView: View {
                     SpaceFreedSummaryView(summary: summary, onDone: env.finishSpaceFreedSummary)
                 } else {
                     DashboardView()
-                        .environmentObject(env)
+                        .environment(env)
                 }
             case .dashboard, .scanning, .resultsAvailable, .review,
                  .deleting, .deletionFailed:
                 DashboardView()
-                    .environmentObject(env)
+                    .environment(env)
             }
         }
         .task {

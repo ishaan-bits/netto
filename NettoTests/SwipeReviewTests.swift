@@ -452,6 +452,39 @@ struct SwipeReviewTests {
         #expect(!env.selection.isSelected("e1"))
         #expect(model.cursor == 0)
     }
+
+    // MARK: Lazy deck install (the dashboard card's path)
+
+    @Test func deckInstallsIntoAnEmptySessionExactlyOnce() {
+        let model = SwipeReviewModel(items: [])
+
+        // An empty request never manufactures a deck — the empty state stays the empty state.
+        model.installDeckIfNeeded([])
+        #expect(model.items.isEmpty)
+
+        model.installDeckIfNeeded(libraryDeck(count: 3))
+        #expect(model.items.map(\.assetID) == ["lib1", "lib2", "lib3"])
+
+        // A second install is refused: the session that exists is the session that stays.
+        model.installDeckIfNeeded(libraryDeck(count: 5))
+        #expect(model.items.count == 3)
+    }
+
+    @Test func installNeverClobbersAnInFlightSession() {
+        let env = makeEnv()
+        env.selection.admitLibraryAssets(["lib1", "lib2", "lib3"])
+        let model = SwipeReviewModel(items: libraryDeck(count: 3))
+        env.mutateSelection { model.decide(.delete, selection: &$0) }
+
+        model.installDeckIfNeeded(libraryDeck(count: 9))
+
+        // Deck, cursor, and history are untouched — a later catalog write cannot rewind
+        // a review that is already under way.
+        #expect(model.items.count == 3)
+        #expect(model.cursor == 1)
+        #expect(model.history.count == 1)
+        #expect(model.canUndo)
+    }
 }
 
 // MARK: - Helpers

@@ -9,7 +9,7 @@ import SwiftUI
 /// scan and opening a group. Detection runs entirely on-device — contact data never leaves
 /// the process.
 struct DuplicateContactsView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
 
     private var phase: ContactsPhase {
         ContactsPresentation.phase(
@@ -251,20 +251,20 @@ struct DuplicateContactsView: View {
     NavigationStack {
         DuplicateContactsView()
     }
-    .environmentObject(PreviewData.contactsEnvironment())
+    .environment(PreviewData.contactsEnvironment())
 }
 
 #Preview("Permission") {
     NavigationStack {
         DuplicateContactsView()
     }
-    .environmentObject(PreviewData.contactsEnvironment(permission: .notDetermined))
+    .environment(PreviewData.contactsEnvironment(permission: .notDetermined))
 }
 
 #Preview("No Duplicates") {
     NavigationStack {
         DuplicateContactsView()
     }
-    .environmentObject(PreviewData.contactsEnvironment(noDuplicates: true))
+    .environment(PreviewData.contactsEnvironment(noDuplicates: true))
 }
 #endif

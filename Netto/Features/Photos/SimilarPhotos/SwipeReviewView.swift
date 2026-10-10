@@ -40,6 +40,15 @@ final class SwipeReviewModel: ObservableObject {
         self.items = items
     }
 
+    /// Installs a deck into an empty session — the lazy path the dashboard's card uses, so
+    /// the full item list is built once (on appear) instead of on every dashboard render.
+    /// Refuses to touch a session that already has items: an in-flight review's cursor and
+    /// history can never be clobbered by a later catalog write.
+    func installDeckIfNeeded(_ newItems: [SwipeReviewItem]) {
+        guard items.isEmpty, !newItems.isEmpty else { return }
+        items = newItems
+    }
+
     var isComplete: Bool { cursor >= items.count }
 
     var currentItem: SwipeReviewItem? {
@@ -104,7 +113,7 @@ final class SwipeReviewModel: ObservableObject {
 /// Exiting early (back gesture / system back) simply pops the stack: decisions already live
 /// in the shared selection, so every selection count updates immediately.
 struct SwipeReviewView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -114,9 +123,14 @@ struct SwipeReviewView: View {
     @State private var dragOffset: CGSize = .zero
     /// Drives the skeleton's shimmer sweep; only ever animated when Reduce Motion is off.
     @State private var shimmerSwept = false
+    /// An explicitly supplied deck (previews). Production passes `nil` and the deck is built
+    /// from the completed catalog on appear — the dashboard's card must not construct every
+    /// swipe item on each of its own renders.
+    private let presetItems: [SwipeReviewItem]?
 
-    init(items: [SwipeReviewItem]) {
-        _model = StateObject(wrappedValue: SwipeReviewModel(items: items))
+    init(items: [SwipeReviewItem]? = nil) {
+        presetItems = items
+        _model = StateObject(wrappedValue: SwipeReviewModel(items: items ?? []))
     }
 
     var body: some View {
@@ -126,11 +140,32 @@ struct SwipeReviewView: View {
             .navigationBarTitleDisplayMode(.inline)
             .nettoAppear()
             .onAppear {
+                installDeckFromCatalogIfNeeded()
                 admitDeck()
                 openCurrent()
             }
+            .onChange(of: env.catalogState) { _, _ in
+                // A scan finishing while the empty state is showing fills the deck in place;
+                // a session that already has items (in flight, done, or mid-review) keeps
+                // its deck — a later catalog write can never clobber cursor or history.
+                // Admission runs only on the empty→non-empty transition: a progress tick
+                // must never rebuild the admission set (O(library) per coalesced tick).
+                let wasEmpty = model.items.isEmpty
+                installDeckFromCatalogIfNeeded()
+                if wasEmpty, !model.items.isEmpty {
+                    admitDeck()
+                }
+            }
             .onChange(of: model.currentItem?.assetID) { _, _ in openCurrent() }
             .onDisappear { preview.close() }
+    }
+
+    /// Installs the deck from the completed catalog, exactly once per session, and only when
+    /// no explicit deck was supplied. No-op for an empty (not-yet-scanned) library.
+    private func installDeckFromCatalogIfNeeded() {
+        guard presetItems == nil, model.items.isEmpty,
+              case .completed(let catalog) = env.catalogState else { return }
+        model.installDeckIfNeeded(SwipeReviewPresentation.items(from: catalog))
     }
 
     @ViewBuilder
@@ -623,5 +658,5 @@ struct SwipeReviewView: View {
     NavigationStack {
         SwipeReviewView(items: SwipeReviewPresentation.items(from: PreviewData.result))
     }
-    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.result)))
+    .environment(PreviewData.environment(analysis: .completed(PreviewData.result)))
 }

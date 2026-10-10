@@ -8,7 +8,7 @@ import SwiftUI
 /// prepared plan the moment the selection changes. Nothing is pre-selected, and no "master"
 /// contact is chosen for the user.
 struct ContactGroupDetailView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
 
     let group: ContactDuplicateGroup

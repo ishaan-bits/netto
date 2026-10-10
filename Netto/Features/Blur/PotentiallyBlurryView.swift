@@ -11,7 +11,7 @@ import SwiftUI
 /// writes this view makes are selection changes. Thumbnails go through the same bounded
 /// `ThumbnailStore` as every other review grid — never full-resolution pixels.
 struct PotentiallyBlurryView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var detailItem: BlurDetailItem?
     @State private var reviewTab: BlurReviewTab = .all
 
@@ -196,7 +196,9 @@ struct PotentiallyBlurryView: View {
 
     private func resultsContent(_ result: BlurAnalysisResult) -> some View {
         let visibleIDs = Set(reviewTab.candidates(in: result).lazy.map(\.assetID))
-        let records = BlurDataset.records(in: result, catalog: catalogResult)
+        // Cached on the environment (invalidated by the catalog/analysis inputs themselves):
+        // the raw dataset is a full-catalog filter, not something to redo per render.
+        let records = env.blurDatasetRecords
             .filter { visibleIDs.contains($0.localIdentifier) }
         // One lookup table for the whole grid: the per-cell scan over every candidate was
         // O(catalog × candidates) on each render pass.
@@ -451,11 +453,6 @@ struct PotentiallyBlurryView: View {
         return message
     }
 
-    private var catalogResult: CatalogScanResult {
-        if case .completed(let result) = env.catalogState { return result }
-        return CatalogScanResult(records: [], libraryAssetCount: 0, accessLevel: .authorized)
-    }
-
     private var candidateCount: Int {
         guard case .results(let result) = phase else { return 0 }
         return result.candidates.count
@@ -485,7 +482,7 @@ private struct BlurDetailItem: Identifiable {
     NavigationStack {
         PotentiallyBlurryView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             catalog: .completed(BlurFixture.completedCatalog),
             blur: .completed(BlurFixture.result)
@@ -497,7 +494,7 @@ private struct BlurDetailItem: Identifiable {
     NavigationStack {
         PotentiallyBlurryView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(catalog: .completed(BlurFixture.completedCatalog))
     )
 }
@@ -506,7 +503,7 @@ private struct BlurDetailItem: Identifiable {
     NavigationStack {
         PotentiallyBlurryView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             catalog: .completed(BlurFixture.completedCatalog),
             blur: .running(BlurAnalysisProgress(completedUnits: 12, totalUnits: 40))
@@ -518,7 +515,7 @@ private struct BlurDetailItem: Identifiable {
     NavigationStack {
         PotentiallyBlurryView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             catalog: .completed(BlurFixture.completedCatalog),
             blur: .completed(BlurFixture.emptyResult)
@@ -530,12 +527,12 @@ private struct BlurDetailItem: Identifiable {
     NavigationStack {
         PotentiallyBlurryView()
     }
-    .environmentObject(PreviewData.environment())
+    .environment(PreviewData.environment())
 }
 
 #Preview("Permission") {
     NavigationStack {
         PotentiallyBlurryView()
     }
-    .environmentObject(PreviewData.environment(permission: .notDetermined))
+    .environment(PreviewData.environment(permission: .notDetermined))
 }

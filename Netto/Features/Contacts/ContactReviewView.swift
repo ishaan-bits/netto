@@ -10,7 +10,7 @@ import SwiftUI
 /// decision, and conflict shown here comes from the immutable `ContactActionPlan` — the view
 /// stores nothing but the dialog flag.
 struct ContactReviewView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
     @State private var showConfirmation = false
 

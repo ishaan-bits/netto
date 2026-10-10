@@ -314,6 +314,106 @@ struct PhotoAssetRecordTests {
         #expect(result.accessLevel == .limited)
         #expect(!result.isEmpty)
     }
+
+    // MARK: Derived facts (computed once at construction — never per render)
+
+    @Test func derivedFactsMatchTheReferenceFiltersExactly() {
+        let screenshot = makeRecord(id: "shot-1", subtypes: [.screenshot])
+        let video = makeRecord(id: "vid-1", mediaType: .video, duration: 42)
+        let live = makeRecord(id: "live-1", subtypes: [.livePhoto])
+        let adjusted = makeRecord(id: "edit-1", hasAdjustments: true)
+        let plain = makeRecord(id: "plain-1")
+        let records = [screenshot, video, live, adjusted, plain]
+        let result = CatalogScanResult(
+            records: records,
+            libraryAssetCount: 5,
+            accessLevel: .authorized
+        )
+
+        // The stored subsets are exactly what the old per-call filters produced — same
+        // members, same catalog order — so every dataset view keeps its previous output.
+        #expect(result.screenshotRecords == records.filter(\.isScreenshot))
+        #expect(result.videoRecords == records.filter(\.isVideo))
+        #expect(ScreenshotDataset.records(in: result) == result.screenshotRecords)
+        #expect(VideoDataset.records(in: result) == result.videoRecords)
+        #expect(
+            ScreenshotDataset.identifiers(in: result)
+                == Set(result.screenshotRecords.map(\.localIdentifier))
+        )
+        #expect(
+            VideoDataset.identifiers(in: result)
+                == Set(result.videoRecords.map(\.localIdentifier))
+        )
+        // The swipe card's thumbnail: first image in catalog order, never a video.
+        #expect(result.firstImageAssetID == "shot-1")
+        #expect(result.imageCount == 4)
+        #expect(result.videoCount == 1)
+        #expect(result.screenshotCount == 1)
+        #expect(result.livePhotoCount == 1)
+        #expect(result.adjustedCount == 1)
+    }
+
+    @Test func equalityComparesInputsOnly() {
+        let records = makeRecords(count: 4)
+        let base = CatalogScanResult(
+            records: records,
+            libraryAssetCount: 4,
+            accessLevel: .authorized
+        )
+
+        #expect(base == CatalogScanResult(
+            records: records,
+            libraryAssetCount: 4,
+            accessLevel: .authorized
+        ))
+        #expect(base != CatalogScanResult(
+            records: records,
+            libraryAssetCount: 99,
+            accessLevel: .authorized
+        ))
+        #expect(base != CatalogScanResult(
+            records: records,
+            libraryAssetCount: 4,
+            accessLevel: .limited
+        ))
+        #expect(base != CatalogScanResult(
+            records: Array(records.reversed()),
+            libraryAssetCount: 4,
+            accessLevel: .authorized
+        ))
+    }
+
+    @Test func deletionPruneRecomputesEveryDerivedFact() {
+        let records = [
+            makeRecord(id: "keep-shot", subtypes: [.screenshot]),
+            makeRecord(id: "drop-shot", subtypes: [.screenshot]),
+            makeRecord(id: "drop-video", mediaType: .video, duration: 12),
+            makeRecord(id: "keep-image"),
+        ]
+        let result = CatalogScanResult(
+            records: records,
+            libraryAssetCount: 4,
+            accessLevel: .authorized
+        )
+        #expect(result.screenshotCount == 2)
+        #expect(result.firstImageAssetID == "keep-shot")
+
+        let pruned = result.removingAssetIDs(["drop-shot", "drop-video"])
+
+        #expect(pruned.imageCount == 2)
+        #expect(pruned.videoCount == 0)
+        #expect(pruned.screenshotCount == 1)
+        #expect(pruned.videoRecords.isEmpty)
+        #expect(pruned.screenshotRecords.map(\.localIdentifier) == ["keep-shot"])
+        #expect(ScreenshotDataset.identifiers(in: pruned) == ["keep-shot"])
+        // The library count stays what the enumeration reported — a prune is not a rescan.
+        #expect(pruned.libraryAssetCount == 4)
+
+        // Removing the first image promotes the next one — the thumbnail fact never goes
+        // stale after a deletion.
+        let afterNext = pruned.removingAssetIDs(["keep-shot"])
+        #expect(afterNext.firstImageAssetID == "keep-image")
+    }
 }
 
 // MARK: - Scan state

@@ -248,9 +248,13 @@ enum SimilarPhotosPresentation {
 
 /// Countable facts about a finished run, computed once from the result.
 struct SimilarPhotosSummary: Sendable, Equatable {
+    /// Kept only so `groupedAssetCount` can stay lazy: the dashboard card never reads it, and
+    /// `totalGroupedAssetCount` allocates Sets over every grouped member — O(library) work
+    /// that must not run inside an unrelated card's render.
+    let result: PhotoAnalysisResult
+
     let exactGroupCount: Int
     let similarGroupCount: Int
-    let groupedAssetCount: Int
     let unavailableCount: Int
     /// Assets never requested because no candidate partner could exist — honest "not analyzed"
     /// without pretending anything failed.
@@ -260,14 +264,18 @@ struct SimilarPhotosSummary: Sendable, Equatable {
     let analyzedCount: Int
 
     init(result: PhotoAnalysisResult) {
+        self.result = result
         exactGroupCount = result.exactGroups.count
         similarGroupCount = result.similarGroups.count
-        groupedAssetCount = result.totalGroupedAssetCount
         unavailableCount = result.unavailableAssets.count
         skippedCount = result.skippedNoCandidateCount
         totalRecords = result.totalRecordCount
         analyzedCount = result.effectiveAnalyzedCount
     }
+
+    /// Assets involved in any group. Computed on read (not in `init`) so constructing a
+    /// summary — which the dashboard does every render — never walks the grouped members.
+    var groupedAssetCount: Int { result.totalGroupedAssetCount }
 
     /// No groups at all — the "nothing to review" result state.
     var hasNoGroups: Bool { exactGroupCount == 0 && similarGroupCount == 0 }

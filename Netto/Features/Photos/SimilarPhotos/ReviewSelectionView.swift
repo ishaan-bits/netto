@@ -9,7 +9,7 @@ import SwiftUI
 /// other than `.awaitingConfirmation`. Counts, sizes, and staleness all come from the immutable
 /// `DeletionPlan` through `DeletionPresentation` — this view stores nothing but the dialog flag.
 struct ReviewSelectionView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
     @State private var showConfirmation = false
 
@@ -396,5 +396,5 @@ private struct ReviewPhaseMessage: View {
     NavigationStack {
         ReviewSelectionView()
     }
-    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.result)))
+    .environment(PreviewData.environment(analysis: .completed(PreviewData.result)))
 }

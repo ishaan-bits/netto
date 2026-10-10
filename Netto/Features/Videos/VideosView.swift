@@ -13,7 +13,7 @@ import SwiftUI
 /// size-resolution start/cancel. Thumbnails come from the same bounded `ThumbnailStore` as the
 /// review UI — poster frames via PhotoKit, never an `AVAssetImageGenerator` per row.
 struct VideosView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var previewedVideo: PhotoAssetRecord?
 
     private var phase: VideosPhase {
@@ -374,7 +374,7 @@ struct VideosView: View {
     NavigationStack {
         VideosView()
     }
-    .environmentObject(previewEnvironment(
+    .environment(previewEnvironment(
         catalog: VideosFixture.completed,
         resolution: VideosFixture.settledPartial
     ))
@@ -384,7 +384,7 @@ struct VideosView: View {
     NavigationStack {
         VideosView()
     }
-    .environmentObject(previewEnvironment(
+    .environment(previewEnvironment(
         catalog: VideosFixture.completed,
         resolution: .measuring(
             VideoSizeResolution.Measurement(
@@ -400,14 +400,14 @@ struct VideosView: View {
     NavigationStack {
         VideosView()
     }
-    .environmentObject(PreviewData.environment())
+    .environment(PreviewData.environment())
 }
 
 #Preview("Empty") {
     NavigationStack {
         VideosView()
     }
-    .environmentObject(previewEnvironment(
+    .environment(previewEnvironment(
         catalog: VideosFixture.noVideosResult,
         resolution: .idle
     ))
@@ -417,7 +417,7 @@ struct VideosView: View {
     NavigationStack {
         VideosView()
     }
-    .environmentObject(PreviewData.environment(permission: .notDetermined))
+    .environment(PreviewData.environment(permission: .notDetermined))
 }
 
 @MainActor

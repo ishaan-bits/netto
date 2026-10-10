@@ -580,6 +580,40 @@ struct BlurAnalysisFlowTests {
         // And the sharpness pass itself was left alone.
         #expect(env.blurAnalysisState == .running(running))
     }
+
+    // MARK: Derived-cache correctness (the grid's record cache)
+
+    @Test func blurDatasetRecordsAreCatalogOrderedAndInputValidated() async {
+        let (env, result) = await completedBlurEnv()
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("fixture env did not complete its catalog")
+            return
+        }
+        #expect(!result.candidates.isEmpty)
+
+        // Exactly the reference filter, in catalog order — cached, but never wrong.
+        let candidateIDs = Set(result.candidates.map(\.assetID))
+        let reference = catalog.records.filter { candidateIDs.contains($0.localIdentifier) }
+        #expect(env.blurDatasetRecords == reference)
+        // Reading again serves the same content — the cache-hit path.
+        #expect(env.blurDatasetRecords == reference)
+
+        // A pruned catalog drops the removed candidate on the next read.
+        let removedID = result.candidates[0].assetID
+        env.catalogState = .completed(catalog.removingAssetIDs([removedID]))
+        #expect(!env.blurDatasetRecords.contains { $0.localIdentifier == removedID })
+
+        // Either input leaving its completed state empties the cache…
+        env.blurAnalysisState = .notStarted
+        #expect(env.blurDatasetRecords.isEmpty)
+        // …a completed analysis over no catalog stays empty…
+        env.blurAnalysisState = .completed(result)
+        env.catalogState = .notStarted
+        #expect(env.blurDatasetRecords.isEmpty)
+        // …and restoring both inputs rebuilds the full dataset.
+        env.catalogState = .completed(catalog)
+        #expect(env.blurDatasetRecords == reference)
+    }
 }
 
 // MARK: - Fixtures

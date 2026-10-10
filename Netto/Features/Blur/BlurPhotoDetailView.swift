@@ -21,7 +21,7 @@ struct BlurPhotoDetailView: View {
     /// than inventing one).
     let candidate: BlurCandidate?
 
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model: PhotoPreviewModel = PhotoPreviewModel()

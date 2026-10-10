@@ -48,20 +48,87 @@ struct CatalogScanResult: Sendable, Equatable {
     /// `.authorized` or `.limited` — whichever the app was actually reading under.
     let accessLevel: PermissionState
 
+    /// Derived facts, computed once in `init` from the record list so that dashboard cards,
+    /// presentation status, and dataset views never re-filter the full library per render.
+    /// Every field is a pure function of `records`, so `==` ignores them by construction.
+    let imageCount: Int
+    let videoCount: Int
+    let screenshotCount: Int
+    let livePhotoCount: Int
+    let adjustedCount: Int
+    /// The screenshot subset in catalog order — shared (CoW) rather than re-filtered.
+    let screenshotRecords: [PhotoAssetRecord]
+    /// The video subset in catalog order — shared (CoW) rather than re-filtered.
+    let videoRecords: [PhotoAssetRecord]
+    /// First image in catalog order (the swipe-review card's thumbnail), resolved once so the
+    /// dashboard never scans the full record list per render. `nil` for a video-only library.
+    let firstImageAssetID: String?
+
+    init(
+        records: [PhotoAssetRecord],
+        libraryAssetCount: Int,
+        accessLevel: PermissionState
+    ) {
+        self.records = records
+        self.libraryAssetCount = libraryAssetCount
+        self.accessLevel = accessLevel
+
+        var imageCount = 0
+        var videoCount = 0
+        var screenshotCount = 0
+        var livePhotoCount = 0
+        var adjustedCount = 0
+        var screenshotRecords: [PhotoAssetRecord] = []
+        var videoRecords: [PhotoAssetRecord] = []
+        var firstImageAssetID: String?
+
+        for record in records {
+            if record.isImage {
+                imageCount += 1
+                if firstImageAssetID == nil {
+                    firstImageAssetID = record.localIdentifier
+                }
+            }
+            if record.isVideo {
+                videoCount += 1
+                videoRecords.append(record)
+            }
+            if record.isScreenshot {
+                screenshotCount += 1
+                screenshotRecords.append(record)
+            }
+            if record.isLivePhoto { livePhotoCount += 1 }
+            if record.hasAdjustments { adjustedCount += 1 }
+        }
+
+        self.imageCount = imageCount
+        self.videoCount = videoCount
+        self.screenshotCount = screenshotCount
+        self.livePhotoCount = livePhotoCount
+        self.adjustedCount = adjustedCount
+        self.screenshotRecords = screenshotRecords
+        self.videoRecords = videoRecords
+        self.firstImageAssetID = firstImageAssetID
+    }
+
     var scannedAssetCount: Int { records.count }
     var isEmpty: Bool { records.isEmpty }
-    var imageCount: Int { records.lazy.filter(\.isImage).count }
-    var videoCount: Int { records.lazy.filter(\.isVideo).count }
-    var screenshotCount: Int { records.lazy.filter(\.isScreenshot).count }
-    var livePhotoCount: Int { records.lazy.filter(\.isLivePhoto).count }
-    var adjustedCount: Int { records.lazy.filter(\.hasAdjustments).count }
 
     /// Known byte total across the catalog. Assets with unknown size contribute nothing, so this
-    /// is a lower bound, not a claim about the library's real footprint.
+    /// is a lower bound, not a claim about the library's real footprint. Off the render path
+    /// (test/diagnostic use only), so it stays a computed fold.
     var knownSizeBytes: Int64 {
         records.reduce(Int64(0)) { total, record in
             total + (record.sizeInBytes ?? 0)
         }
+    }
+
+    /// Equality over the inputs only: the derived facts above are pure functions of `records`,
+    /// so comparing them would add an O(records) walk without changing any outcome.
+    static func == (lhs: CatalogScanResult, rhs: CatalogScanResult) -> Bool {
+        lhs.libraryAssetCount == rhs.libraryAssetCount
+            && lhs.accessLevel == rhs.accessLevel
+            && lhs.records == rhs.records
     }
 
     /// The same completed catalog with the given asset identifiers removed — in-place pruning

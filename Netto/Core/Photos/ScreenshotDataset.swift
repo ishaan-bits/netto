@@ -8,14 +8,17 @@ import Foundation
 /// already recorded.
 enum ScreenshotDataset {
     /// The screenshot records, in catalog order (the enumeration's newest-first order).
+    /// Read from the subset the catalog computed at construction — no re-filter of the
+    /// full library per call (the array is shared with the catalog, not copied).
     static func records(in result: CatalogScanResult) -> [PhotoAssetRecord] {
-        result.records.filter(\.isScreenshot)
+        result.screenshotRecords
     }
 
     /// Stable local identifiers of the screenshot subset — set semantics, so a duplicate id
-    /// in the record list can never inflate the dataset.
+    /// in the record list can never inflate the dataset. Built from the precomputed subset,
+    /// so the cost tracks the screenshot count, not the library size.
     static func identifiers(in result: CatalogScanResult) -> Set<String> {
-        Set(result.records.lazy.filter(\.isScreenshot).map(\.localIdentifier))
+        Set(result.screenshotRecords.map(\.localIdentifier))
     }
 
     /// Structural fingerprint of a screenshot dataset: membership + count, order-independent,

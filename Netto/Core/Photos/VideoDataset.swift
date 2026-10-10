@@ -8,14 +8,17 @@ import Foundation
 /// recorded.
 enum VideoDataset {
     /// The video records, in catalog order (the enumeration's newest-first order).
+    /// Read from the subset the catalog computed at construction — no re-filter of the
+    /// full library per call (the array is shared with the catalog, not copied).
     static func records(in result: CatalogScanResult) -> [PhotoAssetRecord] {
-        result.records.filter(\.isVideo)
+        result.videoRecords
     }
 
     /// Stable local identifiers of the video subset — set semantics, so a duplicate id
-    /// in the record list can never inflate the dataset.
+    /// in the record list can never inflate the dataset. Built from the precomputed subset,
+    /// so the cost tracks the video count, not the library size.
     static func identifiers(in result: CatalogScanResult) -> Set<String> {
-        Set(result.records.lazy.filter(\.isVideo).map(\.localIdentifier))
+        Set(result.videoRecords.map(\.localIdentifier))
     }
 
     /// Structural fingerprint of a video dataset: membership + count, order-independent,

@@ -8,7 +8,7 @@ import SwiftUI
 /// drawn over another. Every value on screen comes from `DashboardPresentation`,
 /// `StorageSnapshot`, or the phase enums of the four categories.
 struct DashboardView: View {
-    @EnvironmentObject private var env: AppEnvironment
+    @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var showPhotoPrePrompt = false
     @Namespace private var cardNamespace
 
@@ -208,7 +208,7 @@ struct DashboardView: View {
                     assetID: swipeReviewAssetID,
                     initials: nil,
                     step: 9,
-                    destination: { SwipeReviewView(items: swipeReviewDeck) }
+                    destination: { SwipeReviewView() }
                 )
 
                 // The on-device sharpness pass (milestone 5B): its own analysis over the
@@ -277,8 +277,15 @@ struct DashboardView: View {
         )
     }
 
+    /// First group member (exact groups first, then similar) — two no-allocation passes
+    /// instead of concatenating both group arrays on every render.
     private static func firstAssetID(in result: PhotoAnalysisResult) -> String? {
-        for group in result.exactGroups + result.similarGroups {
+        for group in result.exactGroups {
+            if let id = group.memberAssetIDs.first {
+                return id
+            }
+        }
+        for group in result.similarGroups {
             if let id = group.memberAssetIDs.first {
                 return id
             }
@@ -395,15 +402,10 @@ struct DashboardView: View {
     }
 
     /// Thumbnail asset for the card: the library's first image; nil until a scan completes.
+    /// Resolved once by the catalog itself — never a per-render scan of the record list.
     private var swipeReviewAssetID: String? {
         guard case .completed(let catalog) = env.catalogState else { return nil }
-        return catalog.records.first(where: \.isImage)?.localIdentifier
-    }
-
-    /// The deck the card pushes: every image in the scanned catalog, in catalog order.
-    private var swipeReviewDeck: [SwipeReviewItem] {
-        guard case .completed(let catalog) = env.catalogState else { return [] }
-        return SwipeReviewPresentation.items(from: catalog)
+        return catalog.firstImageAssetID
     }
 }
 
@@ -455,7 +457,7 @@ struct PermissionPrimingView: View {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(PreviewData.environment())
+    .environment(PreviewData.environment())
     .preferredColorScheme(.dark)
 }
 
@@ -463,7 +465,7 @@ struct PermissionPrimingView: View {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(PreviewData.environment())
+    .environment(PreviewData.environment())
     .preferredColorScheme(.light)
 }
 
@@ -471,14 +473,14 @@ struct PermissionPrimingView: View {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.result)))
+    .environment(PreviewData.environment(analysis: .completed(PreviewData.result)))
 }
 
 #Preview("Scanning") {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             analysis: .running(
                 PhotoAnalysisProgress(stage: .extractingFeatures, completedUnits: 120, totalUnits: 480)
@@ -491,21 +493,21 @@ struct PermissionPrimingView: View {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(PreviewData.environment(permission: .denied))
+    .environment(PreviewData.environment(permission: .denied))
 }
 
 #Preview("No results") {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(PreviewData.environment(analysis: .completed(PreviewData.resultWithoutGroups)))
+    .environment(PreviewData.environment(analysis: .completed(PreviewData.resultWithoutGroups)))
 }
 
 #Preview("Empty library") {
     NavigationStack {
         DashboardView()
     }
-    .environmentObject(
+    .environment(
         PreviewData.environment(
             catalog: .completed(
                 CatalogScanResult(records: [], libraryAssetCount: 0, accessLevel: .authorized)
@@ -520,7 +522,7 @@ struct PermissionPrimingView: View {
     return NavigationStack {
         DashboardView()
     }
-    .environmentObject(env)
+    .environment(env)
 }
 
 #Preview("Storage loading") {
@@ -529,7 +531,7 @@ struct PermissionPrimingView: View {
     return NavigationStack {
         DashboardView()
     }
-    .environmentObject(env)
+    .environment(env)
 }
 
 #Preview("Contacts · results") {
@@ -538,6 +540,6 @@ struct PermissionPrimingView: View {
     return NavigationStack {
         DashboardView()
     }
-    .environmentObject(env)
+    .environment(env)
 }
 #endif
