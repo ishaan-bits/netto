@@ -550,6 +550,73 @@ struct VideosFlowTests {
         #expect(env.videoSizeResolution == .idle)
     }
 
+    // MARK: Scan-job coordination (Phase B)
+
+    /// Video sizing is nonessential detail work: while a heavy pass owns the pipeline and
+    /// the cores, both entry points refuse the measurement outright — not queued, not
+    /// half-started.
+    @Test func measurementWaitsWhileAHeavyPassIsRunning() {
+        let withSimilarity = makeVideoEnv().env
+        withSimilarity.analysisState = .running(PhotoAnalysisProgress(
+            stage: .preparing,
+            completedUnits: 2,
+            totalUnits: 10
+        ))
+        withSimilarity.startVideoSizeResolution()
+        withSimilarity.resumeVideoSizeMeasurement()
+        #expect(withSimilarity.videoSizeResolution == .idle)
+
+        let withBlur = makeVideoEnv().env
+        withBlur.blurAnalysisState = .running(BlurAnalysisProgress(
+            completedUnits: 1,
+            totalUnits: 9
+        ))
+        withBlur.startVideoSizeResolution()
+        withBlur.resumeVideoSizeMeasurement()
+        #expect(withBlur.videoSizeResolution == .idle)
+    }
+
+    /// The view observes each pass's `isRunning` flag flipping to false and issues the
+    /// resume — the kept progress continues from where the yield left it.
+    @Test func measurementStartsOnceThePassFinishes() async {
+        let env = makeVideoEnv().env
+        env.analysisState = .running(PhotoAnalysisProgress(
+            stage: .preparing,
+            completedUnits: 2,
+            totalUnits: 10
+        ))
+        env.startVideoSizeResolution()
+        #expect(env.videoSizeResolution == .idle) // refused while the pass runs
+
+        env.analysisState = .completed(Fixtures.analysisResult) // the pass finished
+        env.resumeVideoSizeMeasurement() // VideosView's onChange observer
+
+        await waitForSettled(env)
+        #expect(isSettled(env.videoSizeResolution))
+    }
+
+    /// Starting similarity yields an in-flight measurement: the partial progress is kept as
+    /// a settled state (never discarded) and the run owns the pipeline from here.
+    @Test func startingSimilarityYieldsAnInFlightMeasurement() async {
+        let provider = RecordingSizeProvider(
+            sizes: VideosFixture.measuredBytes,
+            delayNanoseconds: 80_000_000
+        )
+        let env = makeVideoEnv(sizeProvider: provider).env
+        env.startVideoSizeResolution()
+        #expect(env.videoSizeResolution.isMeasuring)
+
+        env.startSimilarityAnalysis()
+
+        #expect(!env.videoSizeResolution.isMeasuring)
+        guard case .settled(let measurement) = env.videoSizeResolution else {
+            Issue.record("expected a settled partial measurement, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(measurement.total > 0)
+        env.cancelSimilarityAnalysis()
+    }
+
     @Test func catalogRebuildDropsAPreviousMeasurementBySignature() async {
         let (env, _) = makeVideoEnv()
         env.startVideoSizeResolution()

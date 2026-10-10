@@ -109,11 +109,19 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: localIdentifiers, options: fetchOptions)
         guard assets.count > 0 else { return [:] }
 
-        let width = max(1, maxConcurrentResolutions)
+        let policy = ScanConcurrencyPolicy()
         var results: [String: Int64] = [:]
 
         var index = 0
         while index < assets.count {
+            // Thermal-adaptive batch width, re-read every batch so pressure changes during a
+            // long video-size scan take effect; a critical state pauses between batches
+            // (non-throwing API: cancellation exits early with what has been measured).
+            while policy.isCriticallyPressed {
+                if Task.isCancelled { return results }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            let width = policy.width(base: maxConcurrentResolutions)
             let end = min(index + width, assets.count)
             let batch = (index..<end).map { assets.object(at: $0) }
             index = end

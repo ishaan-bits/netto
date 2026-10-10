@@ -199,6 +199,51 @@ struct BlurAnalysisFlowTests {
         #expect(narrowProbe.maxConcurrency <= 2)
     }
 
+    @Test func thermalPressureScalesTheEffectiveWorkerWidth() async throws {
+        // Serious thermal pressure halves the configured bound: the width recorded by the
+        // metrics is the *effective* width the run actually used, not the configured one.
+        let records = (0..<8).map { blurRecord(id: String(format: "thermal-%02d", $0)) }
+        var configuration = BlurAnalysisConfiguration()
+        configuration.maxConcurrentWorkers = 4
+        configuration.thermalState = { .serious }
+        let metrics = BlurAnalysisMetrics()
+        let engine = BlurAnalysisEngine(
+            configuration: configuration,
+            thumbnailLoader: BlurEngineThumbnails(
+                probe: BlurProbe(),
+                fallbackImage: blurFixtureSharpChecker,
+                delayNanos: 10_000_000
+            ),
+            metrics: metrics
+        )
+
+        _ = try await engine.analyze(records: records)
+
+        #expect(metrics.snapshot().counters[.workerWidth] == 2)
+    }
+
+    @Test func nominalThermalStateKeepsTheConfiguredWorkerWidth() async throws {
+        // The policy is a no-op at nominal pressure — the pre-thermal behaviour, pinned.
+        let records = (0..<8).map { blurRecord(id: String(format: "nominal-%02d", $0)) }
+        var configuration = BlurAnalysisConfiguration()
+        configuration.maxConcurrentWorkers = 4
+        configuration.thermalState = { .nominal }
+        let metrics = BlurAnalysisMetrics()
+        let engine = BlurAnalysisEngine(
+            configuration: configuration,
+            thumbnailLoader: BlurEngineThumbnails(
+                probe: BlurProbe(),
+                fallbackImage: blurFixtureSharpChecker,
+                delayNanos: 10_000_000
+            ),
+            metrics: metrics
+        )
+
+        _ = try await engine.analyze(records: records)
+
+        #expect(metrics.snapshot().counters[.workerWidth] == 4)
+    }
+
     @Test func instrumentationRecordsStagesCountersAndReasons() async throws {
         let records = [
             blurRecord(id: "sharp-01"),
@@ -579,6 +624,24 @@ struct BlurAnalysisFlowTests {
         #expect(env.selection.selectedIDs == ["sharp-01"])
         // And the sharpness pass itself was left alone.
         #expect(env.blurAnalysisState == .running(running))
+    }
+
+    /// The admission rule is symmetric (see `startBlurAnalysis`): while a similarity run
+    /// owns the analysis machinery, a sharpness pass is dropped before it snapshots or
+    /// supersedes anything.
+    @Test func sharpnessPassIsRefusedWhileSimilarityIsRunning() {
+        let (env, _, _) = makeBlurEnv()
+        let catalogBefore = env.catalogState
+        let analysisState = PhotoAnalysisProgress(stage: .preparing, completedUnits: 3, totalUnits: 10)
+        env.analysisState = .running(analysisState)
+
+        env.startBlurAnalysis()
+
+        // No run started, no failure substituted, nothing superseded — the guard returned.
+        #expect(env.blurAnalysisState == .notStarted)
+        #expect(env.analysisState == .running(analysisState))
+        #expect(env.catalogState == catalogBefore)
+        #expect(env.deletionState == .noSelection)
     }
 
     // MARK: Derived-cache correctness (the grid's record cache)

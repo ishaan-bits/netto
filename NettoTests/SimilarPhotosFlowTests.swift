@@ -374,19 +374,22 @@ struct SimilarPhotosFlowTests {
         expectFailureMessage(env, equals: "Photos access is required to read your library.")
     }
 
-    @Test func factoryFailureSurfacesItsOwnMessage() {
+    @Test func factoryFailureSurfacesItsOwnMessage() async {
         let env = makeEnv(permission: .authorized) {
             throw PhotoLibraryReadError.underlying("boom")
         }
         env.startSimilarityAnalysis()
+        // Reader creation happens inside the task now — wait for it to fail.
+        _ = await waitForAnalysis(env)
         expectFailureMessage(env, equals: "boom")
     }
 
-    @Test func accessDeniedFromFactoryMapsToThePermissionMessage() {
+    @Test func accessDeniedFromFactoryMapsToThePermissionMessage() async {
         let env = makeEnv(permission: .authorized) {
             throw PhotoLibraryReadError.accessDenied
         }
         env.startSimilarityAnalysis()
+        _ = await waitForAnalysis(env)
         expectFailureMessage(env, equals: "Photos access is required to read your library.")
     }
 
@@ -507,15 +510,21 @@ struct SimilarPhotosFlowTests {
         }
     }
 
-    @Test func catalogBuildUsesTheInjectedFactoryAndMapsDeniedAccess() {
+    @Test func catalogBuildUsesTheInjectedFactoryAndMapsDeniedAccess() async {
         let env = makeEnv(permission: .denied) {
             throw PhotoLibraryReadError.accessDenied
         }
         env.startCatalogBuild()
+        // The run commits as `.running` first; the reader (created inside the task) then
+        // fails with the mapped PhotoKit error.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while case .running = env.catalogState, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
         #expect(env.catalogState == .failed(.photoLibraryUnavailable))
     }
 
-    @Test func startingWhileRunningIsIgnored() {
+    @Test func startingWhileRunningIsIgnored() async {
         let calls = FactoryCallBox()
         let env = AppEnvironment(
             storageProvider: FakeStorage(),
@@ -530,9 +539,16 @@ struct SimilarPhotosFlowTests {
         )
         env.photoPermissionState = .authorized
         env.startSimilarityAnalysis()
+        // The factory runs inside the analysis task now — wait for its first call.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while calls.count == 0, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
         #expect(calls.count == 1)
 
+        // A second start is refused synchronously: no second factory call ever happens.
         env.startSimilarityAnalysis()
+        try? await Task.sleep(for: .milliseconds(100))
         #expect(calls.count == 1)
         #expect(env.analysisState.isRunning)
         env.cancelSimilarityAnalysis()
@@ -751,14 +767,24 @@ struct SimilarPhotosFlowTests {
 
 // MARK: - Fixtures
 
-/// Call counter for the injected library factory. `record()` and `count` are only ever touched
-/// from the main actor (the factory is invoked synchronously inside `AppEnvironment`), which is
-/// why an unchecked box is safe here.
+/// Call counter for the injected library factory. `record()` runs on the detached task that
+/// creates the reader (off the main actor) while `count` is read from the test's actor — a
+/// lock guards both.
 private final class FactoryCallBox: @unchecked Sendable {
+    private let lock = NSLock()
     private var calls = 0
 
-    func record() { calls += 1 }
-    var count: Int { calls }
+    func record() {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
 }
 
 private struct FakeLibrary: PhotoLibraryReading {

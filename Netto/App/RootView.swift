@@ -118,6 +118,13 @@ final class AppEnvironment {
     private var lastAppliedProgressAt: TimeInterval = 0
     private var lastAppliedStage: PhotoAnalysisStage?
     private let progressCoalesceInterval: TimeInterval = 0.25
+    /// Catalog progress coalescing — the same policy as above, tracked separately for the
+    /// catalog writes (a standalone build's `catalogState` and an analysis's `preparing`
+    /// stage): last applied write + last applied denominator. Reset at every run start.
+    /// The producer is untouched; only the main-actor write rate is bounded (≤ 4/s), and a
+    /// changed denominator or a terminal count always applies immediately.
+    private var lastAppliedCatalogProgressAt: TimeInterval = 0
+    private var lastAppliedCatalogTotal: Int = -1
     /// Rolling-throughput ETA for the active scan. Fed only at the coalesced progress points
     /// below (analysis and catalog), read on demand by the dashboard — no extra observation
     /// traffic per asset, no second progress system.
@@ -242,7 +249,7 @@ final class AppEnvironment {
     /// ignored (the fresh result is already on screen) and never fails the scan itself.
     /// Returns the completion date so the caller can publish it to the widget summary.
     @discardableResult
-    private func persistCompletedScan(_ result: PhotoAnalysisResult) -> Date {
+    private func persistCompletedScan(_ result: PhotoAnalysisResult) async -> Date {
         let completedAt = Date()
         let snapshot = ScanSnapshot(
             schemaVersion: ScanSnapshot.currentSchemaVersion,
@@ -250,7 +257,15 @@ final class AppEnvironment {
             completedAt: completedAt,
             result: result
         )
-        try? scanSnapshotStore.save(snapshot)
+        let store = scanSnapshotStore
+        // The snapshot write is file IO over potentially megabytes — keep it off the main
+        // actor. It is awaited (so callers and tests still observe the persisted state
+        // deterministically) but it no longer blocks main-actor progress: the result is
+        // already on screen as `.completed` before this returns. Best-effort as before:
+        // a failed write is ignored and never fails the scan.
+        await Task.detached(priority: .utility) {
+            try? store.save(snapshot)
+        }.value
         lastScanCompletedAt = completedAt
         return completedAt
     }
@@ -369,16 +384,10 @@ final class AppEnvironment {
         catalogGeneration += 1
         let generation = catalogGeneration
 
-        let reading: any PhotoLibraryReading
-        do {
-            reading = try makePhotoLibrary()
-        } catch let error as PhotoLibraryReadError {
-            catalogState = .failed(error.catalogFailure)
-            return
-        } catch {
-            catalogState = .failed(.underlying("Photos access is required to read your library."))
-            return
-        }
+        // A fresh run starts from no applied sample and an unknown denominator, so the
+        // first event of each kind applies immediately instead of waiting out the interval.
+        lastAppliedCatalogProgressAt = 0
+        lastAppliedCatalogTotal = -1
 
         let builder = PhotoCatalogBuilder()
         scanETAEstimator.reset()
@@ -388,18 +397,30 @@ final class AppEnvironment {
             total: CatalogScanProgress.indeterminate.totalCount,
             at: ScanETAEstimator.monotonicNow()
         )
+        // Committed before the reader exists: creating it (a `PHAsset.fetchAssets` round
+        // trip that materializes the whole library) now runs inside the task on the
+        // cooperative pool, so this method returns immediately either way — a reader
+        // failure lands in the task's catch below instead of synchronously here.
         catalogState = .running(.indeterminate)
 
         catalogTask = Task { [weak self] in
             guard let self else { return }
+            let factory = self.makePhotoLibrary
             do {
+                let reading = try await Task.detached(priority: .userInitiated) {
+                    try factory()
+                }.value
                 for try await event in builder.makeScanStream(reading: reading) {
                     // A superseded run stops immediately: every write below would land data
                     // from an older read on top of newer state.
                     guard self.isCurrentCatalog(generation) else { return }
                     switch event {
                     case .progress(let progress):
-                        if self.catalogState.isRunning {
+                        if self.catalogState.isRunning,
+                           self.shouldApplyCatalogProgress(
+                               totalCount: progress.totalCount,
+                               isComplete: progress.isComplete
+                           ) {
                             self.catalogState = .running(progress)
                             self.scanETAEstimator.record(
                                 stage: "catalog",
@@ -412,6 +433,9 @@ final class AppEnvironment {
                         self.noteCatalogCompleted(result, standalone: true)
                     }
                 }
+            } catch let error as PhotoLibraryReadError {
+                guard self.isCurrentCatalog(generation) else { return }
+                self.catalogState = .failed(error.catalogFailure)
             } catch is CancellationError {
                 guard self.isCurrentCatalog(generation) else { return }
                 self.catalogState = .cancelled
@@ -461,6 +485,10 @@ final class AppEnvironment {
             analysisState = .failed(.underlying("Photos access is required to read your library."))
             return
         }
+        // Video sizes are nonessential detail work: a run about to own the thumbnail
+        // pipeline and the cores yields the measurement (its progress is kept as a settled,
+        // partial state and resumes when the run finishes — see VideosView's observers).
+        cancelVideoSizeResolution()
 
         // A fresh analysis supersedes any prepared plan.
         planBuildGeneration += 1
@@ -478,20 +506,14 @@ final class AppEnvironment {
             catalogState = .cancelled
         }
 
-        let reading: any PhotoLibraryReading
-        do {
-            reading = try makePhotoLibrary()
-        } catch let error as PhotoLibraryReadError {
-            analysisState = .failed(Self.analysisFailure(for: error))
-            return
-        } catch {
-            analysisState = .failed(.underlying("Photos access is required to read your library."))
-            return
-        }
-
         lastAppliedProgressAt = 0
         lastAppliedStage = nil
+        lastAppliedCatalogProgressAt = 0
+        lastAppliedCatalogTotal = -1
         scanETAEstimator.reset()
+        // Committed before the reader exists: reader creation runs inside the task on the
+        // cooperative pool (see `startCatalogBuild`), so a failure surfaces through the
+        // task's PhotoLibraryReadError catch rather than synchronously here.
         analysisState = .running(
             PhotoAnalysisProgress(stage: .preparing, completedUnits: 0, totalUnits: 0)
         )
@@ -504,26 +526,43 @@ final class AppEnvironment {
         let engine: PhotoSimilarityEngine
         if ProcessInfo.processInfo.environment["NETTO_SCAN_METRICS"] == "1" {
             engine = PhotoSimilarityEngine(
+                // The shared loader (and its shared asset-reference cache): the
+                // perceptual/verification/sharpness passes reuse resolved references
+                // instead of re-fetching them per stage.
+                thumbnailLoader: thumbnailLoader,
                 stageObserver: SignpostStageObserver(),
                 metrics: AnalysisMetrics()
             )
         } else {
-            engine = PhotoSimilarityEngine()
+            engine = PhotoSimilarityEngine(thumbnailLoader: thumbnailLoader)
         }
         #else
-        let engine = PhotoSimilarityEngine()
+        let engine = PhotoSimilarityEngine(thumbnailLoader: thumbnailLoader)
         #endif
 
         analysisTask = Task { [weak self] in
             guard let self else { return }
+            let factory = self.makePhotoLibrary
 
             // Stage A — metadata catalog read, reported as `preparing`.
             var built: CatalogScanResult?
             do {
+                // The reader is created off the main actor — a `PHAsset.fetchAssets`
+                // round trip over the whole library costs no main-thread time either way.
+                let reading = try await Task.detached(priority: .userInitiated) {
+                    try factory()
+                }.value
                 for try await event in builder.makeScanStream(reading: reading) {
                     guard self.isCurrentAnalysis(generation) else { return }
                     switch event {
                     case .progress(let progress):
+                        // Coalesced under the catalog policy (see `shouldApplyCatalogProgress`):
+                        // the enumeration phase no longer writes observed storage once per
+                        // event, which for a 40k library is thousands of unneeded writes.
+                        guard self.shouldApplyCatalogProgress(
+                            totalCount: progress.totalCount,
+                            isComplete: progress.isComplete
+                        ) else { break }
                         self.analysisState = .running(PhotoAnalysisProgress(
                             stage: .preparing,
                             completedUnits: progress.enumeratedCount,
@@ -584,7 +623,7 @@ final class AppEnvironment {
                         sawCompletion = true
                         self.selection = PhotoSelectionModel(result: result)
                         self.analysisState = .completed(result)
-                        let completedAt = self.persistCompletedScan(result)
+                        let completedAt = await self.persistCompletedScan(result)
                         await self.writeWidgetSummaryAfterScanCompleted(at: completedAt)
                     }
                 }
@@ -647,6 +686,27 @@ final class AppEnvironment {
         )
     }
 
+    /// Catalog progress coalescing, shared by a standalone build and Stage A of an analysis:
+    /// apply when the denominator changed (…of a *different* total — the value readers key
+    /// off), when the count is terminal (a run's last tick must not be swallowed), or when
+    /// `progressCoalesceInterval` has passed. Every other event is dropped — its counters
+    /// are not lost: the next applied event carries the newest ones, and completion is its
+    /// own unconditional event. The producer is untouched; this only bounds the main-actor
+    /// write rate, never raises it, and never delays cancellation, completion, or failure.
+    /// Callers record into the ETA estimator only when this returns `true`, so the
+    /// estimator's samples match what the UI actually saw.
+    private func shouldApplyCatalogProgress(totalCount: Int, isComplete: Bool) -> Bool {
+        let now = Date().timeIntervalSinceReferenceDate
+        if lastAppliedCatalogTotal != totalCount || isComplete {
+            lastAppliedCatalogTotal = totalCount
+            lastAppliedCatalogProgressAt = now
+            return true
+        }
+        guard now - lastAppliedCatalogProgressAt >= progressCoalesceInterval else { return false }
+        lastAppliedCatalogProgressAt = now
+        return true
+    }
+
     /// The active scan's current-stage estimate. Computed on read from the rolling estimator
     /// — the view formats it; no arithmetic and no additional state writes live in SwiftUI.
     func scanETA() -> ScanETA {
@@ -672,13 +732,19 @@ final class AppEnvironment {
     /// Runs the sharpness pass over the images of the *already completed* catalog.
     ///
     /// Read-only and local-only: it measures bounded thumbnails through the same loader
-    /// seam every other pass uses, never touches the photo library, and never waits on
-    /// similarity analysis (the two passes are independent reads of one catalog). Starting
+    /// seam every other pass uses and never touches the photo library. The two passes are
+    /// admitted symmetrically — a sharpness pass refuses to start while similarity analysis
+    /// is running, and a similarity run refuses while sharpness is running (each pass
+    /// snapshots the catalog it was started with, and both contend for the same thumbnail
+    /// pipeline and cores; one heavy pass at a time is the coordination rule). Starting
     /// it also invalidates any prepared deletion review — plans are bound to the dataset
     /// they were built from — and resets the blur selection, so a fresh run always opens
     /// with nothing marked.
     func startBlurAnalysis() {
         guard !blurAnalysisState.isRunning else { return }
+        // Symmetric admission: the similarity pass owns the analysis machinery while it
+        // runs — refused, not queued (an explicit user action; they can retry).
+        guard !analysisState.isRunning else { return }
         // Never rebuild datasets underneath an in-flight Photos mutation.
         guard !deletionState.isDeleting else { return }
         guard photoPermissionState.isUsable else {
@@ -689,6 +755,8 @@ final class AppEnvironment {
             blurAnalysisState = .failed(.underlying("Your library scan has not finished. Build your catalog, then try again."))
             return
         }
+        // Yield nonessential work to the incoming pass (see `startSimilarityAnalysis`).
+        cancelVideoSizeResolution()
 
         // A fresh pass supersedes any prepared plan.
         planBuildGeneration += 1
@@ -1136,7 +1204,7 @@ final class AppEnvironment {
             }
             // Photos changed, the scan did not: apply only the confirmed removals to the
             // completed results instead of invalidating them back to "start analysis".
-            preserveResultsAfterDeletion(removing: plannedIDs.subtracting(success.remainingIDs))
+            await preserveResultsAfterDeletion(removing: plannedIDs.subtracting(success.remainingIDs))
             await refreshStorage()
             // Only now — outcome applied, results pruned, storage refreshed — may a success
             // summary exist, so the UI can never show success before the operation finished.
@@ -1189,8 +1257,16 @@ final class AppEnvironment {
     /// the persisted snapshot, which keeps the original scan's identity), the catalog loses
     /// only the removed records, and the screenshot/video filters reconcile against that
     /// pruned catalog. No rescan is started; failure outcomes never reach here.
-    private func preserveResultsAfterDeletion(removing deletedAssetIDs: Set<String>) {
+    private func preserveResultsAfterDeletion(removing deletedAssetIDs: Set<String>) async {
         planBuildGeneration += 1
+        // Deletion invalidation: nothing derived from a removed asset may outlive it —
+        // neither the resolved asset references (a stale `PHAsset` handle) nor cached
+        // renditions at any size. LRU eviction is the memory bound; this is the
+        // correctness hook (only reached for confirmed successes).
+        if !deletedAssetIDs.isEmpty {
+            PhotoAssetReferenceCache.shared.invalidate(assetIDs: deletedAssetIDs)
+            await thumbnails.remove(assetIDs: deletedAssetIDs)
+        }
         // `planSource` is deliberately left at the source that produced this deletion:
         // overwriting it here made a foreign outcome (screenshots/videos/blur) look like a
         // similar-photos result on the next review appearance, so that screen showed the
@@ -1244,7 +1320,7 @@ final class AppEnvironment {
             let updated = result.removingAssets(deletedAssetIDs, catalogRecords: recordsByID)
             analysisState = .completed(updated)
             selection = PhotoSelectionModel(result: updated, preserving: selection, removing: deletedAssetIDs)
-            persistUpdatedScanResult(updated)
+            await persistUpdatedScanResult(updated)
         }
 
         // In-place prune of the sharpness result — the confirmed removals leave it, the
@@ -1273,7 +1349,7 @@ final class AppEnvironment {
     /// scan happened: same `scanID` and `completedAt` as the snapshot this result came from,
     /// so the store keeps describing one completed scan. A fresh snapshot is written only
     /// when nothing was persisted yet (tests set results directly).
-    private func persistUpdatedScanResult(_ result: PhotoAnalysisResult) {
+    private func persistUpdatedScanResult(_ result: PhotoAnalysisResult) async {
         if let existing = scanSnapshotStore.loadLatest() {
             let snapshot = ScanSnapshot(
                 schemaVersion: ScanSnapshot.currentSchemaVersion,
@@ -1281,10 +1357,13 @@ final class AppEnvironment {
                 completedAt: existing.completedAt,
                 result: result
             )
-            try? scanSnapshotStore.save(snapshot)
+            let store = scanSnapshotStore
+            await Task.detached(priority: .utility) {
+                try? store.save(snapshot)
+            }.value
             lastScanCompletedAt = existing.completedAt
         } else {
-            persistCompletedScan(result)
+            await persistCompletedScan(result)
         }
     }
 
@@ -1468,6 +1547,11 @@ final class AppEnvironment {
     /// settles again without calling the provider.
     func resumeVideoSizeMeasurement() {
         guard !videoSizeResolution.isMeasuring else { return }
+        // Heavy passes take the cores and the thumbnail pipeline; video measurement is
+        // nonessential detail work and waits for them (VideosView restarts it when a pass
+        // finishes, or the user taps "Measure Sizes").
+        guard !analysisState.isRunning else { return }
+        guard !blurAnalysisState.isRunning else { return }
         guard photoPermissionState.isUsable else { return }
         guard case .completed(let catalog) = catalogState else { return }
 

@@ -57,6 +57,16 @@ struct VideosView: View {
             .onChange(of: env.photoPermissionState) { _, _ in
                 env.startVideoSizeResolution()
             }
+            // Heavy passes suspend measurement while they run (the AppEnvironment guards
+            // refuse the start); the moment either finishes, the kept progress continues —
+            // without this observer, a measurement interrupted by a pass would sit settled
+            // and partial until the user tapped "Measure Sizes".
+            .onChange(of: env.analysisState.isRunning) { _, running in
+                if !running { env.resumeVideoSizeMeasurement() }
+            }
+            .onChange(of: env.blurAnalysisState.isRunning) { _, running in
+                if !running { env.resumeVideoSizeMeasurement() }
+            }
             // Leaving the screen during measurement cancels it: the progress kept so far is
             // kept (as a settled, possibly partial state), the rest is simply not measured.
             .onDisappear { env.cancelVideoSizeResolution() }

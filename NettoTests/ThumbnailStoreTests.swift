@@ -103,6 +103,40 @@ struct ThumbnailStoreTests {
         #expect(detail.width >= strip.width)
     }
 
+    @Test func removingAnAssetDropsEverySizeOfOnlyThatAsset() async throws {
+        let log = CallLog()
+        let store = ThumbnailStore(loader: StubLoader(log: log), capacity: 8)
+
+        _ = try await store.image(for: "a", targetPixelSize: 96)
+        _ = try await store.image(for: "a", targetPixelSize: 300)
+        _ = try await store.image(for: "b", targetPixelSize: 96)
+        // Sizes are distinct keys: "a" loaded once per size, "b" once.
+        #expect(log.count("a") == 2)
+        #expect(log.count("b") == 1)
+
+        // Deletion invalidation: every rendition of "a" (all sizes share the prefix) leaves…
+        await store.remove(assetIDs: ["a"])
+
+        _ = try await store.image(for: "a", targetPixelSize: 96)
+        _ = try await store.image(for: "a", targetPixelSize: 300)
+        // …while "b" never reloaded: it was not named.
+        _ = try await store.image(for: "b", targetPixelSize: 96)
+        #expect(log.count("a") == 4)
+        #expect(log.count("b") == 1)
+    }
+
+    @Test func removingUnknownOrNoAssetsIsANoOp() async throws {
+        let log = CallLog()
+        let store = ThumbnailStore(loader: StubLoader(log: log), capacity: 8)
+        _ = try await store.image(for: "a", targetPixelSize: 96)
+
+        await store.remove(assetIDs: [])
+        await store.remove(assetIDs: ["never-loaded"])
+
+        _ = try await store.image(for: "a", targetPixelSize: 96)
+        #expect(log.count("a") == 1)
+    }
+
     @Test func failuresAreCachedAndTheFirstCallerGetsTheOriginalError() async {
         let log = CallLog()
         let store = ThumbnailStore(loader: StubLoader(log: log, failures: ["gone"]), capacity: 8)

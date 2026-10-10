@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import Photos
 import Testing
 @testable import Netto
 
@@ -1100,6 +1101,137 @@ struct PhotoSimilarityEngineTests {
         #expect(result.similarGroups.isEmpty)
         #expect(result.exactGroups.isEmpty)
         #expect(result.unavailableAssets.isEmpty)
+    }
+
+    // MARK: Asset-reference reuse across runs (Phase B)
+
+    /// The deterministic request-count measurement for the reference cache: two runs of the
+    /// real engine over the same two records — forced into one candidate bucket by identical
+    /// dimensions and dates, so both runs issue thumbnail requests — share one injected
+    /// cache. The first run pays one `PHAsset` fetch per asset (misses); the second must
+    /// fetch nothing new (misses frozen) and serve every repeat lookup from the cache.
+    /// Runs against the simulator's seeded library; without it (or authorization) there is
+    /// nothing to resolve, so the test returns like the loader's request probe.
+    @Test func aSecondRunOverTheSameRecordsFetchesNoNewAssetReferences() async throws {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else { return }
+        let fetch = PHAsset.fetchAssets(with: PHFetchOptions())
+        guard fetch.count >= 2 else { return }
+
+        let assetA = fetch.object(at: 0)
+        let assetB = fetch.object(at: 1)
+        // Identical aspect ratio bucket + identical date bucket → a guaranteed candidate
+        // pair, so both records take the thumbnail path on both runs.
+        let records = [
+            makeRecord(id: assetA.localIdentifier, pixelWidth: 4032, pixelHeight: 3024),
+            makeRecord(id: assetB.localIdentifier, pixelWidth: 4032, pixelHeight: 3024),
+        ]
+
+        let cache = PhotoAssetReferenceCache(capacity: 16)
+        let loader = PhotoKitThumbnailLoader(assetCache: cache)
+
+        _ = try await makeEngine(thumbnails: loader).analyze(records: records)
+        let missesAfterFirstRun = cache.missCount
+        #expect(missesAfterFirstRun >= 1)
+
+        _ = try await makeEngine(thumbnails: loader).analyze(records: records)
+
+        // No new daemon round trips — the repeat run resolved everything from the cache.
+        #expect(cache.missCount == missesAfterFirstRun)
+        #expect(cache.hitCount > 0)
+    }
+}
+
+// MARK: Thermal-aware concurrency policy
+
+/// Mutable thermal source for the policy tests. `@unchecked Sendable`: access under lock.
+private final class ThermalStateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state: ProcessInfo.ThermalState
+
+    init(_ state: ProcessInfo.ThermalState) {
+        self.state = state
+    }
+
+    func set(_ newState: ProcessInfo.ThermalState) {
+        lock.lock()
+        state = newState
+        lock.unlock()
+    }
+
+    func get() -> ProcessInfo.ThermalState {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+}
+
+struct ScanConcurrencyPolicyTests {
+    @Test func widthScalesTheConfiguredBoundByThermalState() {
+        func width(_ state: ProcessInfo.ThermalState, base: Int) -> Int {
+            ScanConcurrencyPolicy(thermalState: { state }).width(base: base)
+        }
+
+        // Thermal headroom keeps the configured bound; pressure steps it down…
+        #expect(width(.nominal, base: 4) == 4)
+        #expect(width(.fair, base: 4) == 3) // three quarters
+        #expect(width(.serious, base: 4) == 2) // halved
+        #expect(width(.critical, base: 4) == 1) // a quarter, floored
+        #expect(width(.serious, base: 64) == 32)
+        #expect(width(.critical, base: 64) == 16)
+        // …and the effective width never drops below one: even a critical device still
+        // makes progress (never a stalled run).
+        #expect(width(.fair, base: 1) == 1)
+        #expect(width(.serious, base: 1) == 1)
+        #expect(width(.critical, base: 1) == 1)
+        #expect(width(.critical, base: 0) == 1)
+    }
+
+    @Test func waitReturnsImmediatelyBelowCriticalPressure() async throws {
+        let box = ThermalStateBox(.serious)
+        let policy = ScanConcurrencyPolicy(thermalState: { box.get() })
+
+        #expect(!policy.isCriticallyPressed)
+        try await policy.waitWhileCritical(pollInterval: .milliseconds(1))
+        // Reaching this line without delay is the assertion: non-critical pressure never
+        // pauses work.
+    }
+
+    @Test func criticalPressureHoldsTheWaitUntilItEases() async throws {
+        let box = ThermalStateBox(.critical)
+        let policy = ScanConcurrencyPolicy(thermalState: { box.get() })
+        #expect(policy.isCriticallyPressed)
+
+        let started = ContinuousClock.now
+        let easer = Task {
+            try await Task.sleep(for: .milliseconds(120))
+            box.set(.fair)
+        }
+        try await policy.waitWhileCritical(pollInterval: .milliseconds(5))
+        try await easer.value
+
+        // The wait held for (about) the whole critical window — it did not return while
+        // the device was still pressed — and released once the state eased.
+        #expect(ContinuousClock.now - started >= .milliseconds(100))
+        #expect(!policy.isCriticallyPressed)
+    }
+
+    @Test func cancellingAPausedWaitPropagatesCancellationImmediately() async {
+        let box = ThermalStateBox(.critical) // never eases during this test
+        let policy = ScanConcurrencyPolicy(thermalState: { box.get() })
+        let task = Task { try await policy.waitWhileCritical(pollInterval: .milliseconds(250)) }
+
+        try? await Task.sleep(for: .milliseconds(30))
+        task.cancel()
+
+        do {
+            try await task.value
+            Issue.record("a cancelled pause must throw CancellationError, not return")
+        } catch is CancellationError {
+            // Expected: a user cancel is never held hostage by the thermal pause.
+        } catch {
+            Issue.record("expected CancellationError, got \(error)")
+        }
     }
 }
 

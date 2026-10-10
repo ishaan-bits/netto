@@ -3,9 +3,9 @@ import Foundation
 
 struct BlurAnalysisConfiguration: Sendable, Equatable {
     /// Fixed worker width. Never one task per asset: peak memory (bounded thumbnails) and
-    /// CPU utilization stay fixed regardless of library size. Kept at half the similarity
-    /// engine's default so a user who runs both passes concurrently still gets both
-    /// finished without oversubscribing the main cores.
+    /// CPU utilization stay fixed regardless of library size. Job coordination keeps the
+    /// sharpness pass from *overlapping* the similarity pass (see `startBlurAnalysis`);
+    /// within a run the width is further scaled down by the thermal policy.
     var maxConcurrentWorkers: Int = 4
     /// Longest thumbnail side requested from PhotoKit — the local-only, bounded analysis
     /// rendition (same pixel budget as the similarity engine's verification pass).
@@ -15,8 +15,20 @@ struct BlurAnalysisConfiguration: Sendable, Equatable {
     var analysisSide: Int = BlurSharpnessAnalyzer.defaultAnalysisSide
     /// Classification thresholds. Defaults to the synthetic-calibrated values.
     var thresholds: BlurThresholds = .corpusCalibrated
+    /// Where the run reads the device's thermal state (`ScanConcurrencyPolicy`). A policy
+    /// source, not a tuning value — excluded from `==` (see below).
+    var thermalState: @Sendable () -> ProcessInfo.ThermalState = { ProcessInfo.processInfo.thermalState }
 
     init() {}
+
+    /// Equality over the tuning values only (thermal source is a function, not a tuning
+    /// value — see `PhotoAnalysisConfiguration.==`).
+    static func == (lhs: BlurAnalysisConfiguration, rhs: BlurAnalysisConfiguration) -> Bool {
+        lhs.maxConcurrentWorkers == rhs.maxConcurrentWorkers
+            && lhs.thumbnailMaxPixelSize == rhs.thumbnailMaxPixelSize
+            && lhs.analysisSide == rhs.analysisSide
+            && lhs.thresholds == rhs.thresholds
+    }
 }
 
 /// The blur analysis engine: one bounded, cancellable, local-only sharpness pass over the
@@ -133,7 +145,10 @@ struct BlurAnalysisEngine: Sendable {
         report: @escaping @Sendable (BlurAnalysisProgress) -> Void
     ) async throws -> BlurAnalysisResult {
         let config = engine.configuration
-        let workerWidth = max(1, config.maxConcurrentWorkers)
+        // Thermal-adaptive width (see `ScanConcurrencyPolicy`): the configured bound above,
+        // scaled by the current thermal state; recorded below as the effective width.
+        let thermalPolicy = ScanConcurrencyPolicy(thermalState: config.thermalState)
+        let workerWidth = thermalPolicy.width(base: config.maxConcurrentWorkers)
         let runStarted = DispatchTime.now().uptimeNanoseconds
         // Failure-code tally is per run: one summary must never include a previous run's
         // failures (the validation harness runs cancel-then-full in one process).
@@ -178,6 +193,7 @@ struct BlurAnalysisEngine: Sendable {
         let tally = LockedBox<Tally>(Tally())
         try await BoundedWorkers.run(items: work, width: workerWidth) { item in
             guard !Task.isCancelled else { return }
+            try await thermalPolicy.waitWhileCritical()
             let assetID = item.record.localIdentifier
             do {
                 try Task.checkCancellation()

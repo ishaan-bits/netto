@@ -26,8 +26,25 @@ struct PhotoAnalysisConfiguration: Sendable, Equatable {
     /// comparison. Deliberately generous: a false positive costs one small thumbnail and one
     /// descriptor; a false negative silently loses a candidate pair.
     var perceptualCandidateMaxHamming: Int = 16
+    /// Where the run reads the device's thermal state (`ScanConcurrencyPolicy`). A policy
+    /// source, not a tuning value — excluded from `==` (see below). Tests pin it to a fixed
+    /// state; production reads `ProcessInfo` fresh at every decision.
+    var thermalState: @Sendable () -> ProcessInfo.ThermalState = { ProcessInfo.processInfo.thermalState }
 
     init() {}
+
+    /// Equality over the tuning values only: the thermal source is a function, and two
+    /// configs with the same widths/thresholds are the same configuration no matter where
+    /// the thermal reading comes from.
+    static func == (lhs: PhotoAnalysisConfiguration, rhs: PhotoAnalysisConfiguration) -> Bool {
+        lhs.bucketing == rhs.bucketing
+            && lhs.similarityThreshold == rhs.similarityThreshold
+            && lhs.maxConcurrentWorkers == rhs.maxConcurrentWorkers
+            && lhs.fingerprintThumbnailConcurrency == rhs.fingerprintThumbnailConcurrency
+            && lhs.perceptualThumbnailMaxPixelSize == rhs.perceptualThumbnailMaxPixelSize
+            && lhs.verificationThumbnailMaxPixelSize == rhs.verificationThumbnailMaxPixelSize
+            && lhs.perceptualCandidateMaxHamming == rhs.perceptualCandidateMaxHamming
+    }
 }
 
 /// The photo similarity analysis engine: exact duplicates by content fingerprint, near
@@ -147,7 +164,11 @@ struct PhotoSimilarityEngine: Sendable {
         }
         let reporter = AnalysisProgressReporter(observer: engine.stageObserver, report: report)
         let config = engine.configuration
-        let workerWidth = max(1, config.maxConcurrentWorkers)
+        // Thermal-adaptive widths: the configured bounds above, scaled by the device's
+        // current thermal state (nominal → unchanged). Read once for the width decisions;
+        // the per-item `waitWhileCritical` calls below re-read it for pausing.
+        let thermalPolicy = ScanConcurrencyPolicy(thermalState: config.thermalState)
+        let workerWidth = thermalPolicy.width(base: config.maxConcurrentWorkers)
 
         // Stage 1: preparing — index records by id (first occurrence wins; ids are unique from
         // PhotoKit, but a hostile input must not trap).
@@ -225,9 +246,13 @@ struct PhotoSimilarityEngine: Sendable {
 
         let perceptualHashes = LockedBox<[String: PerceptualHash]>([:])
         let byteKeys = LockedBox<[String: ContentByteKey]>([:])
-        let fingerprintWidth = max(workerWidth, config.fingerprintThumbnailConcurrency)
+        let fingerprintWidth = max(
+            workerWidth,
+            thermalPolicy.width(base: config.fingerprintThumbnailConcurrency)
+        )
         try await BoundedWorkers.run(items: cheapWork, width: fingerprintWidth) { work in
             guard !Task.isCancelled else { return }
+            try await thermalPolicy.waitWhileCritical()
             switch work {
             case .perceptualHash(let record):
                 let phaseStart = DispatchTime.now().uptimeNanoseconds
@@ -320,6 +345,7 @@ struct PhotoSimilarityEngine: Sendable {
         let collidingRecords = collidingIDs.compactMap { recordsByID[$0] }
         try await BoundedWorkers.run(items: collidingRecords, width: workerWidth) { record in
             guard !Task.isCancelled else { return }
+            try await thermalPolicy.waitWhileCritical()
             let phaseStart = DispatchTime.now().uptimeNanoseconds
             metrics?.increment(.contentRequestsAttempted)
             do {
@@ -409,6 +435,7 @@ struct PhotoSimilarityEngine: Sendable {
 
         try await BoundedWorkers.run(items: candidateWork, width: workerWidth) { work in
             guard !Task.isCancelled else { return }
+            try await thermalPolicy.waitWhileCritical()
 
             var prints: [(assetID: String, print: FeaturePrint)] = []
             prints.reserveCapacity(work.members.count)
@@ -786,6 +813,69 @@ private enum AnalysisCheapWork: Sendable {
 private struct CandidatePairWork: Sendable {
     let members: [PhotoAssetRecord]
     let pairs: [(PhotoAssetRecord, PhotoAssetRecord)]
+}
+
+/// Adaptive concurrency policy shared by every scan pass (similarity, sharpness, video
+/// sizes): each engine keeps its configured upper bound, and this policy scales the
+/// *effective* width down as the device heats up, pausing entirely at critical pressure.
+///
+/// Pure width arithmetic plus a cancellation-aware wait — no engine-specific knowledge, so
+/// one policy and one test suite cover every pass. The thermal source is injected:
+/// production reads `ProcessInfo.processInfo.thermalState` fresh at each decision (a run
+/// picks up pressure changes between stages and between work items), tests pin a state.
+///
+/// Guarantees:
+/// - The effective width is always in `1...base` — a run under any thermal state still
+///   makes progress, and never exceeds the configured bound.
+/// - `waitWhileCritical` returns immediately below `.critical`; at `.critical` it polls
+///   until pressure eases (or the task is cancelled, which throws `CancellationError` — a
+///   user cancel is never delayed by the pause). Work resumes exactly where it paused:
+///   the worker's strided index is untouched.
+struct ScanConcurrencyPolicy: Sendable {
+    /// Thermal source — called fresh at every decision so pressure changes mid-run apply.
+    var thermalState: @Sendable () -> ProcessInfo.ThermalState
+
+    init(
+        thermalState: @escaping @Sendable () -> ProcessInfo.ThermalState = {
+            ProcessInfo.processInfo.thermalState
+        }
+    ) {
+        self.thermalState = thermalState
+    }
+
+    /// The effective width for a configured base width under the current thermal state:
+    /// nominal keeps the base; fair takes three quarters; serious halves it; critical cuts
+    /// it to a quarter (floor of 1).
+    func width(base: Int) -> Int {
+        let base = max(1, base)
+        switch thermalState() {
+        case .nominal:
+            return base
+        case .fair:
+            return max(1, (base * 3) / 4)
+        case .serious:
+            return max(1, base / 2)
+        case .critical:
+            return max(1, base / 4)
+        @unknown default:
+            return max(1, base / 2)
+        }
+    }
+
+    /// Whether the next unit of work must wait: critical pressure pauses the pass, any
+    /// other state lets it run at `width(base:)`.
+    var isCriticallyPressed: Bool {
+        thermalState() == .critical
+    }
+
+    /// Pauses while the device is in critical thermal pressure, polling at `pollInterval`.
+    /// Returns as soon as pressure eases (or immediately if there was none). Throws
+    /// `CancellationError` if the surrounding task is cancelled while waiting.
+    func waitWhileCritical(pollInterval: Duration = .milliseconds(250)) async throws {
+        while isCriticallyPressed {
+            try await Task.sleep(for: pollInterval)
+        }
+    }
 }
 
 /// Fixed-width strided worker pool: `width` tasks, each taking items `i, i + width, …`.

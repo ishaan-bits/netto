@@ -207,8 +207,10 @@ struct ScanSnapshotRestorationTests {
         await env.bootstrap()
 
         env.startSimilarityAnalysis()
-        guard case .failed = env.analysisState else {
-            Issue.record("expected failed analysis, got \(env.analysisState)")
+        // Reader creation happens inside the task now — wait for the run to fail.
+        let finalState = await waitForAnalysis(env)
+        guard case .failed = finalState else {
+            Issue.record("expected failed analysis, got \(finalState)")
             return
         }
         #expect(store.saveCount == seededSaves)
@@ -429,12 +431,24 @@ private func waitForAnalysis(
     return env.analysisState
 }
 
-/// Call counter for the injected library factory (main-actor confined usage; unchecked box).
+/// Call counter for the injected library factory. `record()` runs on the detached task that
+/// creates the reader (off the main actor) while `count` is read from the test's actor — a
+/// lock guards both.
 private final class FactoryCallBox: @unchecked Sendable {
+    private let lock = NSLock()
     private var calls = 0
 
-    func record() { calls += 1 }
-    var count: Int { calls }
+    func record() {
+        lock.lock()
+        calls += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
 }
 
 private struct FakeLibrary: PhotoLibraryReading {

@@ -15,6 +15,9 @@ import Foundation
 /// - **Pixel-bounded.** Callers pass a `targetPixelSize`; full-resolution pixels never enter the
 ///   cache. Entries are keyed by size *and* asset, so the strip (small) and the detail sheet
 ///   (larger) never serve each other's bitmap.
+/// - **Invalidated on deletion.** `remove(assetIDs:)` drops every size of the removed assets,
+///   wired from the deletion outcome — LRU eviction is the bound, explicit removal is the
+///   correctness guarantee.
 actor ThumbnailStore {
     private let loader: any PhotoThumbnailLoading
     private let capacity: Int
@@ -79,6 +82,21 @@ actor ThumbnailStore {
                 store(.miss(failure), forKey: key)
             }
             throw error
+        }
+    }
+
+    /// Deletion invalidation: drops every rendition (all sizes) of the named assets from the
+    /// cache, so a deleted photo's pixels can never outlive it in the review UI. Bounded
+    /// work: at most `capacity` keys are examined. Safe to call for assets this store has
+    /// never seen (no-ops).
+    func remove(assetIDs: Set<String>) {
+        guard !assetIDs.isEmpty else { return }
+        let doomed = order.filter { key in
+            guard let separator = key.firstIndex(of: "|") else { return false }
+            return assetIDs.contains(String(key[key.index(after: separator)...]))
+        }
+        for key in doomed {
+            remove(key)
         }
     }
 

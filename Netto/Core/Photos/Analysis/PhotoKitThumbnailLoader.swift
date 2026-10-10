@@ -82,6 +82,118 @@ extension PhotoThumbnailLoading {
     }
 }
 
+/// Bounded, lock-protected cache of resolved `PHAsset` references, keyed by local identifier.
+///
+/// Every thumbnail request used to start with `PHAsset.fetchAssets(withLocalIdentifiers:)` —
+/// an XPC round trip to the Photos daemon — even when an earlier stage or an earlier pass had
+/// already resolved the same identifier (96 px perceptual gate → 256 px verification →
+/// sharpness, similarity → blur). This cache turns every repeat resolution into a dictionary
+/// lookup; the first resolution of each asset still pays the full `fetchAsset` path.
+///
+/// Correctness under change:
+/// - **Deletion** invalidates explicitly (`invalidate(assetIDs:)`, called from the deletion
+///   outcome). Anything that slips through still fails honestly: the image request for a
+///   deleted asset errors and maps to `.assetNotFound` — a cached reference cannot produce
+///   pixels for an asset that no longer exists.
+/// - **Permission revocation** is re-checked on every miss; on a hit the image request itself
+///   fails with the access error, which maps to `.permissionDenied`.
+/// - **Bounds**: capacity-capped with LRU eviction, so memory never tracks library size.
+///   `hitCount`/`missCount` are the observable reuse statistics tests and validation runs
+///   report (a miss equals one `PHAsset.fetchAssets` round trip that did not happen before).
+///
+/// `@unchecked Sendable`: every access goes through `lock`; `PHAsset` is an immutable
+/// identifier wrapper PhotoKit returns to callers from arbitrary threads.
+final class PhotoAssetReferenceCache: @unchecked Sendable {
+    /// Process-wide cache used by every default-configured loader — cross-pass reuse is the
+    /// point (the analysis passes and the UI grid all request the same identifiers).
+    static let shared = PhotoAssetReferenceCache()
+
+    private let lock = NSLock()
+    private var order: [String] = [] // least-recently-used first
+    private var entries: [String: PHAsset] = [:]
+    private var hits = 0
+    private var misses = 0
+    private let capacity: Int
+
+    init(capacity: Int = 512) {
+        self.capacity = max(1, capacity)
+    }
+
+    /// The cached reference (promoting it to most-recently-used), or `nil` on a miss.
+    /// Counts the lookup: `hitCount + missCount` equals the number of resolutions attempted.
+    func asset(for assetID: String) -> PHAsset? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let asset = entries[assetID] else {
+            misses += 1
+            return nil
+        }
+        hits += 1
+        if let position = order.firstIndex(of: assetID) {
+            order.remove(at: position)
+            order.append(assetID)
+        }
+        return asset
+    }
+
+    /// Caches a successfully resolved reference, evicting the least-recently-used entry when
+    /// over capacity. Never called for failures — misses are not cached (unlike
+    /// `ThumbnailStore`, a failed lookup may succeed on the next run: re-granted permission,
+    /// a download completed).
+    func store(_ asset: PHAsset, for assetID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if entries[assetID] != nil, let position = order.firstIndex(of: assetID) {
+            order.remove(at: position)
+        }
+        entries[assetID] = asset
+        order.append(assetID)
+        while entries.count > capacity {
+            guard let oldest = order.first else { break }
+            order.removeFirst()
+            entries.removeValue(forKey: oldest)
+        }
+    }
+
+    /// Deletion invalidation: drops only the named references (all sizes share one entry).
+    func invalidate(assetIDs: Set<String>) {
+        guard !assetIDs.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for assetID in assetIDs where entries.removeValue(forKey: assetID) != nil {
+            if let position = order.firstIndex(of: assetID) {
+                order.remove(at: position)
+            }
+        }
+    }
+
+    /// Full invalidation — reserved for tests and permission-level changes.
+    func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        entries.removeAll()
+        order.removeAll()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.count
+    }
+
+    var hitCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return hits
+    }
+
+    var missCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return misses
+    }
+}
+
 /// iOS 17-compatible thumbnail loading.
 ///
 /// Choices and their reasons:
@@ -110,6 +222,9 @@ extension PhotoThumbnailLoading {
 ///   uncached (failures are never stored); when the primary request fails for a recoverable
 ///   reason, a local-rendition fallback ladder (`previewFallbackPixelSizes`) walks down to
 ///   whatever pixels Photos still has on disk before the screen shows an error.
+/// - **Asset references are cached** (`PhotoAssetReferenceCache`), not pixels: the repeat
+///   `PHAsset.fetchAssets` lookup per stage/pass becomes a dictionary hit, while pixels are
+///   still rendered fresh per request at the exact size and content mode the caller asked for.
 struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     /// Failsafe for one analysis thumbnail request. Generous enough for a slow local decode to
     /// finish, finite enough that a stuck request costs one asset, not the scan.
@@ -143,15 +258,47 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     private let previewRequest: PreviewImageRequest
     private let fallbackRequest: PreviewFallbackRequest
 
+    /// - Parameters:
+    ///   - request/previewRequest/fallbackRequest: injectable seams (tests). `nil` binds the
+    ///     production path to `assetCache`, so a cache hit skips the `PHAsset` lookup.
+    ///   - assetCache: where resolved `PHAsset` references are reused across requests and
+    ///     across passes. Defaults to the process-wide cache — cross-pass reuse (the 96 px
+    ///     perceptual gate → the 256 px verification pass → the sharpness pass) is the point.
     init(
-        request: @escaping ImageRequest = Self.liveRequest,
-        previewRequest: @escaping PreviewImageRequest = Self.livePreviewRequest,
-        fallbackRequest: @escaping PreviewFallbackRequest = Self.livePreviewFallbackRequest
+        request: ImageRequest? = nil,
+        previewRequest: PreviewImageRequest? = nil,
+        fallbackRequest: PreviewFallbackRequest? = nil,
+        assetCache: PhotoAssetReferenceCache = .shared
     ) {
-        self.request = request
-        self.previewRequest = previewRequest
-        self.fallbackRequest = fallbackRequest
+        self.assetCache = assetCache
+        self.request = request ?? { assetID, targetPixelSize, mode in
+            try await Self.liveRequest(
+                assetID: assetID,
+                targetPixelSize: targetPixelSize,
+                mode: mode,
+                cache: assetCache
+            )
+        }
+        self.previewRequest = previewRequest ?? { assetID, targetPixelSize, onInterim in
+            try await Self.livePreviewRequest(
+                assetID: assetID,
+                targetPixelSize: targetPixelSize,
+                onInterim: onInterim,
+                cache: assetCache
+            )
+        }
+        self.fallbackRequest = fallbackRequest ?? { assetID, targetPixelSize in
+            try await Self.livePreviewFallbackRequest(
+                assetID: assetID,
+                targetPixelSize: targetPixelSize,
+                cache: assetCache
+            )
+        }
     }
+
+    /// The cache this loader resolves asset references through (shared with every
+    /// default-configured loader via `.shared`).
+    let assetCache: PhotoAssetReferenceCache
 
     func thumbnail(
         for assetID: String,
@@ -203,10 +350,11 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     private static func liveRequest(
         assetID: String,
         targetPixelSize: Int,
-        mode: PhotoThumbnailRequestMode
+        mode: PhotoThumbnailRequestMode,
+        cache: PhotoAssetReferenceCache
     ) async throws -> CGImage {
         try await PendingPhotoRequest.run(timeoutNanos: thumbnailTimeoutNanos) { resolve in
-            let asset = try fetchAsset(assetID)
+            let asset = try cachedAsset(assetID, cache: cache)
             let options = makeImageRequestOptions(mode: mode)
 
             let side = CGFloat(max(1, targetPixelSize))
@@ -239,12 +387,13 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     private static func livePreviewRequest(
         assetID: String,
         targetPixelSize: Int,
-        onInterim: @escaping @Sendable (CGImage) -> Void
+        onInterim: @escaping @Sendable (CGImage) -> Void,
+        cache: PhotoAssetReferenceCache
     ) async throws -> CGImage {
         // 30 s: an iCloud download of one rendition can legitimately take longer than the
         // local-only analysis failsafe, and on timeout the user still gets Retry.
         try await PendingPhotoRequest.run(timeoutNanos: PendingPhotoRequest.defaultTimeoutNanos) { resolve in
-            let asset = try fetchAsset(assetID)
+            let asset = try cachedAsset(assetID, cache: cache)
             let options = makePreviewRequestOptions()
 
             let side = CGFloat(max(1, targetPixelSize))
@@ -288,11 +437,12 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     /// options (single-shot, never the scanner's network-disabled path).
     private static func livePreviewFallbackRequest(
         assetID: String,
-        targetPixelSize: Int
+        targetPixelSize: Int,
+        cache: PhotoAssetReferenceCache
     ) async throws -> CGImage {
         try await previewFallbackLadder(targetPixelSize: targetPixelSize) { size in
             try await PendingPhotoRequest.run(timeoutNanos: previewFallbackTimeoutNanos) { resolve in
-                let asset = try fetchAsset(assetID)
+                let asset = try cachedAsset(assetID, cache: cache)
                 let options = makePreviewFallbackRequestOptions()
 
                 let side = CGFloat(size)
@@ -467,6 +617,27 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
         options.fetchLimit = 1
         let result = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: options)
         guard let asset = result.firstObject else { throw PhotoContentError.assetNotFound }
+        return asset
+    }
+
+    /// Asset resolution through the reference cache. A hit skips both the permission status
+    /// read and the `PHAsset.fetchAssets` round trip (an XPC call to the Photos daemon) —
+    /// the per-request lookup this loader used to pay on every thumbnail, every stage, and
+    /// every pass. A miss runs the exact `fetchAsset` path above, so the first resolution of
+    /// an asset — and every resolution while permission is off — behaves byte-for-byte as
+    /// before; only the *repeat* lookup is new. A revoked permission surfaces from the image
+    /// request itself (mapped to `.permissionDenied`) even on a cached reference, and a
+    /// deleted asset's request fails with `.assetNotFound` — a stale reference can never
+    /// fabricate a success.
+    private static func cachedAsset(
+        _ assetID: String,
+        cache: PhotoAssetReferenceCache
+    ) throws -> PHAsset {
+        if let cached = cache.asset(for: assetID) {
+            return cached
+        }
+        let asset = try fetchAsset(assetID)
+        cache.store(asset, for: assetID)
         return asset
     }
 

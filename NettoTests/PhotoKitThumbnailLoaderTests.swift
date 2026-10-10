@@ -265,6 +265,101 @@ struct PhotoKitThumbnailLoaderTests {
     }
 }
 
+// MARK: Asset-reference cache (Phase B — repeat lookups without repeat PhotoKit fetches)
+
+/// `PhotoAssetReferenceCache` turns every repeat resolution of an identifier — the same
+/// asset through a later stage or a later pass — into a dictionary hit instead of an
+/// `PHAsset.fetchAssets` round trip to the Photos daemon. These tests run against the
+/// simulator's seeded library (the same guard style as the request probe above); without
+/// an authorized library there is nothing to resolve twice.
+struct PhotoAssetReferenceCacheTests {
+    /// First N authorized assets, or empty when this host has no usable library.
+    private func seededAssets(limit: Int) -> [PHAsset] {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard status == .authorized || status == .limited else { return [] }
+        let fetch = PHAsset.fetchAssets(with: PHFetchOptions())
+        guard fetch.count > 0 else { return [] }
+        return (0..<min(limit, fetch.count)).map { fetch.object(at: $0) }
+    }
+
+    @Test func aSecondLookupIsAHitAndCountsNeverLie() {
+        guard let asset = seededAssets(limit: 1).first else { return }
+        let cache = PhotoAssetReferenceCache(capacity: 8)
+
+        // First lookup: a miss — the loader would fetch here (one daemon round trip).
+        #expect(cache.asset(for: asset.localIdentifier) == nil)
+        #expect(cache.missCount == 1)
+        #expect(cache.count == 0)
+
+        // Every repeat: a hit against the stored reference.
+        cache.store(asset, for: asset.localIdentifier)
+        #expect(cache.asset(for: asset.localIdentifier) === asset)
+        #expect(cache.asset(for: asset.localIdentifier) === asset)
+        #expect(cache.hitCount == 2)
+        #expect(cache.missCount == 1)
+        #expect(cache.count == 1)
+    }
+
+    @Test func theCacheIsBoundedAndEvictsLeastRecentlyUsedFirst() {
+        guard let asset = seededAssets(limit: 1).first else { return }
+        let cache = PhotoAssetReferenceCache(capacity: 2)
+
+        cache.store(asset, for: "a")
+        cache.store(asset, for: "b")
+        _ = cache.asset(for: "a") // "a" becomes most recently used
+        cache.store(asset, for: "c") // over capacity: "b" (LRU) leaves
+
+        #expect(cache.count == 2)
+        #expect(cache.asset(for: "a") != nil)
+        #expect(cache.asset(for: "b") == nil)
+        #expect(cache.asset(for: "c") != nil)
+    }
+
+    @Test func invalidationDropsOnlyTheNamedReferences() {
+        guard let asset = seededAssets(limit: 1).first else { return }
+        let cache = PhotoAssetReferenceCache(capacity: 8)
+        cache.store(asset, for: "a")
+        cache.store(asset, for: "b")
+
+        cache.invalidate(assetIDs: ["a", "never-stored"])
+        #expect(cache.count == 1)
+        #expect(cache.asset(for: "a") == nil)
+        #expect(cache.asset(for: "b") != nil)
+
+        // An empty invalidation is a no-op; removeAll clears everything.
+        cache.invalidate(assetIDs: [])
+        #expect(cache.count == 1)
+        cache.removeAll()
+        #expect(cache.count == 0)
+    }
+
+    @Test func aLoaderResolvesTheAssetOnceAcrossStagesAndModes() async {
+        guard let asset = seededAssets(limit: 1).first else { return }
+        let cache = PhotoAssetReferenceCache(capacity: 8)
+        let loader = PhotoKitThumbnailLoader(assetCache: cache)
+
+        // Three stages of one run over one asset — the cheap 96 px gate, the 256 px
+        // verification evidence, and the sharpness fill. One fetch, two hits: the pixels
+        // are still rendered fresh per request (only the reference is reused).
+        _ = try? await loader.thumbnail(for: asset.localIdentifier, targetPixelSize: 96, mode: .perceptual)
+        _ = try? await loader.thumbnail(for: asset.localIdentifier, targetPixelSize: 256, mode: .verification)
+        _ = try? await loader.thumbnail(for: asset.localIdentifier, targetPixelSize: 256, mode: .sharpness)
+
+        #expect(cache.missCount == 1)
+        #expect(cache.hitCount == 2)
+        #expect(cache.count == 1)
+    }
+
+    @Test func theSharedCacheIsTheProcessDefaultForEveryLoader() {
+        let defaultLoader = PhotoKitThumbnailLoader()
+        #expect(defaultLoader.assetCache === PhotoAssetReferenceCache.shared)
+        // An explicitly injected cache isolates a test run from the process-wide one.
+        let isolated = PhotoAssetReferenceCache(capacity: 4)
+        let isolatedLoader = PhotoKitThumbnailLoader(assetCache: isolated)
+        #expect(isolatedLoader.assetCache === isolated)
+    }
+}
+
 /// Small reference box used by the seam tests. `@unchecked Sendable`: all access under `lock`.
 private final class Box<Value>: @unchecked Sendable {
     private let lock = NSLock()

@@ -91,6 +91,32 @@ photo:
 - **No O(n²) full-library comparison** — the pipeline is designed so pair count grows
   with bucket density, not library size.
 
+### Scan runtime (large libraries)
+
+Scans of tens of thousands of assets additionally run under four load-shaping rules:
+
+- **No expensive setup or bookkeeping on the main actor** — the PhotoKit reader for a
+  catalog build or similarity scan is created in a detached task; catalog progress/ETA
+  writes are coalesced to at most 4/second (plus immediate writes when the asset total
+  is first known and on completion), never at a higher frequency than before; snapshot
+  persistence runs off the main actor; deletion invalidation work is awaited off it.
+- **One asset lookup, shared across stages** — a session-scoped LRU cache (512 entries)
+  of resolved `PHAsset` references is shared by the loader's asset requests, so
+  cataloging, fingerprinting, the sharpness pass, and previews each pay the PhotoKit
+  fetch once per asset instead of once per stage; deletion invalidates exactly the
+  removed IDs. Rendition bytes were already shared through the persistent
+  `ThumbnailStore`.
+- **Thermal-aware bounded concurrency** — every bounded pool (similarity workers,
+  fingerprint thumbnails, sharpness workers, per-batch size measurement) scales its cap
+  by the device thermal state (nominal ×1, fair ×0.75, serious ×0.5, critical ×0.25,
+  floor 1), and critical pressure pauses batch workers until it eases. Each pool floors
+  at 1, so progress continues at every level.
+- **One heavy pass at a time** — a similarity run or sharpness pass owns the analysis
+  pipeline: the other refuses to start, video-size measurement refuses to start (and an
+  in-flight measurement yields, keeping its partial progress as a settled snapshot), and
+  both the similarity and sharpness `isRunning` flags falling to false resume it.
+  Catalog building and similarity analysis remain mutually exclusive as before.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -154,7 +180,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 668 Swift Testing cases across 66 suites covering the pure
+- **Unit suite** — 46 files, 692 Swift Testing cases across 68 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -163,15 +189,45 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   blur-classification corpus (14 categories × 3 sizes × 2 delivery paths), and the
   widget summary. Tests use fakes and fixtures — they never mutate a real photo library
   or the contacts store.
+- **Scan-runtime coverage (Phase B)** — 18 cases over the large-library hardening: the
+  shared `PHAsset` reference cache (hit/miss accounting, LRU bounds, targeted
+  invalidation, loader reuse across stage and mode requests, `.shared` as the process
+  default), `ThumbnailStore` deletion invalidation (every size of a removed asset, no-op
+  for unknown IDs), the thermal concurrency policy (width scaling per thermal state,
+  the critical-pressure pause, cancellation through it) plus its effective width
+  wiring in both engines, a repeat engine run fetching **zero** additional asset
+  references, and the analysis-pipeline coordination (video measurement refusing to
+  start or resume while a pass owns the pipeline, resuming when it finishes, an
+  in-flight measurement yielding to a similarity start).
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification** — full suites green (668/668 unit, 5/5 UI) and a clean
-  `build-for-testing` with 0 errors and 251 warnings, matching the pre-existing
-  baseline exactly (all in the UI-test targets).
+- **Recent verification** — full suites green on the Phase B worktree: the unit run
+  reports "692 tests in 68 suites passed", plus 5/5 UI cases, and a clean
+  `build-for-testing` with 0 errors and
+  251 warnings, all inside the pre-existing UI-test-target baseline (the unit/app
+  targets are warning-free). One case, `cancellationPropagatesOutOfTheLoader` in
+  `PhotoKitThumbnailLoaderTests`, is cancelled when run inside the full suite but
+  passes in isolation; this is a pre-existing Swift Testing suite-context quirk,
+  reproduced unchanged on the Phase A commit, and is listed under Known limitations.
 - **Benchmark, bounded honestly** — `BlurScanBenchmarkTests` self-seeds a Simulator
   library and A/B-measures the blur scan's delivery paths with stage-level
   instrumentation. Simulator PhotoKit timing is not representative of devices, so the
   benchmark is used only for relative comparisons, never as a device-performance claim.
+  Post-Phase-B single run over 1 000 seeded photos (before = pre-M7 delivery path,
+  after = production path): `after wall=9.54s request=6.236s ticks=38 width=4` versus
+  the pre-Phase-B baseline for the same production path `wall=9.80s request=6.120s
+  ticks=40 width=4` — i.e. no regression, within simulator run-to-run noise; Phase B's
+  wins are structural (fewer main-actor writes, fewer PhotoKit asset fetches,
+  thermal-scaled caps), which this metric does not isolate. Within a run, both engine
+  paths now share the process asset-reference cache, so request-time deltas between
+  before/after are not a pure A/B.
+- **On-device profiling procedure** (required before any device-performance claim):
+  install on an iPhone 17 Pro with a large real library; in Instruments, profile a
+  full scan with Time Profiler + Animation Hitches + CPU (thermal column) + Allocations;
+  record scan wall time from the dashboard, main-thread CPU % during the scan, hitch
+  count during the scan, sustained CPU %, thermal state, and peak memory. Repeat on the
+  pre-Phase-B build for the comparison; the matrix has not been run yet (see Known
+  limitations).
 
 ## Known limitations
 
@@ -187,8 +243,26 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   corpus re-validates the thresholds. Known behaviours: very smooth content (blank
   skies, gradients) can read as likely blurry by every measured signal; whole-frame
   intentional defocus is indistinguishable from accidental blur at thumbnail scale; the
-  result is in-memory for the session only. The classifier never acts on its own —
-  candidates are for explicit human review.
+   result is in-memory for the session only. The classifier never acts on its own —
+   candidates are for explicit human review.
+- **Scan-runtime tradeoffs (Phase B)** — the asset-reference LRU is session-scoped
+  (512 entries): it bounds memory and lookup cost but does not persist across launches.
+  Thermal scaling reacts to the reported thermal state, not to per-request latency; at
+  critical pressure the scan deliberately slows instead of failing. Video-size
+  measurement yields to a similarity or sharpness pass and resumes only when a pass's
+  `isRunning` flag flips to false (an explicit resume also works); if the app is
+  backgrounded or killed while yielded, measurement restarts from persisted partial
+  results on the next session.
+- **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
+  `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
+  context but passes when run alone; the behaviour predates Phase B (reproduced on the
+  Phase A commit) and is a Swift Testing suite-context quirk, not a suppressed failure.
+- **The Phase B benchmark comparison is not isolated** — within one
+  `BlurScanBenchmarkTests` run, the before and after engine paths now share the process
+  asset-reference cache, so per-path request times are no longer independent; the
+  simulator numbers above only rule out regressions, they do not measure the cache's
+  benefit. The device procedure under Testing & verification is the intended
+  measurement.
 
 ## Credits / AI development note
 
