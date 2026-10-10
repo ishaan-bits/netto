@@ -195,7 +195,9 @@ struct SwipeReviewTests {
         #expect(env.selection.isSelected("e1"))
         #expect(!env.selection.isSelected("e2"))
 
-        // Re-entering starts a fresh cursor over the same, preserved selection.
+        // A bare model constructed later starts fresh; the *screen* restores the persisted
+        // session (cursor, history, decisions) over it on appear — covered in the
+        // persistence suite below. Either way the shared selection is untouched.
         let fresh = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
         #expect(fresh.cursor == 0)
         #expect(fresh.history.isEmpty)
@@ -241,11 +243,11 @@ struct SwipeReviewTests {
         #expect(model.isComplete == false)
         #expect(model.reviewedCount == 1)
 
-        // The completion state's primary action targets the existing review flow — the same
-        // `ReviewSelectionView` entry the bottom Review button uses (`reviewDidAppear` →
-        // plan preparation from the shared selection). Swipe mode builds no destination of
-        // its own.
-        #expect(SwipeReviewPresentation.completionPrimaryDestination == .existingReviewFlow)
+        // The completion state's primary action targets the editable cleanup flow — the same
+        // `SwipeCleanupSelectionView` entry the bottom Review Cleanup button uses, which
+        // hands the checked Delete marks to the *existing* `ReviewSelectionView`. Swipe mode
+        // builds no destination of its own.
+        #expect(SwipeReviewPresentation.completionPrimaryDestination == .editableCleanup)
         #expect(SwipeReviewPresentation.completionPrimaryTitle == "Review Cleanup")
         #expect(SwipeReviewPresentation.completionSecondaryDestination == .dismissToSimilarPhotos)
 
@@ -297,21 +299,23 @@ struct SwipeReviewTests {
         env.mutateSelection { model.decide(.keep, selection: &$0) }   // e2 cleared
         #expect(!model.isComplete) // the persistent bar — not only completion — is an entry
         #expect(env.selection.selectedIDs == ["e1", "e3"])
-        // The bar shares the completion screen's primary destination: the *existing* review.
-        #expect(SwipeReviewPresentation.completionPrimaryDestination == .existingReviewFlow)
+        // The bar shares the completion screen's primary destination: the editable cleanup.
+        #expect(SwipeReviewPresentation.completionPrimaryDestination == .editableCleanup)
         #expect(SwipeReviewPresentation.completionPrimaryTitle == "Review Cleanup")
 
-        // Same handoff the bar's NavigationLink performs: the existing review screen appears
-        // over the shared selection and prepares exactly those photos.
-        env.reviewDidAppear(from: .similarPhotos)
+        // Same handoff the cleanup screen performs: only this session's Delete marks (e1 —
+        // never-reviewed e3 is not a candidate, even though it is selected) enter the
+        // *existing* review as the `.swipeReview` source.
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        #expect(env.swipeCleanupCheckedIDs == ["e1"])
+        env.reviewDidAppear(from: .swipeReview)
         await waitForPlanReady(env)
 
         guard case .readyForReview(let plan) = env.deletionState else {
             Issue.record("expected readyForReview, got \(env.deletionState)")
             return
         }
-        #expect(plan.selectionSnapshot == env.selection.selectedIDs)
-        #expect(plan.selectionSnapshot == ["e1", "e3"])
+        #expect(plan.selectionSnapshot == ["e1"])
     }
 
     @Test func finishingTheLastPhotoReachesTheCompletionState() {
@@ -485,6 +489,617 @@ struct SwipeReviewTests {
         #expect(model.history.count == 1)
         #expect(model.canUndo)
     }
+
+    // MARK: Shuffle (Phase D)
+
+    @Test func shuffleAndSessionCopyIsExact() {
+        #expect(SwipeReviewPresentation.shuffleButtonTitle == "Shuffle")
+        #expect(SwipeReviewPresentation.shuffleAccessibilityID == "swipeShuffleButton")
+        #expect(SwipeReviewPresentation.shuffleAccessibilityLabel
+                == "Shuffle the photos you have not reviewed yet")
+        #expect(SwipeReviewPresentation.newPassButtonTitle == "Start New Pass")
+        #expect(SwipeReviewPresentation.newPassAccessibilityID == "swipeNewPassButton")
+        #expect(SwipeReviewPresentation.remainingCount(cursor: 3, total: 5) == 2)
+        #expect(SwipeReviewPresentation.remainingCount(cursor: 0, total: 0) == 0)
+        #expect(SwipeReviewPresentation.remainingCount(cursor: 5, total: 5) == 0)
+        // The gate: fewer than two remaining photos has nothing to shuffle.
+        #expect(!SwipeReviewPresentation.shuffleEnabled(remaining: 0))
+        #expect(!SwipeReviewPresentation.shuffleEnabled(remaining: 1))
+        #expect(SwipeReviewPresentation.shuffleEnabled(remaining: 2))
+        #expect(SwipeReviewPresentation.shuffleEnabled(remaining: 50))
+    }
+
+    @Test func shuffleReordersOnlyTheUnreviewedTail() {
+        let items = libraryDeck(count: 6)
+        let model = SwipeReviewModel(items: items)
+        var selection = PhotoSelectionModel(result: fixtureResult())
+        selection.admitLibraryAssets(Set(items.map(\.assetID)))
+
+        // Two decisions pin the reviewed prefix.
+        model.decide(.delete, selection: &selection) // lib1 marked
+        model.decide(.keep, selection: &selection)   // lib2 cleared
+        #expect(model.cursor == 2)
+
+        var generator = SeededGenerator(seed: 42)
+        model.shuffleRemaining(using: &generator)
+
+        // The prefix is byte-identical — a reviewed photo can never re-enter the pass.
+        #expect(Array(model.items.prefix(2)) == [items[0], items[1]])
+        // The tail is a permutation of the unreviewed photos: same photos, new order, and
+        // (with this seed) an order that actually differs from the original.
+        let originalTail = Array(items.dropFirst(2).map(\.assetID))
+        let shuffledTail = model.items.dropFirst(2).map(\.assetID)
+        #expect(Set(shuffledTail) == Set(originalTail))
+        #expect(shuffledTail != originalTail)
+        // Decisions, cursor, and undo are untouched by the reorder.
+        #expect(model.cursor == 2)
+        #expect(model.canUndo)
+        #expect(model.decisions == ["lib1": .delete, "lib2": .keep])
+        #expect(model.deleteDecisionCount == 1)
+        #expect(selection.isSelected("lib1"))
+        #expect(!selection.isSelected("lib2"))
+    }
+
+    @Test func shufflingThenSwipingTheWholePassNeverRepeatsAPhoto() {
+        let items = libraryDeck(count: 8)
+        let model = SwipeReviewModel(items: items)
+        var selection = PhotoSelectionModel(result: fixtureResult())
+        selection.admitLibraryAssets(Set(items.map(\.assetID)))
+
+        var generator = SeededGenerator(seed: 7)
+        model.shuffleRemaining(using: &generator)
+
+        var visited: [String] = []
+        while let current = model.currentItem {
+            visited.append(current.assetID)
+            model.decide(.delete, selection: &selection)
+        }
+
+        #expect(visited.count == 8)
+        #expect(Set(visited).count == 8) // every photo exactly once — no repeats in a pass
+        #expect(model.isComplete)
+    }
+
+    @Test func shuffleWithZeroOrOneRemainingIsANoOp() {
+        let items = libraryDeck(count: 3)
+        let model = SwipeReviewModel(items: items)
+        var selection = PhotoSelectionModel(result: fixtureResult())
+        selection.admitLibraryAssets(Set(items.map(\.assetID)))
+        for _ in 0..<2 {
+            model.decide(.keep, selection: &selection)
+        }
+        #expect(model.remainingCount == 1)
+
+        var generator = SeededGenerator(seed: 99)
+        model.shuffleRemaining(using: &generator)
+
+        // One photo left: the order is untouched and the decision state is intact.
+        #expect(model.items == items)
+        #expect(model.cursor == 2)
+        #expect(model.canUndo)
+    }
+
+    // MARK: Start New Pass (Phase D)
+
+    @Test func startNewPassResetsTheCursorAndKeepsEveryDecision() {
+        let items = libraryDeck(count: 4)
+        let model = SwipeReviewModel(items: items)
+        var selection = PhotoSelectionModel(result: fixtureResult())
+        selection.admitLibraryAssets(Set(items.map(\.assetID)))
+
+        model.decide(.delete, selection: &selection) // lib1 marked
+        model.decide(.keep, selection: &selection)   // lib2 cleared
+        #expect(model.cursor == 2)
+
+        // The view rebuilds the library deck from the current catalog for a new pass; the
+        // model takes whatever it is given, resets position and undo, and keeps the log.
+        model.startNewPass(items: items)
+
+        #expect(model.cursor == 0)
+        #expect(model.history.isEmpty)
+        #expect(!model.canUndo) // honestly unavailable — the new pass has recorded nothing
+        #expect(model.currentItem?.assetID == "lib1")
+        #expect(model.decisions == ["lib1": .delete, "lib2": .keep])
+        #expect(model.deleteDecisionCount == 1)
+        #expect(selection.isSelected("lib1")) // the shared selection is untouched by the reset
+        #expect(!selection.isSelected("lib2"))
+    }
+
+    @Test func undoAcrossAPriorPassRestoresThePriorDecision() {
+        let items = [item("e1")]
+        let env = makeEnv()
+        let result = fixtureResult()
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: items)
+
+        // Pass 1 marks the photo Delete…
+        model.decide(.delete, selection: &env.selection)
+        // …pass 2 reviews it again and keeps it, overwriting the log entry…
+        model.startNewPass(items: items)
+        model.decide(.keep, selection: &env.selection)
+        #expect(model.decisions == ["e1": .keep])
+        #expect(model.deleteDecisionCount == 0)
+
+        // …and Undo restores the *prior pass's* decision, not a blank slate.
+        model.undo(selection: &env.selection)
+        #expect(model.decisions == ["e1": .delete])
+        #expect(model.deleteDecisionCount == 1)
+        #expect(env.selection.isSelected("e1"))
+        #expect(model.cursor == 0)
+    }
+
+    // MARK: Session persistence (Phase D)
+
+    @Test func saveAndRestoreRoundTripsTheExactSession() {
+        let env = makeEnv()
+        let items = libraryDeck(count: 5)
+        let model = SwipeReviewModel(items: items)
+        env.mutateSelection { $0.admitLibraryAssets(Set(items.map(\.assetID))) }
+
+        model.decide(.delete, selection: &env.selection)
+        model.decide(.keep, selection: &env.selection)
+        model.decide(.delete, selection: &env.selection)
+        var generator = SeededGenerator(seed: 3)
+        model.shuffleRemaining(using: &generator)
+        env.saveSwipeSession(from: model)
+
+        // A relaunch: a brand-new model (as the screen constructs on appear) adopts the
+        // persisted session exactly — deck order, position, undo stack, decisions.
+        let restored = SwipeReviewModel(items: [])
+        let snapshot = env.restoreSwipeSession()
+        #expect(snapshot != nil)
+        if let snapshot {
+            restored.restore(from: snapshot)
+        }
+        #expect(restored.items == model.items)
+        #expect(restored.cursor == model.cursor)
+        #expect(restored.history == model.history)
+        #expect(restored.decisions == model.decisions)
+        #expect(restored.deleteDecisionCount == model.deleteDecisionCount)
+        #expect(restored.canUndo)
+
+        // Undo still works after restoration: the cursor moves back, the stack shrinks, and
+        // the shared selection reverts the last decision (lib3's Delete → unmarked).
+        let beforeUndo = env.selection
+        #expect(beforeUndo.isSelected("lib3"))
+        restored.undo(selection: &env.selection)
+        #expect(restored.cursor == 2)
+        #expect(restored.history.count == 2)
+        #expect(restored.canUndo)
+        #expect(!env.selection.isSelected("lib3"))
+        #expect(env.selection.isSelected("lib1"))
+    }
+
+    @Test func restoreClampsABrokenCursorAndDropsADetachedUndoStack() {
+        let items = libraryDeck(count: 3)
+        let broken = SwipeReviewSessionSnapshot(
+            items: items,
+            cursor: 99, // beyond the deck — hand-edited or truncated file territory
+            history: [SwipeReviewHistoryEntry(assetID: "lib1", wasSelected: true, priorDecision: nil)],
+            decisions: ["lib1": .delete, "lib2": .keep]
+        )
+        let model = SwipeReviewModel(items: [])
+
+        model.restore(from: broken)
+
+        #expect(model.cursor == items.count) // clamped, never off the end
+        #expect(model.history.isEmpty) // detached from the cursor — dropped, never rewinding
+        #expect(model.decisions == ["lib1": .delete, "lib2": .keep])
+        #expect(model.deleteDecisionCount == 1) // recomputed from the log, not trusted blindly
+    }
+
+    @Test func restoreIgnoresAnEmptySnapshot() {
+        let model = SwipeReviewModel(items: libraryDeck(count: 2))
+        model.restore(from: SwipeReviewSessionSnapshot()) // no session saved at all
+        #expect(model.items.count == 2)
+        #expect(model.cursor == 0)
+    }
+
+    @Test func restoreThenReapplyDecisionsRebuildsTheMarksAfterARelaunch() {
+        let env = makeEnv()
+        let result = fixtureResult()
+        let items = SwipeReviewPresentation.items(from: result)
+        let model = SwipeReviewModel(items: items)
+        env.selection = PhotoSelectionModel(result: result)
+
+        model.decide(.delete, selection: &env.selection) // e1 marked
+        model.decide(.keep, selection: &env.selection)   // e2 cleared
+        env.saveSwipeSession(from: model)
+
+        // Relaunch: the selection is rebuilt from deterministic defaults (nothing marked),
+        // the session is restored, and the log is replayed onto the fresh selection —
+        // exactly what the screen's onAppear does.
+        var rebuilt = PhotoSelectionModel(result: result)
+        let restored = SwipeReviewModel(items: [])
+        if let snapshot = env.restoreSwipeSession() {
+            restored.restore(from: snapshot)
+        }
+        restored.reapplyDecisions(to: &rebuilt)
+
+        #expect(restored.cursor == 2)
+        #expect(rebuilt.isSelected("e1"))
+        #expect(!rebuilt.isSelected("e2"))
+        #expect(restored.canUndo)
+        // Idempotent: replaying the same log twice converges, never flips.
+        restored.reapplyDecisions(to: &rebuilt)
+        #expect(rebuilt.isSelected("e1"))
+        #expect(!rebuilt.isSelected("e2"))
+    }
+
+    @Test func snapshotCodableRoundTripIsExact() throws {
+        let items = libraryDeck(count: 3)
+        let snapshot = SwipeReviewSessionSnapshot(
+            items: items,
+            cursor: 2,
+            history: [
+                SwipeReviewHistoryEntry(assetID: "lib1", wasSelected: false, priorDecision: nil),
+                SwipeReviewHistoryEntry(assetID: "lib2", wasSelected: true, priorDecision: .keep),
+            ],
+            decisions: ["lib1": .delete, "lib2": .keep]
+        )
+
+        let decoded = try JSONDecoder().decode(
+            SwipeReviewSessionSnapshot.self,
+            from: JSONEncoder().encode(snapshot)
+        )
+
+        #expect(decoded == snapshot)
+    }
+
+    @Test func fileStoreRoundTripsAndRejectsForeignSchemasAndCorruption() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swipe-session-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FileSwipeReviewSessionStore(directoryOverride: directory)
+        let snapshot = SwipeReviewSessionSnapshot(
+            items: libraryDeck(count: 2),
+            cursor: 1,
+            decisions: ["lib1": .delete]
+        )
+
+        // Round trip: save hands off to the write drain, so wait for the write, then load.
+        store.save(snapshot)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while store.load() != snapshot, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(store.load() == snapshot)
+
+        // Future schema: dropped whole — a fresh session, never a misread one.
+        let foreign = """
+        {"schemaVersion":999,"items":[],"cursor":0,"history":[],"decisions":{}}
+        """
+        try Data(foreign.utf8).write(to: directory.appendingPathComponent("session.json"))
+        #expect(store.load() == nil)
+
+        // Corrupt bytes: same contract — unreadable reads as "no session".
+        try Data([0x00, 0x01, 0x02]).write(to: directory.appendingPathComponent("session.json"))
+        #expect(store.load() == nil)
+    }
+
+    // MARK: Review Cleanup candidates (Phase D)
+
+    @Test func cleanupCandidatesIncludeOnlySessionDeleteMarksStillSelectedAndPresent() {
+        let env = makeEnv()
+        let result = fixtureResult()
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+
+        env.mutateSelection { model.decide(.delete, selection: &$0) } // e1 marked
+        env.mutateSelection { model.decide(.keep, selection: &$0) }   // e2 cleared
+        // e3 and n1 were never reviewed — e3 is selected by default but is NOT a candidate:
+        // only this session's Delete marks qualify.
+        #expect(env.selection.selectedIDs == ["e1", "e3"])
+
+        #expect(model.cleanupCandidates(selection: env.selection).map(\.assetID) == ["e1"])
+
+        // Unmarked in the shared selection since the swipe → not a candidate anymore.
+        env.mutateSelection { $0.setSelected(false, forAsset: "e1") }
+        #expect(model.cleanupCandidates(selection: env.selection).isEmpty)
+
+        // Deleted from the catalog since the swipe → filtered by the available set.
+        env.mutateSelection { $0.setSelected(true, forAsset: "e1") }
+        #expect(model.cleanupCandidates(selection: env.selection, availableAssetIDs: ["e2", "e3"])
+            .isEmpty)
+        #expect(model.cleanupCandidates(selection: env.selection, availableAssetIDs: ["e1", "e3"])
+            .map(\.assetID) == ["e1"])
+    }
+
+    @Test func cleanupCandidatesPreserveDeckOrder() {
+        let env = makeEnv()
+        let items = libraryDeck(count: 6)
+        let model = SwipeReviewModel(items: items)
+        env.mutateSelection { $0.admitLibraryAssets(Set(items.map(\.assetID))) }
+
+        // Mark lib6, lib2, lib5 (out of order) — the candidate list follows the deck.
+        model.decide(.keep, selection: &env.selection)   // lib1
+        model.decide(.delete, selection: &env.selection) // lib2
+        model.decide(.keep, selection: &env.selection)   // lib3
+        model.decide(.keep, selection: &env.selection)   // lib4
+        model.decide(.delete, selection: &env.selection) // lib5
+        model.decide(.delete, selection: &env.selection) // lib6
+
+        let candidates = model.cleanupCandidates(selection: env.selection)
+        #expect(candidates.map(\.assetID) == ["lib2", "lib5", "lib6"])
+    }
+
+    @Test func largeDeckCleanupScopingIsExactAndNonMutating() {
+        let env = makeEnv()
+        let items = libraryDeck(count: 1_000)
+        let model = SwipeReviewModel(items: items)
+        env.mutateSelection { $0.admitLibraryAssets(Set(items.map(\.assetID))) }
+
+        // Every second photo marked — the scoping must read the existing deck, never
+        // rebuild or re-sort it (the "large library" contract).
+        for (index, _) in items.enumerated() {
+            model.decide(index.isMultiple(of: 2) ? .delete : .keep, selection: &env.selection)
+        }
+        #expect(model.deleteDecisionCount == 500)
+        let deckBefore = model.items
+
+        let candidates = model.cleanupCandidates(selection: env.selection)
+
+        #expect(candidates.count == 500)
+        let expectedIDs = items.enumerated()
+            .filter { $0.offset.isMultiple(of: 2) }
+            .map { $0.element.assetID }
+        #expect(candidates.map(\.assetID) == expectedIDs)
+        #expect(model.items == deckBefore) // scoping is a read — the deck never moves
+        #expect(env.selection.selectedCount == 500)
+    }
+
+    // MARK: Review Cleanup selection state (Phase D)
+
+    @Test func candidatesDefaultToCheckedWithExactCounts() {
+        let env = makeEnv()
+        let result = fixtureResult()
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection) // e1
+        model.decide(.keep, selection: &env.selection)   // e2
+        model.decide(.delete, selection: &env.selection) // e3
+
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+
+        #expect(env.swipeCleanupCandidates.map(\.assetID) == ["e1", "e3"])
+        #expect(env.swipeCleanupCheckedIDs == ["e1", "e3"]) // default: everything checked
+        #expect(env.swipeCleanupCheckedCount == 2)
+        #expect(SwipeReviewPresentation.selectedOfTotalText(selected: 2, total: 2)
+                == "2 of 2 selected")
+        #expect(SwipeReviewPresentation.reviewButtonTitle(2) == "Review 2 Photos")
+    }
+
+    @Test func individualBulkAndReentrySelectionBehavior() {
+        let env = makeEnv()
+        let result = fixtureResult()
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection) // e1
+        model.decide(.keep, selection: &env.selection)   // e2
+        model.decide(.delete, selection: &env.selection) // e3
+
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+
+        // Individual toggle.
+        env.setSwipeCleanupChecked("e1", checked: false)
+        #expect(env.swipeCleanupCheckedIDs == ["e3"])
+        #expect(env.swipeCleanupCheckedCount == 1)
+        // A toggle for a non-candidate is refused, not silently stored.
+        env.setSwipeCleanupChecked("n1", checked: false)
+        #expect(env.swipeCleanupCheckedIDs == ["e3"])
+
+        // Bulk.
+        env.deselectAllSwipeCleanup()
+        #expect(env.swipeCleanupCheckedCount == 0)
+        #expect(!SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: 0))
+        env.selectAllSwipeCleanup()
+        #expect(env.swipeCleanupCheckedIDs == ["e1", "e3"])
+
+        // Re-entering preserves explicit choices…
+        env.setSwipeCleanupChecked("e3", checked: false)
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        #expect(env.swipeCleanupCheckedIDs == ["e1"])
+
+        // …and the session keeps going: a later Delete mark (n1) joins already selected,
+        // while e3's explicit "no" sticks — choices are keyed by asset, not by position.
+        model.decide(.delete, selection: &env.selection) // n1 → marked (cursor 3 → 4)
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        #expect(env.swipeCleanupCandidates.map(\.assetID) == ["e1", "e3", "n1"])
+        #expect(env.swipeCleanupCheckedIDs == ["e1", "n1"])
+        #expect(env.swipeCleanupCheckedCount == 2)
+    }
+
+    // MARK: Review Cleanup through the existing deletion pipeline (Phase D)
+
+    @Test func confirmationDeletesExactlyTheCheckedSubset() async {
+        let service = RecordingCleanupDeletionService(
+            outcome: .succeeded(DeletionSuccess(plannedCount: 1, verifiedRemovedCount: 1, remainingIDs: []))
+        )
+        let env = makeReviewReadyEnv(deletionService: service)
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+
+        model.decide(.delete, selection: &env.selection) // e1
+        model.decide(.keep, selection: &env.selection)   // e2
+        model.decide(.delete, selection: &env.selection) // e3
+
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        env.setSwipeCleanupChecked("e3", checked: false) // the user unchecks e3
+
+        env.reviewDidAppear(from: .swipeReview)
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["e1"]) // the plan is the checked subset only
+
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        // The service saw exactly the checked, still-selected, catalog-validated assets —
+        // e3 was never in the plan and never in the execution context.
+        #expect(service.executedSelectionIDs.count == 1)
+        #expect(service.executedSelectionIDs.first == ["e1"])
+        #expect(env.deletionState == .succeeded(DeletionSuccess(
+            plannedCount: 1, verifiedRemovedCount: 1, remainingIDs: []
+        )))
+    }
+
+    @Test func uncheckingAfterThePlanIsBuiltStalesItBeforeAnyMutation() async {
+        let service = RecordingCleanupDeletionService(
+            outcome: .succeeded(DeletionSuccess(plannedCount: 1, verifiedRemovedCount: 1, remainingIDs: []))
+        )
+        let env = makeReviewReadyEnv(deletionService: service)
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection)
+
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        env.reviewDidAppear(from: .swipeReview)
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+
+        // The user unchecks the only candidate while the plan is on screen: the plan is
+        // immediately stale — the same selectionChanged contract every other source uses.
+        env.setSwipeCleanupChecked("e1", checked: false)
+        guard case .planStale(_, let reasons) = env.deletionState else {
+            Issue.record("expected planStale, got \(env.deletionState)")
+            return
+        }
+        #expect(reasons == [.selectionChanged])
+
+        // Confirmation and execution refuse a stale plan — zero assets touched.
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        #expect(service.executedSelectionIDs.isEmpty)
+    }
+
+    @Test func unmarkingAfterThePlanIsBuiltStalesItThroughTheSharedSelection() async {
+        let env = makeReviewReadyEnv()
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection)
+
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        env.reviewDidAppear(from: .swipeReview)
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+
+        // The grid unchecks the same photo while the swipe-cleanup plan is live: the
+        // checked ∩ selected snapshot moved, so the plan stale-s immediately.
+        env.mutateSelection { $0.setSelected(false, forAsset: "e1") }
+        guard case .planStale(_, let reasons) = env.deletionState else {
+            Issue.record("expected planStale, got \(env.deletionState)")
+            return
+        }
+        #expect(reasons == [.selectionChanged])
+    }
+
+    @Test func cleanupChoiceChangesNeverStaleAPlanFromAnotherSource() async {
+        let env = makeReviewReadyEnv()
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection)
+
+        // Candidates exist, but the live plan came from the Similar Photos grid.
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        env.reviewDidAppear(from: .similarPhotos)
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+
+        env.setSwipeCleanupChecked("e1", checked: false)
+        env.selectAllSwipeCleanup()
+
+        // A similar-photos plan only goes stale when the *shared selection* moves — cleanup
+        // toggles are scoped to the swipe flow and must not fake staleness here.
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected the similarPhotos plan to stay ready, got \(env.deletionState)")
+            return
+        }
+    }
+
+    @Test func partialFailuresAreReportedHonestly() async {
+        let service = RecordingCleanupDeletionService(
+            // PhotoKit removed nothing that time — the remaining ID keeps the outcome
+            // partial, and the state machine must say so rather than claim success.
+            outcome: .succeeded(DeletionSuccess(
+                plannedCount: 1, verifiedRemovedCount: 0, remainingIDs: ["e1"]
+            ))
+        )
+        let env = makeReviewReadyEnv(deletionService: service)
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection)
+
+        env.enterSwipeCleanup(model.cleanupCandidates(selection: env.selection))
+        env.reviewDidAppear(from: .swipeReview)
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .needsReview(let success) = env.deletionState else {
+            Issue.record("expected needsReview for a partial outcome, got \(env.deletionState)")
+            return
+        }
+        #expect(success.remainingIDs == ["e1"])
+        #expect(!success.isFullyRemoved)
+    }
+
+    @Test func aCandidateMissingFromTheCatalogNeverEntersThePlan() async {
+        let service = RecordingCleanupDeletionService(
+            outcome: .succeeded(DeletionSuccess(plannedCount: 1, verifiedRemovedCount: 1, remainingIDs: []))
+        )
+        let env = makeReviewReadyEnv(deletionService: service)
+        let result = fixtureResult()
+        env.analysisState = .completed(result)
+        env.selection = PhotoSelectionModel(result: result)
+        let model = SwipeReviewModel(items: SwipeReviewPresentation.items(from: result))
+        model.decide(.delete, selection: &env.selection) // e1
+        model.decide(.keep, selection: &env.selection)   // e2
+        model.decide(.delete, selection: &env.selection) // e3
+
+        // e3 vanished from the catalog between the swipe and the cleanup screen: the enter
+        // pass filters it out against the live records, before any plan can see it.
+        env.enterSwipeCleanup(
+            model.cleanupCandidates(
+                selection: env.selection,
+                availableAssetIDs: ["e1", "e2", "n1"]
+            )
+        )
+        #expect(env.swipeCleanupCheckedIDs == ["e1"])
+
+        env.reviewDidAppear(from: .swipeReview)
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("expected readyForReview, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["e1"])
+
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        #expect(service.executedSelectionIDs.first == ["e1"])
+    }
 }
 
 // MARK: - Helpers
@@ -555,7 +1170,8 @@ private func libraryDeck(count: Int) -> [SwipeReviewItem] {
 @MainActor
 private func makeEnv(
     calls: CallCounter? = nil,
-    deletionService: any PhotoDeleting = CountingDeletionService()
+    deletionService: any PhotoDeleting = CountingDeletionService(),
+    sessionStore: any SwipeReviewSessionStore = InMemorySwipeReviewSessionStore()
 ) -> AppEnvironment {
     let env = AppEnvironment(
         storageProvider: FakeStorage(),
@@ -565,7 +1181,10 @@ private func makeEnv(
         },
         deletionService: deletionService,
         // Completions in this suite must never touch the app's real persisted snapshot.
-        scanSnapshotStore: InMemoryScanSnapshotStore()
+        scanSnapshotStore: InMemoryScanSnapshotStore(),
+        // Likewise the session file: restoration tests read this store, never Application
+        // Support, so results are deterministic and leave no files behind.
+        swipeSessionStore: sessionStore
     )
     env.photoPermissionState = .authorized
     return env
@@ -574,13 +1193,18 @@ private func makeEnv(
 /// An environment whose catalog and permissions are complete enough for the existing review
 /// flow to prepare a plan — the handoff target of the completion state's "Review Cleanup".
 @MainActor
-private func makeReviewReadyEnv() -> AppEnvironment {
+private func makeReviewReadyEnv(
+    deletionService: any PhotoDeleting = CountingDeletionService(),
+    sessionStore: any SwipeReviewSessionStore = InMemorySwipeReviewSessionStore()
+) -> AppEnvironment {
     let records = ["e1", "e2", "e3", "n1"].map { makeRecord(id: $0) }
     let env = AppEnvironment(
         storageProvider: FakeStorage(),
         photoPermission: FakePermissionService(.authorized),
         sizeProvider: FakeSizeProvider(),
-        scanSnapshotStore: InMemoryScanSnapshotStore()
+        deletionService: deletionService,
+        scanSnapshotStore: InMemoryScanSnapshotStore(),
+        swipeSessionStore: sessionStore
     )
     env.photoPermissionState = .authorized
     env.catalogState = .completed(CatalogScanResult(
@@ -683,4 +1307,74 @@ private func makeRecord(id: String) -> PhotoAssetRecord {
         representsBurst: false,
         burstIdentifier: nil
     )
+}
+
+/// Deterministic generator (splitmix64) so shuffle tests assert exact behavior instead of
+/// probabilistic behavior — one seed, one order, on every run.
+private struct SeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9e37_79b9_7f4a_7c15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xbf58_476d_1ce4_e5b9
+        z = (z ^ (z >> 27)) &* 0x94d0_49bb_1331_11eb
+        return z ^ (z >> 31)
+    }
+}
+
+/// In-memory session store so restoration tests are deterministic and leave no files on
+/// disk — the same seam `scanSnapshotStore` provides for checkpoint tests.
+private final class InMemorySwipeReviewSessionStore: SwipeReviewSessionStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: SwipeReviewSessionSnapshot?
+
+    func load() -> SwipeReviewSessionSnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func save(_ snapshot: SwipeReviewSessionSnapshot) {
+        lock.lock()
+        defer { lock.unlock() }
+        stored = snapshot
+    }
+}
+
+/// Records the execution context every confirmation passed to the service, so "only the
+/// checked subset is deleted" is an assertion about what the pipeline actually saw.
+private final class RecordingCleanupDeletionService: PhotoDeleting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var contexts: [Set<String>] = []
+    private let outcome: DeletionOutcome
+
+    init(outcome: DeletionOutcome) {
+        self.outcome = outcome
+    }
+
+    func execute(
+        _ confirmed: ConfirmedDeletionPlan,
+        in context: PlanExecutionContext
+    ) async -> DeletionOutcome {
+        record(context.selectionIDs)
+        return outcome
+    }
+
+    // Synchronous so `NSLock` (unavailable in async contexts) can be used safely.
+    private func record(_ selectionIDs: Set<String>) {
+        lock.lock()
+        contexts.append(selectionIDs)
+        lock.unlock()
+    }
+
+    var executedSelectionIDs: [Set<String>] {
+        lock.lock()
+        defer { lock.unlock() }
+        return contexts
+    }
 }

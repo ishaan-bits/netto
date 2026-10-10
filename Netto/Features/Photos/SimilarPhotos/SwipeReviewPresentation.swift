@@ -4,7 +4,7 @@ import Foundation
 /// shows under the counter. Built from the scanned catalog (the general library) — never
 /// from a fresh library read or a re-analysis — so the session presents exactly the photos
 /// the app has already read on this iPhone.
-struct SwipeReviewItem: Sendable, Equatable, Identifiable {
+struct SwipeReviewItem: Sendable, Equatable, Identifiable, Codable {
     let assetID: String
     let groupKind: PhotoSimilarityGroupKind
     /// 1-based position of the item's group among the groups presented this session, so the
@@ -56,6 +56,31 @@ enum SwipeReviewPresentation {
     static let keepAccessibilityLabel = "Keep"
 
     static let undoButtonTitle = "Undo"
+
+    // MARK: Shuffle and new pass
+
+    static let shuffleButtonTitle = "Shuffle"
+    static let shuffleAccessibilityID = "swipeShuffleButton"
+    static let shuffleAccessibilityLabel = "Shuffle the photos you have not reviewed yet"
+
+    /// "Start New Pass" on the completion screen: reshuffle the whole deck (picking up newly
+    /// scanned photos for a library session) and review again. Decisions are never touched —
+    /// a new pass re-orders the deck and resets the cursor and undo stack, nothing else.
+    static let newPassButtonTitle = "Start New Pass"
+    static let newPassAccessibilityID = "swipeNewPassButton"
+
+    /// Shuffle is only meaningful when at least two unreviewed photos remain — with one (or
+    /// none) there is nothing to re-order, so the button sits visibly disabled instead of
+    /// pretending to do something.
+    static func shuffleEnabled(remaining: Int) -> Bool {
+        remaining > 1
+    }
+
+    /// Unreviewed photos still to decide — the Shuffle button's gate and the honest
+    /// denominator behind it. O(1); never a deck filter.
+    static func remainingCount(cursor: Int, total: Int) -> Int {
+        max(0, total - cursor)
+    }
 
     /// In-card labels shown while a finger is dragging: right = keep, left = delete.
     static let keepIndicatorLabel = "KEEP"
@@ -129,17 +154,116 @@ enum SwipeReviewPresentation {
         selectedCount > 0
     }
 
-    /// The completion state's primary action target: the *existing* Review flow
-    /// (`ReviewSelectionView`, which enters through `reviewDidAppear(from: .similarPhotos)`).
-    /// Swipe Review never builds its own deletion surface — it only hands the (already
-    /// existing) selection to the same review screen the bottom Review button pushes.
+    /// The completion state's primary action target: the *editable* cleanup flow. Swipe
+    /// Review never deletes on its own — it hands the session's Delete marks to
+    /// `SwipeCleanupSelectionView`, which scoping-checks them and then enters the same
+    /// `ReviewSelectionView` → plan → confirmation → PhotoKit pipeline every other feature
+    /// uses.
     enum CompletionDestination: Equatable {
-        case existingReviewFlow
+        case editableCleanup
         case dismissToSimilarPhotos
     }
 
-    static let completionPrimaryDestination: CompletionDestination = .existingReviewFlow
+    static let completionPrimaryDestination: CompletionDestination = .editableCleanup
     static let completionSecondaryDestination: CompletionDestination = .dismissToSimilarPhotos
+
+    // MARK: Editable Review Cleanup (session-scoped)
+
+    /// The cleanup screen: every photo this session marked Delete, selectable before the
+    /// existing review pipeline is entered.
+    static let cleanupTitle = "Review Cleanup"
+    static let cleanupScreenAccessibilityID = "swipeCleanupScreen"
+    static let cleanupSelectedCountAccessibilityID = "swipeCleanupSelectedCount"
+    static let selectAllTitle = "Select All"
+    static let deselectAllTitle = "Deselect All"
+    static let selectAllAccessibilityID = "swipeCleanupSelectAllButton"
+    static let deselectAllAccessibilityID = "swipeCleanupDeselectAllButton"
+    static let cleanupReviewAccessibilityID = "swipeCleanupReviewButton"
+
+    /// Per-row identifier — stable for tests and UI automation without embedding a count.
+    static func cleanupRowAccessibilityID(_ assetID: String) -> String {
+        "swipeCleanupRow-\(assetID)"
+    }
+
+    static let cleanupEmptyMessage =
+        "Photos you mark Delete show up here. Swipe left on a photo to mark it for cleanup."
+    static let keepExclusionNote = "Photos you kept are never shown here."
+    static let confirmNote =
+        "Nothing is deleted until you confirm the deletion on the next screen."
+
+    /// "7 of 12 selected" — the live count over the cleanup screen's candidates.
+    static func selectedOfTotalText(selected: Int, total: Int) -> String {
+        "\(selected) of \(total) selected"
+    }
+
+    /// "Review 12 Photos" / "Review 1 Photo" — the handoff button into the existing review.
+    static func reviewButtonTitle(_ count: Int) -> String {
+        "Review \(count) \(count == 1 ? "Photo" : "Photos")"
+    }
+
+    /// The cleanup screen's candidate list, in deck order: exactly the photos this session
+    /// decided "Delete" that are *still* marked in the shared selection and still present in
+    /// the catalog. Photos decided "Keep" are excluded by the decision check; photos never
+    /// reviewed (e.g. group members merely carrying the default selection) are excluded the
+    /// same way; `availableAssetIDs` drops assets deleted or unavailable since the deck was
+    /// built. `nil` availability means "no catalog to reconcile against" — no filtering.
+    static func cleanupCandidates(
+        items: [SwipeReviewItem],
+        decisions: [String: SwipeReviewDecision],
+        selection: PhotoSelectionModel,
+        availableAssetIDs: Set<String>? = nil
+    ) -> [SwipeReviewItem] {
+        items.filter { item in
+            guard decisions[item.assetID] == .delete, selection.isSelected(item.assetID) else {
+                return false
+            }
+            return availableAssetIDs?.contains(item.assetID) ?? true
+        }
+    }
+
+    /// Whether a deck should be constructed right now: only when no explicit deck was
+    /// supplied *and* the session has none. Called from the screen's appear and catalog-change
+    /// paths — once those checks say no (the normal state for an in-flight or finished
+    /// session), no work runs, so repeated renders of a 30,000-photo library never rebuild,
+    /// re-sort, or re-filter the deck.
+    static func shouldInstallDeck(presetItemsSupplied: Bool, sessionIsEmpty: Bool) -> Bool {
+        !presetItemsSupplied && sessionIsEmpty
+    }
+
+    /// Reconciles a persisted snapshot against the catalog as it is *now* before the session
+    /// adopts it: photos deleted or no longer visible since the deck was built leave the deck
+    /// (with the cursor keeping its position *relative to the photos that remain*), their
+    /// stale history entries and decisions drop with them, and a session whose deck vanished
+    /// entirely reads as no session. `nil` availability means no completed catalog to
+    /// reconcile against — the snapshot is adopted untouched.
+    ///
+    /// Newly added photos never sneak into an in-flight deck (they join on Start New Pass,
+    /// which rebuilds a library deck from the current catalog).
+    static func reconciled(
+        _ snapshot: SwipeReviewSessionSnapshot,
+        availableAssetIDs: Set<String>?
+    ) -> SwipeReviewSessionSnapshot? {
+        guard let availableAssetIDs else {
+            return snapshot.items.isEmpty ? nil : snapshot
+        }
+        var kept: [SwipeReviewItem] = []
+        kept.reserveCapacity(snapshot.items.count)
+        var keptCursor = 0
+        for (index, item) in snapshot.items.enumerated() {
+            guard availableAssetIDs.contains(item.assetID) else { continue }
+            if index < snapshot.cursor { keptCursor += 1 }
+            kept.append(item)
+        }
+        guard !kept.isEmpty else { return nil }
+        var reconciled = snapshot
+        reconciled.items = kept
+        reconciled.cursor = keptCursor
+        reconciled.history = snapshot.history.filter { availableAssetIDs.contains($0.assetID) }
+        reconciled.decisions = snapshot.decisions.filter {
+            availableAssetIDs.contains($0.key)
+        }
+        return reconciled
+    }
 
     // MARK: Session order
 

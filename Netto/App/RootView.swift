@@ -9,6 +9,10 @@ enum DeletionSelectionSource: Sendable, Equatable {
     case screenshots
     case videos
     case blurReview
+    /// Swipe Review's editable cleanup: a *scoped subset* of the shared selection (this
+    /// session's checked Delete marks), validated against both the checked set and the live
+    /// selection at build and at execution.
+    case swipeReview
 }
 
 /// The app's lifecycle phase as the environment reasons about it — mapped from `ScenePhase`
@@ -105,6 +109,9 @@ final class AppEnvironment {
     /// The shared App Group summary the home screen widget renders. Injected so tests
     /// record writes (and reload requests) instead of touching the real container.
     let widgetSummaryStore: any WidgetSummaryStoring
+    /// Persistence seam for Swipe Review sessions (deck order, cursor, undo, decisions).
+    /// Injected so tests use temporary storage instead of the app's real session file.
+    let swipeSessionStore: any SwipeReviewSessionStore
 
     var flowState: AppFlowState = .launching
     var prompt: PermissionPrompt = .none
@@ -213,6 +220,102 @@ final class AppEnvironment {
     var contactReviewChoice: ContactActionChoice?
     /// Which source the current/last plan was built from; confirmation validates against it.
     private var planSource: DeletionSelectionSource = .similarPhotos
+
+    // MARK: Editable swipe-cleanup selection (Phase D)
+
+    /// The current review session's Delete-marked candidates, in deck order — refreshed from
+    /// `SwipeCleanupSelectionView` on appear (and only there: never per render).
+    private(set) var swipeCleanupCandidates: [SwipeReviewItem] = []
+    /// Explicit per-candidate choices made inside the cleanup flow, keyed by asset. Absent =
+    /// still on the default (selected). Lives in the environment — not in view state — so
+    /// checks and unchecks survive every navigation *within* the review flow; a candidate
+    /// that appears later (a new Delete mark) joins selected unless the user already chose
+    /// otherwise for that asset.
+    private var swipeCleanupChoices: [String: Bool] = [:]
+
+    /// The checked subset the plan is built from: candidates still checked. Read through
+    /// `selectionIDs(for: .swipeReview)` at plan build *and* at execution, so a change to
+    /// either the checks or the shared selection stale/refuse the plan.
+    var swipeCleanupCheckedIDs: Set<String> {
+        Set(swipeCleanupCandidates.lazy.map(\.assetID).filter {
+            self.swipeCleanupChoices[$0] ?? true
+        })
+    }
+
+    /// O(candidates) count of the checked subset — candidates are only ever the session's
+    /// Delete marks (bounded by what the user swiped), and the cleanup screen renders every
+    /// one of them anyway.
+    var swipeCleanupCheckedCount: Int {
+        swipeCleanupCandidates.reduce(0) { partial, item in
+            partial + ((self.swipeCleanupChoices[item.assetID] ?? true) ? 1 : 0)
+        }
+    }
+
+    /// Installs the candidate list when the cleanup screen appears. Choices are kept: a
+    /// still-present candidate stays whatever the user last set, a vanished one is filtered
+    /// out of the checked set by definition, and a newly marked photo joins selected.
+    func enterSwipeCleanup(_ candidates: [SwipeReviewItem]) {
+        swipeCleanupCandidates = candidates
+        staleSwipeCleanupPlanIfCurrent()
+    }
+
+    func setSwipeCleanupChecked(_ assetID: String, checked: Bool) {
+        guard swipeCleanupCandidates.contains(where: { $0.assetID == assetID }) else { return }
+        swipeCleanupChoices[assetID] = checked
+        staleSwipeCleanupPlanIfCurrent()
+    }
+
+    func selectAllSwipeCleanup() {
+        for candidate in swipeCleanupCandidates {
+            swipeCleanupChoices[candidate.assetID] = true
+        }
+        staleSwipeCleanupPlanIfCurrent()
+    }
+
+    func deselectAllSwipeCleanup() {
+        for candidate in swipeCleanupCandidates {
+            swipeCleanupChoices[candidate.assetID] = false
+        }
+        staleSwipeCleanupPlanIfCurrent()
+    }
+
+    /// A prepared swipe-review plan no longer matches the checked ∩ selected set it was
+    /// built from — exactly the `selectionChanged` staleness every other source uses. A plan
+    /// that still matches is left alone, so merely re-entering the screen never fakes a
+    /// "out of date" state.
+    private func staleSwipeCleanupPlanIfCurrent() {
+        guard planSource == .swipeReview else { return }
+        switch deletionState {
+        case .readyForReview(let plan), .awaitingConfirmation(let plan):
+            guard plan.selectionSnapshot != selectionIDs(for: .swipeReview) else { return }
+            applyDeletion(.planStale(plan, [.selectionChanged]))
+        default:
+            break
+        }
+    }
+
+    // MARK: Session persistence (Phase D)
+
+    /// Persists the session after every mutation. The store's file implementation drains
+    /// off the main actor and coalesces bursts; the in-memory test store is synchronous.
+    func saveSwipeSession(from model: SwipeReviewModel) {
+        let snapshot = model.sessionSnapshot()
+        cachedSwipeSession = .some(snapshot)
+        swipeSessionStore.save(snapshot)
+    }
+
+    /// The persisted session, loaded once per process. Double-optional: `nil` (outer) means
+    /// "not loaded yet", `.some(nil)` means "loaded — no session" (so a fresh launch does not
+    /// re-read the file on every call). Callers treat both as "no session".
+    func restoreSwipeSession() -> SwipeReviewSessionSnapshot? {
+        if let cached = cachedSwipeSession { return cached }
+        let loaded = swipeSessionStore.load()
+        cachedSwipeSession = .some(loaded)
+        return loaded
+    }
+
+    /// Load-once cache for `restoreSwipeSession()`; `nil` = not loaded yet.
+    @ObservationIgnored private var cachedSwipeSession: SwipeReviewSessionSnapshot??
     /// Bumped by the `didSet`s on `catalogState` and `blurAnalysisState` — the two inputs of
     /// the blur-candidate record cache. Selection and progress-unrelated writes never bump it.
     @ObservationIgnored private var blurDatasetGeneration: UInt64 = 0
@@ -277,6 +380,7 @@ final class AppEnvironment {
         checkpointStore: any ScanCheckpointStore = FileScanCheckpointStore(),
         backgroundTasks: any BackgroundTaskScheduling = SystemBackgroundTaskScheduler(),
         widgetSummaryStore: any WidgetSummaryStoring = FileWidgetSummaryStore(),
+        swipeSessionStore: any SwipeReviewSessionStore = FileSwipeReviewSessionStore(),
         sessionToken: String = UUID().uuidString
     ) {
         self.storageProvider = storageProvider
@@ -296,6 +400,7 @@ final class AppEnvironment {
         self.checkpointAccumulator = ScanCheckpointAccumulator(writer: writer)
         self.backgroundTasks = backgroundTasks
         self.widgetSummaryStore = widgetSummaryStore
+        self.swipeSessionStore = swipeSessionStore
         self.deletionSessionToken = sessionToken
     }
 
@@ -1276,13 +1381,15 @@ final class AppEnvironment {
                 return
             }
             analysisResult = .empty
-        case .similarPhotos:
+        case .similarPhotos, .swipeReview:
             // Swipe Review writes its marks into this same selection and never needs the
             // similarity result to open or run — its deck *is* the scanned catalog — so a
             // library that has not been analysed must not dead-end its "Review Cleanup".
             // Fall back to the empty result exactly as the catalog-only sources do: the
-            // plan is record-driven (validation, sizes, confirmation are unchanged), and a
-            // later analysis rebuilds the selection and stales any plan built without it.
+            // plan is record-driven (validation, sizes, confirmation are unchanged), and
+            // a later analysis rebuilds the selection and stales any plan built without it.
+            // The swipe-cleanup source additionally scopes the plan to the checked subset
+            // of that selection (`selectionIDs(for:)`), but plan *building* is identical.
             if case .completed(let completed) = analysisState {
                 analysisResult = completed
             } else {
@@ -1398,11 +1505,13 @@ final class AppEnvironment {
     }
 
     /// User changed the similar-photos selection after a plan was shown — the plan is
-    /// immediately stale. Only plans built from that source are affected.
+    /// immediately stale. Only plans built from a source that reads this selection are
+    /// affected: `.similarPhotos` reads all of it, and `.swipeReview` reads its checked
+    /// subset of it, so either kind of plan must stale when the marks move underneath.
     func mutateSelection(_ mutation: (inout PhotoSelectionModel) -> Void) {
         let before = selection.selectedIDs
         mutation(&selection)
-        guard planSource == .similarPhotos else { return }
+        guard planSource == .similarPhotos || planSource == .swipeReview else { return }
         // Only a change to what is *marked* stales the plan: accepted-set mutations (e.g.
         // Swipe Review re-admitting its whole deck on appear) provably cannot alter the
         // plan's selection snapshot, and staling on them told the user their prepared
@@ -1828,6 +1937,11 @@ final class AppEnvironment {
         case .screenshots: return screenshotSelection.selectedIDs
         case .videos: return videoSelection.selectedIDs
         case .blurReview: return blurSelection.selectedIDs
+        // Checked ∩ live selection: a check that no longer maps to a mark (the photo was
+        // unmarked elsewhere or pruned) is not a deletion candidate, and a mark the user
+        // just unchecked is not either. Read identically at build and at execution, so any
+        // change on either side stales or refuses the plan.
+        case .swipeReview: return swipeCleanupCheckedIDs.intersection(selection.selectedIDs)
         }
     }
 
@@ -1835,7 +1949,7 @@ final class AppEnvironment {
     /// no dataset (never matches a real plan's stamp, so such a plan is stale).
     private func currentDatasetSignature(for source: DeletionSelectionSource) -> String {
         switch source {
-        case .similarPhotos:
+        case .similarPhotos, .swipeReview:
             if case .completed(let result) = analysisState {
                 return DeletionPlanner.analysisSignature(for: result)
             }
@@ -1868,7 +1982,7 @@ final class AppEnvironment {
         blur: BlurAnalysisResult?
     ) -> String {
         switch source {
-        case .similarPhotos: return DeletionPlanner.analysisSignature(for: analysis)
+        case .similarPhotos, .swipeReview: return DeletionPlanner.analysisSignature(for: analysis)
         case .screenshots: return ScreenshotDataset.signature(in: catalog)
         case .videos: return VideoDataset.signature(in: catalog)
         case .blurReview:

@@ -45,11 +45,17 @@ Beyond the core cleanup loop:
 - **Large photo preview** — a full photo details/preview screen, with a progressive
   local-rendition fallback so previews keep working when PhotoKit's fast
   representation request fails.
-- **Swipe Keep/Delete review mode** — a Tinder-style swipe session over the similar-photo
-  deck: swipe to keep or mark for cleanup, with Undo, a persistent bottom bar showing
-  "N photos selected for cleanup" and a live **Review Cleanup** handoff into the existing
-  review flow, and a completion screen on finishing the deck. All decisions persist in the
-  shared selection model across navigation.
+- **Swipe Keep/Delete review mode** — a Tinder-style swipe session over the photo
+  library (similarity deck or the whole library from the dashboard card): swipe to keep
+  or mark for cleanup, with Undo and a persistent bottom bar showing the session's live
+  Delete-mark count and a **Review Cleanup** handoff. Shuffle re-orders only the photos
+  you have not reviewed yet (no repeats within a pass; **Start New Pass** on the
+  completion screen resets position and keeps every decision), the session itself —
+  deck order, position, undo history, and the decision log — persists through
+  navigation and relaunch (asset identifiers and review state only, never pixels), and
+  the handoff opens an **editable** list of exactly this session's Delete marks (all
+  checked by default, individual toggles plus Select All / Deselect All) before entering
+  the existing confirmation → deletion pipeline.
 - **Deselect All / Reset to Recommended** — bulk selection controls, including restoring
   the engine's recommended selection exactly as presented.
 - **Scan ETA** — a rolling-throughput estimate of remaining scan time shown alongside
@@ -158,6 +164,49 @@ without ever claiming the system will keep scanning in the background:
   the rest become no-ops), timeouts and cancellations are distinguished from unavailable
   content, and a resumed pass issues fresh requests rather than reusing a timed-out one.
 
+### Swipe Review & editable cleanup (Phase D)
+
+The swipe session and its cleanup handoff are durable, scoped, and reuse the existing
+deletion safety net rather than adding a second one:
+
+- **Shuffle without losing place** — the Shuffle button (top of the review, and the
+  only way order changes mid-pass) re-orders *only the unreviewed tail* of the deck:
+  the reviewed prefix, the cursor, the undo stack, and every Keep/Delete decision are
+  untouched, so a reviewed photo can never re-enter the pass. With fewer than two
+  photos remaining the button is visibly disabled instead of pretending to act. Within
+  one pass the cursor only moves forward through unique items, so photos never repeat;
+  **Start New Pass** (completion screen) resets cursor and undo, keeps the decision log,
+  and rebuilds a library deck from the current catalog (group sessions keep their deck).
+- **Session persistence** — after every decision, undo, shuffle, and new pass, the
+  session is saved through a `SwipeReviewSessionStore` seam (asset identifiers and
+  review state only — no pixels, no thumbnails) as one small JSON document
+  (`<Application Support>/SwipeReview/session.json`, schema-versioned, atomic writes,
+  bursts coalesced off the main actor so the file only ever holds a state that actually
+  existed). Restoring on the next appear reconciles the deck against the catalog *as it
+  is now*: photos deleted since the session left drop out (with their history and
+  decisions), the cursor keeps its position relative to the photos that remain, a
+  deck that vanished entirely reads as no session, and corrupt or future-schema files
+  degrade to "fresh session", never to a crash. The decision log is then replayed onto
+  the shared selection, so Keep/Delete marks survive a relaunch.
+- **Editable Review Cleanup** — the persistent bar and the completion screen hand off
+  to a candidate list scoped to *this session's* Delete marks, in deck order: Kept
+  photos and photos never reviewed are excluded even if the shared selection carries
+  them, assets deleted from the catalog since the swipe are filtered out before any
+  plan can see them, and everything eligible is checked by default. Individual toggles
+  plus Select All / Deselect All update the live "N of M selected" count; explicit
+  choices are keyed by asset and survive navigating back into the list, while a photo
+  marked Delete since the last visit joins already selected. The screen selects only —
+  it never deletes and never builds a plan.
+- **The existing pipeline, unchanged** — the handoff enters the same
+  `ReviewSelectionView` → confirm → `PhotoDeleting` flow every other feature uses, as a
+  new `.swipeReview` source whose plan is built from the *checked ∩ still-selected*
+  set and validated (asset existence, sizes, authorization, session, dataset
+  fingerprint) immediately before execution — so unchecking a photo, unmarking it in
+  the grid, or deleting it behind the app's back stale or refuse the plan rather than
+  deleting something the user no longer sees selected. Partial failures, permission
+  losses, and vanished assets report honestly through the same outcome states as
+  everywhere else. Swipe Review itself still never deletes anything.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -221,7 +270,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 738 Swift Testing cases across 76 suites covering the pure
+- **Unit suite** — 46 files, 761 Swift Testing cases across 76 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -260,13 +309,31 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   persists exactly what landed and foregrounding measures only the remainder, a paused
   heavy pass's checkpoint keeps the file slot), and ETA reset semantics (reset drops
   every sample; a countdown reappears only from fresh post-reset observations).
+- **Swipe Review & cleanup coverage (Phase D)** — 23 cases over the session and its
+  cleanup handoff: shuffle (tail-only reorder with the prefix, decisions, and undo
+  intact; a full pass after a shuffle visiting every photo exactly once; the disabled
+  one-or-none-remaining boundary; seeded, deterministic order), Start New Pass (cursor
+  and undo reset, every decision kept, undo restoring a *prior pass's* decision),
+  persistence (exact round-trip of deck order, cursor, undo stack, and decision log
+  through the store seam; a corrupt cursor clamped and a detached undo stack dropped;
+  empty snapshots ignored; the decision log replayed onto a rebuilt selection
+  idempotently; snapshot Codable round-trip; the file store round-tripping through its
+  write drain and dropping future-schema and corrupt files), cleanup candidates (only
+  this session's Delete marks, still selected and still in the catalog, in deck order;
+  a 1 000-photo deck scoping 500 candidates without touching the deck), selection
+  state (default-checked with exact counts, individual/bulk toggles, choices surviving
+  re-entry while a new mark joins selected), and the deletion pipeline as the
+  `.swipeReview` source (confirmation executing exactly the checked subset,
+  unchecking or unmarking after the plan was built stale-ing it before any mutation,
+  another source's plan left alone by cleanup toggles, partial failures reported as
+  `needsReview`, and a catalog-missing candidate never entering the plan).
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification** — full suites green on the Phase C worktree: the unit run
-  reports "738 tests in 76 suites passed", plus 5/5 UI cases, and a clean
-  `build-for-testing` with 0 errors and
-  251 warnings, all inside the pre-existing UI-test-target baseline (the unit/app
-  targets are warning-free). One case, `cancellationPropagatesOutOfTheLoader` in
+- **Recent verification** — full suites green on the Phase D worktree: the unit run
+  reports "761 tests in 76 suites passed", plus 5/5 UI cases, and a clean
+  `build-for-testing` with 0 errors and 251 warnings, all inside the pre-existing
+  UI-test-target baseline (the unit/app targets are warning-free). One case,
+  `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests`, is cancelled when run inside the full suite but
   passes in isolation; this is a pre-existing Swift Testing suite-context quirk,
   reproduced unchanged on the Phase A commit, and is listed under Known limitations.
@@ -325,6 +392,14 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   whole, but an individual provider call has no per-request timeout. None of this scans
   in the background: the OS background task exists only to *save* a resumable checkpoint
   before expiration, never to keep analyzing.
+- **Swipe Review session persistence (Phase D)** — the session restores when the Swipe
+  Review screen next appears (deck order, position, undo, and decisions), not on the
+  dashboard itself, which shows only aggregate counts. A **Start New Pass** over a
+  similarity-group session keeps that session's original deck (only library decks
+  rebuild from the current catalog, picking up newly scanned photos); group membership
+  changes are reconciled on restore (deleted photos leave the deck), but newly formed
+  groups are not injected mid-session. The session file holds one session — entering
+  Swipe Review over a different deck replaces it.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the

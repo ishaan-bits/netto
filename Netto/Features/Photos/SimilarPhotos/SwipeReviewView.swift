@@ -7,34 +7,39 @@ import SwiftUI
 /// The swipe-review session: which photo is on screen, in what order, and what was decided
 /// before it. Deliberately owns **no selection** — every decision is written through the
 /// caller's `PhotoSelectionModel` (the same value `AppEnvironment` publishes), so swipe mode
-/// cannot fork a second source of truth; the model only tracks the cursor and the in-memory
-/// undo history.
+/// cannot fork a second source of truth; the model only tracks the cursor, the per-asset
+/// decision log, and the in-memory undo history.
 ///
 /// Ownership rules:
 /// - Order is fixed at init from the caller's deck (the scanned catalog — no scanning, no
-///   re-analysis).
+///   re-analysis) and only ever changes through Shuffle / Start New Pass (both documented
+///   below).
 /// - Each decision records the photo's selection state *before* the decision, so Undo is an
 ///   exact restore rather than a re-derivation.
-/// - History is session-only memory: leaving the screen drops it and keeps the decisions.
-/// - `decide` and `undo` are the only mutation paths; both are no-ops at the boundaries
-///   (nothing to decide at the end, nothing to undo at the start).
+/// - `decisions` is the authoritative session log ("this photo was swiped Delete/Keep") and
+///   survives a new pass; Review Cleanup scopes itself to it. It is persisted with the deck,
+///   cursor, and history, so a relaunch resumes exactly where the app left off.
+/// - `decide`, `undo`, `shuffleRemaining`, `startNewPass`, and `restore` are the only
+///   mutation paths; the boundaries are no-ops (nothing to decide at the end, nothing to
+///   undo at the start, nothing to shuffle with fewer than two photos left).
 @MainActor
 final class SwipeReviewModel: ObservableObject {
-    enum Decision: Equatable {
-        case keep
-        case delete
-    }
-
-    /// One swiped photo: what it was, and what its selection must return to if undone.
-    struct HistoryEntry: Equatable {
-        let assetID: String
-        let wasSelected: Bool
-    }
+    /// The decision a swipe records — a free, codable enum so snapshots stay plain data.
+    typealias Decision = SwipeReviewDecision
+    /// One undo-stack entry — codable for the persisted session.
+    typealias HistoryEntry = SwipeReviewHistoryEntry
 
     @Published private(set) var items: [SwipeReviewItem]
     /// Index of the photo on screen; equals `items.count` once every photo has been swiped.
     @Published private(set) var cursor = 0
     @Published private(set) var history: [HistoryEntry] = []
+    /// Asset identifier → the decision last swiped for it in this session. The source of
+    /// truth for "what did this session mark" — kept across Start New Pass (which clears the
+    /// cursor and undo stack but never what the user already decided).
+    @Published private(set) var decisions: [String: Decision] = [:]
+    /// O(1) count of Delete marks, maintained incrementally by decide/undo — the persistent
+    /// bar and completion screen read this instead of filtering the whole deck per render.
+    @Published private(set) var deleteDecisionCount = 0
 
     init(items: [SwipeReviewItem]) {
         self.items = items
@@ -55,6 +60,9 @@ final class SwipeReviewModel: ObservableObject {
         cursor < items.count ? items[cursor] : nil
     }
 
+    /// Unreviewed photos still ahead — the Shuffle gate.
+    var remainingCount: Int { SwipeReviewPresentation.remainingCount(cursor: cursor, total: items.count) }
+
     /// Photos decided so far — the completion screen's "N photos reviewed".
     var reviewedCount: Int { min(cursor, items.count) }
 
@@ -62,11 +70,17 @@ final class SwipeReviewModel: ObservableObject {
 
     /// Applies one decision to the shared selection and advances. Keep deselects (the photo
     /// is kept), Delete selects it (marked for cleanup) — either way it is only a selection
-    /// change; nothing here can reach the deletion pipeline.
+    /// change; nothing here can reach the deletion pipeline. The decision is also logged in
+    /// `decisions` (replacing any earlier one for this asset) and, if there was one, its
+    /// predecessor rides along in the history entry so Undo can restore it exactly.
     func decide(_ decision: Decision, selection: inout PhotoSelectionModel) {
         guard let item = currentItem else { return }
         history.append(
-            HistoryEntry(assetID: item.assetID, wasSelected: selection.isSelected(item.assetID))
+            HistoryEntry(
+                assetID: item.assetID,
+                wasSelected: selection.isSelected(item.assetID),
+                priorDecision: decisions[item.assetID]
+            )
         )
         switch decision {
         case .keep:
@@ -74,34 +88,131 @@ final class SwipeReviewModel: ObservableObject {
         case .delete:
             selection.setSelected(true, forAsset: item.assetID)
         }
+        applyDecision(decision, toAsset: item.assetID)
         cursor += 1
     }
 
-    /// Reverses the most recent decision: the cursor returns to that photo and its selection
-    /// is restored to exactly what it was before the swipe. No-op when there is no history.
+    /// Reverses the most recent decision: the cursor returns to that photo, its selection is
+    /// restored to exactly what it was before the swipe, and its decision log entry reverts
+    /// to whatever the asset carried before (or leaves the log when it carried nothing).
+    /// No-op when there is no history.
     func undo(selection: inout PhotoSelectionModel) {
         guard let entry = history.popLast() else { return }
         selection.setSelected(entry.wasSelected, forAsset: entry.assetID)
+        switch entry.priorDecision {
+        case .some(let prior):
+            applyDecision(prior, toAsset: entry.assetID)
+        case .none:
+            removeDecision(forAsset: entry.assetID)
+        }
         cursor = max(0, cursor - 1)
+    }
+
+    /// Reorders only the *unreviewed* tail (from the cursor on) so decisions, position, and
+    /// undo are untouched and no reviewed photo can re-enter the pass. Within one pass the
+    /// cursor only moves forward through unique items, so a photo can never repeat — the
+    /// only way to see reviewed photos again is Start New Pass (or, implicitly, undo).
+    func shuffleRemaining<G: RandomNumberGenerator>(using generator: inout G) {
+        guard remainingCount > 1 else { return }
+        var tail = Array(items[cursor...])
+        tail.shuffle(using: &generator)
+        items.replaceSubrange(cursor..., with: tail)
+    }
+
+    /// Starts a fresh pass over `newItems`: the cursor and undo stack reset, the deck takes
+    /// the new order, and **every prior decision stays** — a new pass is "review again", not
+    /// "forget what I marked". Undo is honestly unavailable until the new pass records a
+    /// decision (the button reads disabled, never lies).
+    func startNewPass(items newItems: [SwipeReviewItem]) {
+        items = newItems
+        cursor = 0
+        history = []
+    }
+
+    /// Adopts a persisted snapshot exactly as written — the relaunch / navigation-return
+    /// path. Corrupt input is sanitized defensively rather than crashing: the cursor is
+    /// clamped into the deck, and an undo stack that doesn't line up with the cursor (it can
+    /// only happen in a hand-edited or truncated file) is dropped instead of rewinding the
+    /// session to a photo it doesn't describe.
+    func restore(from snapshot: SwipeReviewSessionSnapshot) {
+        guard !snapshot.items.isEmpty else { return }
+        items = snapshot.items
+        cursor = min(max(0, snapshot.cursor), snapshot.items.count)
+        history = snapshot.history.count == cursor ? snapshot.history : []
+        decisions = snapshot.decisions
+        deleteDecisionCount = decisions.values.reduce(0) { $0 + ($1 == .delete ? 1 : 0) }
+    }
+
+    /// The session exactly as it is right now, for persistence.
+    func sessionSnapshot() -> SwipeReviewSessionSnapshot {
+        SwipeReviewSessionSnapshot(
+            items: items,
+            cursor: cursor,
+            history: history,
+            decisions: decisions
+        )
+    }
+
+    /// Replays the decision log onto a freshly built shared selection (after the deck has
+    /// been admitted), so Keep/Delete marks survive a relaunch: each asset lands in exactly
+    /// the state its last decision recorded, regardless of the deterministic defaults the
+    /// selection was rebuilt from. Idempotent — replaying the same log twice converges.
+    func reapplyDecisions(to selection: inout PhotoSelectionModel) {
+        for (assetID, decision) in decisions {
+            selection.setSelected(decision == .delete, forAsset: assetID)
+        }
+    }
+
+    /// The cleanup candidates this session offers, in deck order — Delete-marked photos that
+    /// are still marked in the shared selection and still present in the catalog (when one
+    /// is given). See `SwipeReviewPresentation.cleanupCandidates`.
+    func cleanupCandidates(
+        selection: PhotoSelectionModel,
+        availableAssetIDs: Set<String>? = nil
+    ) -> [SwipeReviewItem] {
+        SwipeReviewPresentation.cleanupCandidates(
+            items: items,
+            decisions: decisions,
+            selection: selection,
+            availableAssetIDs: availableAssetIDs
+        )
+    }
+
+    private func applyDecision(_ decision: Decision, toAsset assetID: String) {
+        if let existing = decisions[assetID], existing == decision { return }
+        if decision == .delete { deleteDecisionCount += 1 }
+        if decisions[assetID] == .delete { deleteDecisionCount -= 1 }
+        decisions[assetID] = decision
+    }
+
+    private func removeDecision(forAsset assetID: String) {
+        guard let existing = decisions.removeValue(forKey: assetID) else { return }
+        if existing == .delete { deleteDecisionCount -= 1 }
     }
 }
 
 // MARK: - Swipe review screen
 
 /// One-at-a-time review of the photo library: swipe right (or tap Keep) to keep a photo,
-/// swipe left (or tap Delete) to mark it for cleanup, with Undo for the last decision.
-/// Entered directly from the dashboard's top-level Swipe Review card — no dependency on
-/// Similar Photos, its screens, or its similarity groups.
+/// swipe left (or tap Delete) to mark it for cleanup, with Undo for the last decision and a
+/// Shuffle button that re-orders only the photos still unreviewed. Entered directly from the
+/// dashboard's top-level Swipe Review card — no dependency on Similar Photos, its screens,
+/// or its similarity groups.
 ///
-/// Two hard boundaries this screen enforces:
+/// Three hard boundaries this screen enforces:
 /// - **Selection only.** Every decision flows through `env.mutateSelection` → the existing
 ///   `PhotoSelectionModel` (the deck is admitted into it on appear, so library photos accept
-///   marks without a second selection store); the Review screen at the end is the *existing*
-///   `ReviewSelectionView`, which is still the only path that can start a deletion. Nothing
-///   on this screen deletes, rescans, or rebuilds a plan.
-/// - **One photo loaded at a time.** The preview is the M4J `PhotoPreviewModel` driven by the
-///   environment's loader (uncached, released on close or on reaching the completion state) —
-///   no second PhotoKit loader, no whole-library prefetch.
+///   marks without a second selection store); the Review Cleanup button opens a scoped,
+///   editable list of this session's Delete marks and only *that* flow's confirmation can
+///   reach the existing deletion pipeline. Nothing on this screen deletes, rescans, or
+///   rebuilds a plan.
+/// - **One photo loaded at a time.** The preview is the M4J `PhotoPreviewModel` driven by
+///   the environment's loader (uncached, released on close or on reaching the completion
+///   state) — no second PhotoKit loader, no whole-library prefetch.
+/// - **Session durability.** Deck order, cursor, undo history, and the decision log persist
+///   through `env.saveSwipeSession` / `env.restoreSwipeSession` (asset identifiers and
+///   review state only — never pixels), so leaving the screen, navigating back, or relaunching
+///   the app resumes exactly where the review stopped.
 ///
 /// A persistent bottom bar (live count + "Review Cleanup") is on screen for the whole
 /// session — finishing the deck is not a precondition for reviewing — and the completion
@@ -111,7 +222,8 @@ final class SwipeReviewModel: ObservableObject {
 /// preserve the shared selection exactly: this screen never instantiates or resets it.
 ///
 /// Exiting early (back gesture / system back) simply pops the stack: decisions already live
-/// in the shared selection, so every selection count updates immediately.
+/// in the shared selection, so every selection count updates immediately — and the session
+/// itself is restored from its persisted snapshot the next time the screen appears.
 struct SwipeReviewView: View {
     @Environment(AppEnvironment.self) private var env: AppEnvironment
     @Environment(\.dismiss) private var dismiss
@@ -140,6 +252,7 @@ struct SwipeReviewView: View {
             .navigationBarTitleDisplayMode(.inline)
             .nettoAppear()
             .onAppear {
+                restoreSessionFromStoreIfPossible()
                 installDeckFromCatalogIfNeeded()
                 admitDeck()
                 openCurrent()
@@ -160,11 +273,39 @@ struct SwipeReviewView: View {
             .onDisappear { preview.close() }
     }
 
+    /// Adopts the persisted session, if any, exactly once per screen instance (the guard on
+    /// an empty model means a screen that already has its deck — live, restored, or preset —
+    /// never re-adopts and never re-clobbers). The snapshot is reconciled against the
+    /// catalog as it is *now* first, so photos deleted since the deck was built leave the
+    /// session instead of surfacing as un-decidable ghosts; the deck is then admitted and
+    /// the decision log replayed onto the shared selection so every mark is live again.
+    private func restoreSessionFromStoreIfPossible() {
+        guard presetItems == nil, model.items.isEmpty else { return }
+        let availableAssetIDs: Set<String>? = {
+            guard case .completed(let catalog) = env.catalogState else { return nil }
+            return Set(catalog.records.lazy.map(\.localIdentifier))
+        }()
+        guard let snapshot = env.restoreSwipeSession(),
+              let reconciled = SwipeReviewPresentation.reconciled(
+                  snapshot,
+                  availableAssetIDs: availableAssetIDs
+              )
+        else { return }
+        model.restore(from: reconciled)
+        admitDeck()
+        env.mutateSelection { model.reapplyDecisions(to: &$0) }
+    }
+
     /// Installs the deck from the completed catalog, exactly once per session, and only when
-    /// no explicit deck was supplied. No-op for an empty (not-yet-scanned) library.
+    /// no explicit deck was supplied. No-op for an empty (not-yet-scanned) library — and,
+    /// via `shouldInstallDeck`, no-op for every render once a session exists: a 30,000-photo
+    /// library is mapped exactly once, never per render.
     private func installDeckFromCatalogIfNeeded() {
-        guard presetItems == nil, model.items.isEmpty,
-              case .completed(let catalog) = env.catalogState else { return }
+        guard SwipeReviewPresentation.shouldInstallDeck(
+            presetItemsSupplied: presetItems != nil,
+            sessionIsEmpty: model.items.isEmpty
+        ) else { return }
+        guard case .completed(let catalog) = env.catalogState else { return }
         model.installDeckIfNeeded(SwipeReviewPresentation.items(from: catalog))
     }
 
@@ -259,6 +400,26 @@ struct SwipeReviewView: View {
             Text(SwipeReviewPresentation.groupContext(for: item))
                 .font(.caption)
                 .foregroundStyle(NettoColor.textSecondary)
+
+            // Shuffle — re-orders only the unreviewed tail, so it can be tapped at any point
+            // in the pass without losing a single decision or re-showing a reviewed photo.
+            // Clearly disabled once fewer than two photos remain: there is nothing to
+            // re-order, and pretending otherwise would be a lie.
+            Button {
+                shuffleRemaining()
+            } label: {
+                Label(
+                    SwipeReviewPresentation.shuffleButtonTitle,
+                    systemImage: "shuffle"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(NettoTertiaryButtonStyle())
+            .disabled(!SwipeReviewPresentation.shuffleEnabled(remaining: model.remainingCount))
+            .opacity(SwipeReviewPresentation.shuffleEnabled(remaining: model.remainingCount) ? 1 : 0.4)
+            .accessibilityLabel(SwipeReviewPresentation.shuffleAccessibilityLabel)
+            .accessibilityIdentifier(SwipeReviewPresentation.shuffleAccessibilityID)
+            .padding(.top, Theme.Spacing.xs)
         }
     }
 
@@ -482,6 +643,7 @@ struct SwipeReviewView: View {
         env.mutateSelection { selection in
             model.decide(decision, selection: &selection)
         }
+        persistSession()
         settleDrag()
     }
 
@@ -490,7 +652,42 @@ struct SwipeReviewView: View {
         env.mutateSelection { selection in
             model.undo(selection: &selection)
         }
+        persistSession()
         settleDrag()
+    }
+
+    /// Shuffle: only the unreviewed tail re-orders. Decisions, cursor, and undo history are
+    /// untouched by construction, so persisting afterwards captures a session that is still
+    /// exactly where it was — just in a different order.
+    private func shuffleRemaining() {
+        var generator = SystemRandomNumberGenerator()
+        model.shuffleRemaining(using: &generator)
+        persistSession()
+    }
+
+    /// Start New Pass: rebuild a library deck from the *current* catalog (so photos added
+    /// since the deck was built join this pass, and confirmed removals are gone), reshuffle
+    /// everything, and reset position and undo — while every prior decision keeps standing.
+    /// A group session keeps its own deck (group membership only exists in the analysis the
+    /// deck came from).
+    private func startNewPass() {
+        var deck = model.items
+        if presetItems == nil, model.items.first?.isLibraryItem == true,
+           case .completed(let catalog) = env.catalogState {
+            deck = SwipeReviewPresentation.items(from: catalog)
+        }
+        model.startNewPass(items: deck)
+        var generator = SystemRandomNumberGenerator()
+        model.shuffleRemaining(using: &generator)
+        persistSession()
+    }
+
+    /// Persists deck order, cursor, undo history, and the decision log after every mutation.
+    /// Called only from explicit actions (never from a render), so a 30,000-photo session
+    /// costs at most one snapshot write per user action — off the main actor for the file
+    /// store (see `FileSwipeReviewSessionStore`).
+    private func persistSession() {
+        env.saveSwipeSession(from: model)
     }
 
     private func settleDrag() {
@@ -540,26 +737,25 @@ struct SwipeReviewView: View {
 
     // MARK: Persistent review bar
 
-    /// The bottom action area shown for the whole swipe session: the live count out of the
-    /// *shared* selection, then the handoff into the existing `ReviewSelectionView` — the
-    /// identical destination the Similar Photos bottom bar and the completion screen use.
-    /// Always visible while swiping, clearly unavailable (disabled) while nothing is
-    /// selected. It reads `env.selection` directly; there is no local copy to drift, fork,
-    /// or reset when navigating away and back.
+    /// The bottom action area shown for the whole swipe session: the live count of *this
+    /// session's* Delete marks (decisions — not the whole shared selection, which can carry
+    /// untouched group defaults), then the handoff into the editable cleanup screen. Always
+    /// visible while swiping, clearly unavailable (disabled) while nothing is marked. It
+    /// reads the model's O(1) mark count; there is no local copy to drift, fork, or reset
+    /// when navigating away and back.
     private var reviewCleanupBar: some View {
-        let enabled = SwipeReviewPresentation.reviewCleanupEnabled(
-            selectedCount: env.selection.selectedCount
-        )
+        let selectedCount = model.deleteDecisionCount
+        let enabled = SwipeReviewPresentation.reviewCleanupEnabled(selectedCount: selectedCount)
         return VStack(spacing: Theme.Spacing.sm) {
-            Text(SwipeReviewPresentation.selectedForCleanupText(env.selection.selectedCount))
+            Text(SwipeReviewPresentation.selectedForCleanupText(selectedCount))
                 .font(NettoType.secondaryBody.weight(.semibold))
                 .monospacedDigit()
                 .foregroundStyle(NettoColor.brandDeep)
-                .nettoCount(env.selection.selectedCount)
+                .nettoCount(selectedCount)
                 .accessibilityIdentifier(SwipeReviewPresentation.selectedCountAccessibilityID)
 
             NavigationLink {
-                ReviewSelectionView()
+                SwipeCleanupSelectionView(model: model)
             } label: {
                 Text(SwipeReviewPresentation.completionPrimaryTitle)
                     .frame(maxWidth: .infinity)
@@ -600,15 +796,16 @@ struct SwipeReviewView: View {
                     .font(NettoType.secondaryBody.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(NettoColor.textSecondary)
-                Text(SwipeReviewPresentation.selectedForCleanupText(env.selection.selectedCount))
+                Text(SwipeReviewPresentation.selectedForCleanupText(model.deleteDecisionCount))
                     .font(NettoType.secondaryBody.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(NettoColor.brandDeep)
-                    .nettoCount(env.selection.selectedCount)
+                    .nettoCount(model.deleteDecisionCount)
                     .accessibilityIdentifier(SwipeReviewPresentation.selectedCountAccessibilityID)
             }
 
             reviewCleanupButton
+            newPassButton
             doneButton
 
             Spacer(minLength: NettoLayout.Spacing.xl)
@@ -617,17 +814,16 @@ struct SwipeReviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Into the *existing* review flow — the identical destination the Similar Photos bottom
-    /// bar and the persistent swipe-time bar use. The review screen prepares its plan from
-    /// the shared selection on appear; swipe mode adds no deletion surface of its own. Gated
-    /// by the same predicate as the persistent bar, so "nothing selected" reads identically
-    /// on both screens.
+    /// Into the *editable* cleanup screen — the identical destination the persistent
+    /// swipe-time bar uses. The cleanup screen scopes the list to this session's Delete
+    /// marks and only hands a checked subset to the existing review flow; gated by the same
+    /// predicate as the persistent bar, so "nothing marked" reads identically on both.
     private var reviewCleanupButton: some View {
         let enabled = SwipeReviewPresentation.reviewCleanupEnabled(
-            selectedCount: env.selection.selectedCount
+            selectedCount: model.deleteDecisionCount
         )
         return NavigationLink {
-            ReviewSelectionView()
+            SwipeCleanupSelectionView(model: model)
         } label: {
             Text(SwipeReviewPresentation.completionPrimaryTitle)
                 .frame(maxWidth: .infinity)
@@ -636,6 +832,21 @@ struct SwipeReviewView: View {
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.45)
         .accessibilityIdentifier(SwipeReviewPresentation.reviewCleanupAccessibilityID)
+    }
+
+    /// "Start New Pass": reshuffle the whole deck (a library deck is rebuilt from the current
+    /// catalog first, so newly scanned photos join) and review again. Decisions all stand —
+    /// only position and undo history reset, visibly: Undo reads disabled until the new pass
+    /// has a decision to reverse.
+    private var newPassButton: some View {
+        Button {
+            startNewPass()
+        } label: {
+            Text(SwipeReviewPresentation.newPassButtonTitle)
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(NettoSecondaryButtonStyle())
+        .accessibilityIdentifier(SwipeReviewPresentation.newPassAccessibilityID)
     }
 
     /// Leaves the swipe session (back gesture / this button both end at the same stack pop).

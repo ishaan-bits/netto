@@ -33,6 +33,8 @@ struct ReviewSelectionView: View {
             return "No photos are selected. Choose photos on the Potentially Blurry screen first, then come back to review them."
         case .similarPhotos:
             return "No photos are selected for cleanup. Pick photos inside a group first."
+        case .swipeReview:
+            return "No photos are checked for cleanup. Check the photos you want to delete on the previous screen, then come back to review them."
         }
     }
 
