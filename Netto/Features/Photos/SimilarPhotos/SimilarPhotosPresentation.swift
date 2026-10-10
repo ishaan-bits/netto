@@ -15,6 +15,10 @@ enum SimilarPhotosPhase: Sendable, Equatable {
     /// Similarity analysis is running, including its internal catalog read (reported as the
     /// `preparing` stage).
     case analyzing(PhotoAnalysisProgress)
+    /// An interrupted run (analysis or its catalog stage) saved its progress and can be
+    /// continued. `stage` is the saved stage line, `fraction` the bar at the pause — shown
+    /// as paused, never as a live scan, and never with an ETA.
+    case paused(stage: String, fraction: Double?)
     /// Analysis finished; groups are available (possibly none).
     case results(PhotoAnalysisResult)
     /// Permission is fine, nothing has been run yet.
@@ -65,6 +69,11 @@ enum SimilarPhotosPresentation {
             return .cancelled
         case .failed(let failure):
             return .failed(failure.userMessage)
+        case .paused(let progress):
+            return .paused(
+                stage: stageMessage(for: progress),
+                fraction: barFraction(for: progress)
+            )
         case .notStarted, .running:
             break
         }
@@ -74,6 +83,11 @@ enum SimilarPhotosPresentation {
             return .failed(failure.userMessage)
         case .cancelled:
             return .cancelled
+        case .paused(let progress):
+            return .paused(
+                stage: DashboardPresentation.catalogStage(progress),
+                fraction: DashboardPresentation.catalogFraction(progress)
+            )
         case .completed(let result):
             return result.isEmpty ? .emptyLibrary : .idle
         case .notStarted, .running:

@@ -86,6 +86,11 @@ struct SimilarPhotosView: View {
                 cancel: { env.cancelSimilarityAnalysis() }
             )
 
+        case .paused(let stage, let fraction):
+            // The run was interrupted (backgrounding, termination, lock) and saved its
+            // checkpoint; resume continues it from the saved stage — never a fresh start.
+            pausedState(stage: stage, fraction: fraction)
+
         case .cancelled:
             PhaseMessage(
                 systemImage: "arrow.counterclockwise",
@@ -131,6 +136,23 @@ struct SimilarPhotosView: View {
         cancel: @escaping () -> Void
     ) -> some View {
         NettoProgressPanel(message: message, fraction: fraction, cancel: cancel)
+    }
+
+    /// The paused counterpart of `progressState`: the saved stage (with the saved percent,
+    /// when one existed), no cancel action (nothing is running), no ETA (the estimator was
+    /// reset with the pause) — the single action is Resume, which continues the saved run.
+    private func pausedState(stage: String, fraction: Double?) -> some View {
+        let savedPercent = fraction.map {
+            "\(Int(($0 * 100).rounded()))% complete — "
+        } ?? ""
+        return PhaseMessage(
+            systemImage: "pause.circle",
+            title: "Scan paused",
+            message: "\(stage) \(savedPercent)Nothing was changed — resume to continue where it stopped.",
+            buttonTitle: "Resume"
+        ) {
+            env.resumeInterruptedWork()
+        }
     }
 
     // MARK: Results
@@ -385,6 +407,7 @@ struct SimilarPhotosView: View {
         case .idle: return "idle"
         case .buildingCatalog: return "buildingCatalog"
         case .analyzing: return "analyzing"
+        case .paused: return "paused"
         case .cancelled: return "cancelled"
         case .failed: return "failed"
         case .emptyLibrary: return "emptyLibrary"

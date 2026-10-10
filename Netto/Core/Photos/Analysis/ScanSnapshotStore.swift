@@ -40,7 +40,6 @@ protocol ScanSnapshotStore: Sendable {
 /// hard-coded — the directory comes from `FileManager.url(for:in:appropriateFor:create:)`.
 struct FileScanSnapshotStore: ScanSnapshotStore {
     private static let fileName = "latest-scan.json"
-    private static let directoryName = "ScanState"
 
     /// Test seam: an explicit directory (e.g. a temporary one) instead of Application Support.
     private let directoryOverride: URL?
@@ -50,14 +49,7 @@ struct FileScanSnapshotStore: ScanSnapshotStore {
     }
 
     private func directoryURL() throws -> URL {
-        if let directoryOverride { return directoryOverride }
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        return base.appendingPathComponent(Self.directoryName, isDirectory: true)
+        try ScanStateDirectory.url(override: directoryOverride)
     }
 
     private func fileURL() throws -> URL {
@@ -88,5 +80,534 @@ struct FileScanSnapshotStore: ScanSnapshotStore {
     func clear() {
         guard let url = try? fileURL() else { return }
         try? FileManager.default.removeItem(at: url)
+    }
+}
+
+// MARK: - Interrupted-run checkpoints (Phase C)
+
+/// One image's perceptual hash saved mid-run, with the modification date used to
+/// re-validate it against a freshly read catalog before resume.
+struct PerceptualHashEntry: Codable, Equatable, Sendable {
+    let assetID: String
+    let modified: Date?
+    let bits: UInt64
+}
+
+/// One video's content-length key saved mid-run (the cheap exact-match pre-filter),
+/// re-validated the same way as a perceptual hash.
+struct ContentByteKeyEntry: Codable, Equatable, Sendable {
+    let assetID: String
+    let modified: Date?
+    let imageBytes: Int64
+    let videoBytes: Int64
+}
+
+/// One image's sharpness verdict saved mid-run. Verdicts — not pixels, not scores-then-
+/// reclassify — are what resume trusts: the classification already happened under the
+/// thresholds recorded alongside the entries, and resume discards them if the thresholds
+/// differ. `laplacianVariance` rides along so a resumed run's candidates can still explain
+/// themselves without re-measuring.
+struct BlurVerdictEntry: Codable, Equatable, Sendable {
+    let assetID: String
+    let modified: Date?
+    let verdict: BlurVerdict
+    let laplacianVariance: Float?
+}
+
+/// One video's measured size saved mid-run, re-validated against the fresh catalog before
+/// resume so bytes from a deleted or re-exported video are never mixed in.
+struct VideoSizeEntry: Codable, Equatable, Sendable {
+    let assetID: String
+    let modified: Date?
+    let bytes: Int64
+}
+
+/// Cheap evidence produced by an engine mid-run, reported to a checkpoint sink the moment
+/// the evidence exists. Deliberately reference-only: identifiers, dates, and small derived
+/// values — never pixels, thumbnails, or content bytes.
+enum CheckpointEvidence: Sendable {
+    case perceptualHash(assetID: String, modified: Date?, bits: UInt64)
+    case contentByteKey(assetID: String, modified: Date?, imageBytes: Int64, videoBytes: Int64)
+    case blurVerdict(assetID: String, modified: Date?, verdict: BlurVerdict, laplacianVariance: Float?)
+}
+
+/// The durable record of an **in-flight** pass, written in bounded batches so an
+/// interruption — backgrounding, expiration, or process death — resumes instead of
+/// starting over.
+///
+/// One file holds at most one checkpoint (see `ScanCheckpointWriter` for the ordering
+/// rules), and the payload is strictly bounded: at most one compact entry per asset
+/// (~100 bytes), never pixels or content. `runSequence` is a monotonic per-session
+/// counter assigned when the run starts — the stale-run guard that keeps a superseded
+/// run's late flush from overwriting a newer checkpoint.
+struct ScanCheckpoint: Codable, Equatable, Sendable {
+    /// Bump when the persisted shape changes incompatibly; `load()` discards anything that
+    /// does not match, so a stale file degrades to "no checkpoint", never to a crash.
+    static let currentSchemaVersion = 1
+
+    /// Which pass the checkpoint belongs to. Also the priority order for writes: a single
+    /// file can hold only one, and the heavier pass's resume info wins over video sizes.
+    enum Kind: String, Codable, Sendable {
+        case catalog
+        case similarity
+        case blur
+        case videoSizes
+    }
+
+    /// Entries accumulated before the next flush triggers — large enough that a 40k-library
+    /// scan writes a few dozen times, small enough that each write stays a few milliseconds
+    /// of off-main JSON IO.
+    static let flushEveryEntries = 256
+    /// Time-based flush bound: entry production can stall for long stretches (a slow
+    /// stage-4/5 bucket), so progress reaches disk on the clock too.
+    static let flushEverySeconds: TimeInterval = 3
+
+    let schemaVersion: Int
+    let runSequence: Int
+    let kind: Kind
+    let startedAt: Date
+    let updatedAt: Date
+    /// `PhotoAnalysisStage.rawValue` for a similarity run, `"catalog"` for a catalog build,
+    /// empty for blur and video runs (single-stage passes report counts only).
+    let stage: String
+    let completedUnits: Int
+    /// 0 = unknown (an indeterminate stage), matching the live progress structs.
+    let totalUnits: Int
+    let perceptualHashes: [PerceptualHashEntry]
+    let byteKeys: [ContentByteKeyEntry]
+    let blurVerdicts: [BlurVerdictEntry]
+    /// The thresholds the saved verdicts were classified with. Resume compares it against
+    /// the thresholds the next run will use and discards mismatched verdicts entirely —
+    /// never a mixed-calibration result.
+    let blurThresholds: BlurThresholds?
+    let videoSizes: [VideoSizeEntry]
+
+    init(
+        runSequence: Int,
+        kind: Kind,
+        startedAt: Date,
+        updatedAt: Date,
+        stage: String = "",
+        completedUnits: Int = 0,
+        totalUnits: Int = 0,
+        perceptualHashes: [PerceptualHashEntry] = [],
+        byteKeys: [ContentByteKeyEntry] = [],
+        blurVerdicts: [BlurVerdictEntry] = [],
+        blurThresholds: BlurThresholds? = nil,
+        videoSizes: [VideoSizeEntry] = []
+    ) {
+        self.schemaVersion = ScanCheckpoint.currentSchemaVersion
+        self.runSequence = runSequence
+        self.kind = kind
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.stage = stage
+        self.completedUnits = completedUnits
+        self.totalUnits = totalUnits
+        self.perceptualHashes = perceptualHashes
+        self.byteKeys = byteKeys
+        self.blurVerdicts = blurVerdicts
+        self.blurThresholds = blurThresholds
+        self.videoSizes = videoSizes
+    }
+}
+
+/// Persistence seam for `ScanCheckpoint` — same injection rule as `ScanSnapshotStore`:
+/// tests use temporary storage instead of the app's real file.
+protocol ScanCheckpointStore: Sendable {
+    func save(_ checkpoint: ScanCheckpoint) throws
+    /// The stored checkpoint, or `nil` when none exists, the data is corrupt, or the schema
+    /// is incompatible. Must never throw and never crash.
+    func load() -> ScanCheckpoint?
+    func clear()
+}
+
+/// File-backed store: `<Application Support>/ScanState/checkpoint.json`, written atomically
+/// (same directory and write rules as the completed-scan snapshot).
+struct FileScanCheckpointStore: ScanCheckpointStore {
+    private static let fileName = "checkpoint.json"
+
+    /// Test seam: an explicit directory (e.g. a temporary one) instead of Application Support.
+    private let directoryOverride: URL?
+
+    init(directoryOverride: URL? = nil) {
+        self.directoryOverride = directoryOverride
+    }
+
+    private func directoryURL() throws -> URL {
+        try ScanStateDirectory.url(override: directoryOverride)
+    }
+
+    private func fileURL() throws -> URL {
+        try directoryURL().appendingPathComponent(Self.fileName)
+    }
+
+    func save(_ checkpoint: ScanCheckpoint) throws {
+        let url = try fileURL()
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(checkpoint)
+        try data.write(to: url, options: .atomic)
+    }
+
+    func load() -> ScanCheckpoint? {
+        guard let url = try? fileURL() else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let checkpoint = try? JSONDecoder().decode(ScanCheckpoint.self, from: data) else {
+            return nil
+        }
+        // Wrong/future schema: ignore safely — fall back to "no checkpoint", never resume.
+        guard checkpoint.schemaVersion == ScanCheckpoint.currentSchemaVersion else { return nil }
+        return checkpoint
+    }
+
+    func clear() {
+        guard let url = try? fileURL() else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
+/// The on-disk location both scan-state files share (`latest-scan.json` and
+/// `checkpoint.json`): Application Support's app-private directory, never a hard-coded path.
+enum ScanStateDirectory {
+    static let directoryName = "ScanState"
+
+    static func url(override: URL?) throws -> URL {
+        if let override { return override }
+        let base = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        return base.appendingPathComponent(directoryName, isDirectory: true)
+    }
+}
+
+/// Serializes checkpoint writes so a superseded run can never overwrite a newer run's
+/// checkpoint, and a cleared checkpoint can never be resurrected by a late flush.
+///
+/// Ordering rule, enforced under one lock: a write is accepted only when its
+/// `(runSequence, updatedAt)` is strictly newer than the last accepted write, and only
+/// when its sequence is above the highest cleared sequence. Completion, explicit cancel,
+/// and supersession all clear *through* the current run's sequence, which permanently
+/// blocks any straggler flush from that run or an earlier one.
+final class ScanCheckpointWriter: @unchecked Sendable {
+    private let store: any ScanCheckpointStore
+    private let lock = NSLock()
+    private var lastWritten: (sequence: Int, updatedAt: TimeInterval) =
+        (Int.min, -TimeInterval.greatestFiniteMagnitude)
+    private var blockedThroughSequence = Int.min
+    /// What the single file currently holds (nil = no file). Seeded from a restored
+    /// checkpoint at bootstrap so a previous session's kind is still known.
+    private var currentKind: ScanCheckpoint.Kind?
+
+    init(store: any ScanCheckpointStore, adopting restored: ScanCheckpoint? = nil) {
+        self.store = store
+        if let restored {
+            adopt(restored)
+        }
+    }
+
+    /// Learns what a restored file holds so kind-aware clears keep working across a
+    /// relaunch (e.g. a video-size settle must not remove a previous session's file).
+    func adopt(_ restored: ScanCheckpoint) {
+        lock.lock()
+        defer { lock.unlock() }
+        currentKind = restored.kind
+        lastWritten = (restored.runSequence, restored.updatedAt.timeIntervalSinceReferenceDate)
+    }
+
+    /// Best-effort write: a failed file write is dropped (the live run continues and the
+    /// next flush retries), never surfaced as a run failure.
+    func write(_ checkpoint: ScanCheckpoint) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard checkpoint.runSequence > blockedThroughSequence else { return }
+        guard checkpoint.runSequence > lastWritten.sequence
+            || (checkpoint.runSequence == lastWritten.sequence
+                && checkpoint.updatedAt.timeIntervalSinceReferenceDate > lastWritten.updatedAt)
+        else { return }
+        guard (try? store.save(checkpoint)) != nil else { return }
+        lastWritten = (
+            checkpoint.runSequence,
+            checkpoint.updatedAt.timeIntervalSinceReferenceDate
+        )
+        currentKind = checkpoint.kind
+    }
+
+    /// Unconditional clear (fresh run, explicit cancel, supersession): the file goes and
+    /// every write at or below `sequence` is blocked from bringing it back.
+    func clear(through sequence: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        blockedThroughSequence = max(blockedThroughSequence, sequence)
+        store.clear()
+        currentKind = nil
+    }
+
+    /// Completion clear: removes the file only when it holds `kind` (another pass's
+    /// resumable state is never destroyed by this run finishing), while still blocking
+    /// this run's own late flushes.
+    func clear(owning kind: ScanCheckpoint.Kind, through sequence: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        blockedThroughSequence = max(blockedThroughSequence, sequence)
+        guard currentKind == kind || currentKind == nil else { return }
+        store.clear()
+        currentKind = nil
+    }
+
+    /// Whether `kind` may replace the file right now — used by the video-size checkpoint,
+    /// which must never overwrite a paused heavy pass's resume information.
+    func allows(_ kind: ScanCheckpoint.Kind) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentKind == nil || currentKind == kind
+    }
+
+    var kind: ScanCheckpoint.Kind? {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentKind
+    }
+}
+
+/// In-memory accumulation for one interrupted run, flushed to disk in bounded batches.
+///
+/// Entry producers (engine workers) call `record` off the main actor; the batch trigger
+/// hands an immutable snapshot to a detached task, so a full-library flush never blocks
+/// either the workers or the main actor. The only synchronous write is `flushNowSync`,
+/// used at pause/expiration where determinism matters more than a few milliseconds.
+final class ScanCheckpointAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private let writer: ScanCheckpointWriter
+    private let batchEntries: Int
+    private let batchInterval: TimeInterval
+    private let now: @Sendable () -> Date
+
+    private var kind: ScanCheckpoint.Kind?
+    private var runSequence = Int.min
+    private var startedAt = Date()
+    private var stage = ""
+    private var completedUnits = 0
+    private var totalUnits = 0
+    private var perceptualHashes: [PerceptualHashEntry] = []
+    private var byteKeys: [ContentByteKeyEntry] = []
+    private var blurVerdicts: [BlurVerdictEntry] = []
+    private var blurThresholds: BlurThresholds?
+    private var dirty = false
+    private var entriesSinceFlush = 0
+    private var lastFlushAt = Date.distantPast
+
+    init(
+        writer: ScanCheckpointWriter,
+        batchEntries: Int = ScanCheckpoint.flushEveryEntries,
+        batchInterval: TimeInterval = ScanCheckpoint.flushEverySeconds,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.writer = writer
+        self.batchEntries = batchEntries
+        self.batchInterval = batchInterval
+        self.now = now
+    }
+
+    /// Starts accumulating for a run. `carrying` restores a previous checkpoint's payload
+    /// (resume), so its evidence is never re-earned; `nil` starts empty (fresh run).
+    /// Returns the run's sequence — the value sinks must present to be accepted (callers
+    /// that already hold the sequence they passed in may ignore it).
+    @discardableResult
+    func begin(
+        kind: ScanCheckpoint.Kind,
+        runSequence: Int,
+        carrying checkpoint: ScanCheckpoint?
+    ) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        self.kind = kind
+        self.runSequence = runSequence
+        self.startedAt = checkpoint?.startedAt ?? now()
+        self.stage = checkpoint?.stage ?? ""
+        self.completedUnits = checkpoint?.completedUnits ?? 0
+        self.totalUnits = checkpoint?.totalUnits ?? 0
+        self.perceptualHashes = checkpoint?.perceptualHashes ?? []
+        self.byteKeys = checkpoint?.byteKeys ?? []
+        self.blurVerdicts = checkpoint?.blurVerdicts ?? []
+        self.blurThresholds = checkpoint?.blurThresholds ?? nil
+        self.entriesSinceFlush = checkpoint == nil ? 0 : ScanCheckpoint.flushEveryEntries
+        self.lastFlushAt = now()
+        self.dirty = checkpoint != nil
+        return runSequence
+    }
+
+    /// Releases the run without writing: the caller has cleared the file (completion,
+    /// cancel, supersession) or is about to rewrite it under a new run.
+    func endRun() {
+        lock.lock()
+        defer { lock.unlock() }
+        kind = nil
+        runSequence = Int.min
+        perceptualHashes = []
+        byteKeys = []
+        blurVerdicts = []
+        blurThresholds = nil
+        dirty = false
+        entriesSinceFlush = 0
+    }
+
+    var currentRunSequence: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return runSequence
+    }
+
+    /// What the active accumulation belongs to; nil between runs.
+    var activeKind: ScanCheckpoint.Kind? {
+        lock.lock()
+        defer { lock.unlock() }
+        return kind
+    }
+
+    var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return kind != nil
+    }
+
+    /// One piece of evidence from a run worker. Ignored when the sequence does not match
+    /// the active run — a cancelled run's stragglers can never pollute the next run.
+    func record(_ evidence: CheckpointEvidence, runSequence: Int) {
+        lock.lock()
+        guard kind != nil, runSequence == self.runSequence else {
+            lock.unlock()
+            return
+        }
+        switch evidence {
+        case .perceptualHash(let assetID, let modified, let bits):
+            perceptualHashes.append(PerceptualHashEntry(
+                assetID: assetID, modified: modified, bits: bits
+            ))
+        case .contentByteKey(let assetID, let modified, let imageBytes, let videoBytes):
+            byteKeys.append(ContentByteKeyEntry(
+                assetID: assetID,
+                modified: modified,
+                imageBytes: imageBytes,
+                videoBytes: videoBytes
+            ))
+        case .blurVerdict(let assetID, let modified, let verdict, let laplacianVariance):
+            blurVerdicts.append(BlurVerdictEntry(
+                assetID: assetID,
+                modified: modified,
+                verdict: verdict,
+                laplacianVariance: laplacianVariance
+            ))
+        }
+        dirty = true
+        entriesSinceFlush += 1
+        let shouldFlush = entriesSinceFlush >= batchEntries
+            || now().timeIntervalSince(lastFlushAt) >= batchInterval
+        guard shouldFlush else {
+            lock.unlock()
+            return
+        }
+        entriesSinceFlush = 0
+        lastFlushAt = now()
+        guard let snapshot = snapshotLocked() else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        // Detached: JSON encoding + atomic file write of a potentially megabyte-sized
+        // payload never touches a worker thread or the main actor. The writer's
+        // (sequence, updatedAt) ordering makes concurrent flushes safe.
+        Task.detached(priority: .utility) { [writer] in writer.write(snapshot) }
+    }
+
+    /// Progress for the active run, tagged with its kind so a chained catalog rebuild
+    /// (which never begins its own run) cannot rewrite a paused pass's saved stage.
+    ///
+    /// Also runs the time-based flush bound: a progress-only run (catalog) produces no
+    /// evidence records, so without this its checkpoint would only reach disk at a
+    /// lifecycle event — the 3 s clock bound must hold for it too.
+    func setProgress(
+        kind: ScanCheckpoint.Kind,
+        stage: String,
+        completed: Int,
+        total: Int
+    ) {
+        lock.lock()
+        guard self.kind == kind else {
+            lock.unlock()
+            return
+        }
+        self.stage = stage
+        completedUnits = completed
+        totalUnits = total
+        dirty = true
+        guard now().timeIntervalSince(lastFlushAt) >= batchInterval,
+              let snapshot = snapshotLocked()
+        else {
+            lock.unlock()
+            return
+        }
+        entriesSinceFlush = 0
+        lastFlushAt = now()
+        lock.unlock()
+        Task.detached(priority: .utility) { [writer] in writer.write(snapshot) }
+    }
+
+    /// Stamps the calibration the blur run is classifying with, so an interruption
+    /// persists it alongside the verdicts and resume can reject a stale calibration.
+    func noteBlurThresholds(_ thresholds: BlurThresholds) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard kind == .blur else { return }
+        blurThresholds = thresholds
+        dirty = true
+    }
+
+    /// Best-effort snapshot of what is accumulated right now; nil when no run is active.
+    func snapshot() -> ScanCheckpoint? {
+        lock.lock()
+        defer { lock.unlock() }
+        return snapshotLocked()
+    }
+
+    /// Writes any pending state synchronously and returns whether it wrote. Used at
+    /// pause/expiration (deterministic) and inactive transitions (best-effort insurance).
+    @discardableResult
+    func flushNowSync() -> Bool {
+        lock.lock()
+        guard dirty, let snapshot = snapshotLocked() else {
+            lock.unlock()
+            return false
+        }
+        dirty = false
+        entriesSinceFlush = 0
+        lastFlushAt = now()
+        lock.unlock()
+        writer.write(snapshot)
+        return true
+    }
+
+    private func snapshotLocked() -> ScanCheckpoint? {
+        guard let kind, kind != .videoSizes else { return nil }
+        return ScanCheckpoint(
+            runSequence: runSequence,
+            kind: kind,
+            startedAt: startedAt,
+            updatedAt: now(),
+            stage: stage,
+            completedUnits: completedUnits,
+            totalUnits: totalUnits,
+            // Sorted by identifier so a snapshot of the same evidence is byte-identical
+            // regardless of worker completion order — determinism for tests and diffs.
+            perceptualHashes: perceptualHashes.sorted { $0.assetID < $1.assetID },
+            byteKeys: byteKeys.sorted { $0.assetID < $1.assetID },
+            blurVerdicts: blurVerdicts.sorted { $0.assetID < $1.assetID },
+            blurThresholds: blurThresholds
+        )
     }
 }

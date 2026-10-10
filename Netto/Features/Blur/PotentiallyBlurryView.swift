@@ -38,6 +38,7 @@ struct PotentiallyBlurryView: View {
         case .catalogFailed: return "catalogFailed"
         case .notStarted: return "notStarted"
         case .analyzing: return "analyzing"
+        case .paused: return "paused"
         case .cancelled: return "cancelled"
         case .failed: return "failed"
         case .emptyLibrary: return "emptyLibrary"
@@ -140,6 +141,19 @@ struct PotentiallyBlurryView: View {
                 fraction: progress.fraction,
                 cancel: { env.cancelBlurAnalysis() }
             )
+
+        case .paused(let stage, let fraction):
+            // The sharpness pass was interrupted and saved its checkpoint; Resume
+            // continues it from the saved stage — never a fresh start, and no ETA
+            // (the estimator was reset with the pause).
+            PhaseMessage(
+                systemImage: "pause.circle",
+                title: "Analysis paused",
+                message: "\(stage)\(fraction.map { " \(Int(($0 * 100).rounded()))% complete —" } ?? "") Nothing was changed — resume to continue where it stopped.",
+                buttonTitle: "Resume"
+            ) {
+                env.resumeInterruptedWork()
+            }
 
         case .cancelled:
             PhaseMessage(

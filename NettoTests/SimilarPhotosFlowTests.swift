@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Testing
 @testable import Netto
@@ -763,6 +764,417 @@ struct SimilarPhotosFlowTests {
         }
         return env.analysisState
     }
+}
+
+// MARK: - Interrupted-run checkpoints (Phase C)
+//
+// Evidence for these tests is captured through the real engine and its checkpoint sink —
+// exactly what an interrupted run would have saved — then replayed through the restore →
+// paused → resume path. The loader counts every request, which is what makes "resume
+// skips what the checkpoint already earned" observable.
+
+@MainActor
+struct SimilarityCheckpointFlowTests {
+    private let records = checkpointRecords()
+
+    @Test func restoredCheckpointPresentsPausedStateWithoutStartingAnything() async throws {
+        let counter = RequestCounter()
+        let checkpoint = try await capturedSimilarityCheckpoint(records: records, counter: counter)
+        let (env, store, factoryCalls) = makeCheckpointEnv(
+            records: records,
+            counter: RequestCounter(),
+            checkpoint: checkpoint
+        )
+
+        await env.bootstrap()
+
+        guard case .paused(let progress) = env.analysisState else {
+            Issue.record("expected paused analysis, got \(env.analysisState)")
+            return
+        }
+        #expect(progress.stage == .fingerprinting)
+        #expect(progress.completedUnits == checkpoint.perceptualHashes.count)
+        #expect(progress.totalUnits == records.count)
+        // A relaunch presents the checkpoint and waits: no reader, no requests, no ETA.
+        #expect(factoryCalls.count == 0)
+        #expect(store.load() == checkpoint)
+        #expect(env.scanETA() == .calculating)
+    }
+
+    @Test func resumeReusesTheSavedEvidenceAndCompletesWithFewerRequests() async throws {
+        let fresh = try await freshBaseline()
+
+        let counter = RequestCounter()
+        let checkpoint = try await capturedSimilarityCheckpoint(records: records, counter: RequestCounter())
+        let (env, store, _) = makeCheckpointEnv(
+            records: records,
+            counter: counter,
+            checkpoint: checkpoint
+        )
+        await env.bootstrap()
+        env.resumeInterruptedWork()
+
+        let state = await waitForAnalysis(env)
+        guard case .completed(let resumed) = state else {
+            Issue.record("resumed run did not complete: \(state)")
+            return
+        }
+        // Same library, same loader, same engine — a resumed run's result must match a
+        // fresh one, and the saved perceptual hashes cost no thumbnail requests.
+        expectSameAnalysisOutcome(resumed, fresh.result)
+        #expect(counter.count < fresh.requestCount)
+        // Completion released the checkpoint kind-aware: nothing left to resume.
+        #expect(store.load() == nil)
+    }
+
+    @Test func changedModificationDatesInvalidateTheSavedEvidence() async throws {
+        let fresh = try await freshBaseline()
+        let captured = try await capturedSimilarityCheckpoint(records: records, counter: RequestCounter())
+        // Every saved entry now belongs to a different version of its asset: resume must
+        // recompute all of it instead of trusting stale evidence.
+        let stale = ScanCheckpoint(
+            runSequence: captured.runSequence,
+            kind: .similarity,
+            startedAt: captured.startedAt,
+            updatedAt: captured.updatedAt,
+            stage: captured.stage,
+            completedUnits: captured.completedUnits,
+            totalUnits: captured.totalUnits,
+            perceptualHashes: captured.perceptualHashes.map {
+                PerceptualHashEntry(
+                    assetID: $0.assetID,
+                    modified: Date(timeIntervalSince1970: 1_000),
+                    bits: $0.bits
+                )
+            }
+        )
+        let counter = RequestCounter()
+        let (env, _, _) = makeCheckpointEnv(
+            records: records,
+            counter: counter,
+            checkpoint: stale
+        )
+        await env.bootstrap()
+        env.resumeInterruptedWork()
+
+        let state = await waitForAnalysis(env)
+        guard case .completed(let resumed) = state else {
+            Issue.record("run with stale evidence did not complete: \(state)")
+            return
+        }
+        expectSameAnalysisOutcome(resumed, fresh.result)
+        // Full price: every hash recomputed, exactly as a fresh run pays.
+        #expect(counter.count == fresh.requestCount)
+    }
+
+    @Test func checkpointEntriesForDeletedAssetsAreIgnored() async throws {
+        let fresh = try await freshBaseline()
+        let captured = try await capturedSimilarityCheckpoint(records: records, counter: RequestCounter())
+        // One valid entry (reused) plus one for an asset that no longer exists (dropped
+        // by reconciliation — missing is never treated as analyzed).
+        var valid = captured.perceptualHashes
+        let reused = valid.removeFirst()
+        let mixed = ScanCheckpoint(
+            runSequence: captured.runSequence,
+            kind: .similarity,
+            startedAt: captured.startedAt,
+            updatedAt: captured.updatedAt,
+            stage: captured.stage,
+            completedUnits: captured.completedUnits,
+            totalUnits: captured.totalUnits,
+            perceptualHashes: valid + [
+                PerceptualHashEntry(assetID: "deleted-asset", modified: nil, bits: 0xF00D),
+                reused,
+            ]
+        )
+        let counter = RequestCounter()
+        let (env, _, _) = makeCheckpointEnv(
+            records: records,
+            counter: counter,
+            checkpoint: mixed
+        )
+        await env.bootstrap()
+        env.resumeInterruptedWork()
+
+        let state = await waitForAnalysis(env)
+        guard case .completed(let resumed) = state else {
+            Issue.record("run with a deleted entry did not complete: \(state)")
+            return
+        }
+        expectSameAnalysisOutcome(resumed, fresh.result)
+        #expect(!resumed.unavailableAssets.map(\.assetID).contains("deleted-asset"))
+        // The valid entry was reused; the ghost contributed nothing (and was never counted).
+        #expect(counter.count < fresh.requestCount)
+    }
+
+    @Test func aFreshStartSupersedesTheInterruptedRunAndCancelNeverResurrectsIt() async throws {
+        let counter = RequestCounter()
+        let checkpoint = try await capturedSimilarityCheckpoint(records: records, counter: counter)
+        let (env, store, _) = makeCheckpointEnv(
+            records: records,
+            counter: RequestCounter(),
+            checkpoint: checkpoint
+        )
+        await env.bootstrap()
+        #expect(store.load() == checkpoint)
+
+        // An explicit new Analyze supersedes resumable work: the checkpoint is gone the
+        // moment the fresh run claims the slot.
+        env.startSimilarityAnalysis()
+        #expect(env.analysisState.isRunning)
+        #expect(store.load() == nil)
+
+        env.cancelSimilarityAnalysis()
+        #expect(env.analysisState == .cancelled)
+        // Explicit cancel abandons resumable work too — Resume has nothing to continue.
+        #expect(store.load() == nil)
+        env.resumeInterruptedWork()
+        #expect(env.analysisState == .cancelled)
+    }
+
+    @Test func completionReleasesTheCheckpoint() async {
+        let (env, store, _) = makeCheckpointEnv(
+            records: records,
+            counter: RequestCounter()
+        )
+        env.startSimilarityAnalysis()
+        let state = await waitForAnalysis(env)
+        guard case .completed = state else {
+            Issue.record("fresh run did not complete: \(state)")
+            return
+        }
+        #expect(store.load() == nil)
+    }
+
+    // MARK: Helpers
+
+    private struct Baseline {
+        let result: PhotoAnalysisResult
+        let requestCount: Int
+    }
+
+    private func freshBaseline() async throws -> Baseline {
+        let counter = RequestCounter()
+        let (env, _, _) = makeCheckpointEnv(records: records, counter: counter)
+        env.startSimilarityAnalysis()
+        let state = await waitForAnalysis(env)
+        guard case .completed(let result) = state else {
+            throw CheckpointTestError.didNotComplete("\(state)")
+        }
+        return Baseline(result: result, requestCount: counter.count)
+    }
+
+    private func waitForAnalysis(
+        _ env: AppEnvironment,
+        timeoutMilliseconds: Int = 20_000
+    ) async -> PhotoAnalysisState {
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(timeoutMilliseconds))
+        while env.analysisState.isRunning, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return env.analysisState
+    }
+}
+
+private enum CheckpointTestError: Error {
+    case didNotComplete(String)
+}
+
+/// Cross-run comparison on the stable projections: group structure and counts must match,
+/// while unavailable entries compare as a set (their emission order follows parallel
+/// worker timing, which is not part of the contract).
+private func expectSameAnalysisOutcome(_ lhs: PhotoAnalysisResult, _ rhs: PhotoAnalysisResult) {
+    #expect(lhs.totalRecordCount == rhs.totalRecordCount)
+    #expect(lhs.analyzedAssetCount == rhs.analyzedAssetCount)
+    #expect(lhs.skippedNoCandidateCount == rhs.skippedNoCandidateCount)
+    #expect(lhs.exactGroups == rhs.exactGroups)
+    #expect(lhs.similarGroups == rhs.similarGroups)
+    #expect(lhs.descriptorKind == rhs.descriptorKind)
+    #expect(lhs.visionAvailable == rhs.visionAvailable)
+    #expect(
+        Set(lhs.unavailableAssets.map { "\($0.assetID):\($0.reason.rawValue)" })
+            == Set(rhs.unavailableAssets.map { "\($0.assetID):\($0.reason.rawValue)" })
+    )
+}
+
+/// Four same-bucket image records (identical dimensions and creation date) — the cheap
+/// pass issues one perceptual request each, which is what resume must skip.
+private func checkpointRecords() -> [PhotoAssetRecord] {
+    let creation = Date(timeIntervalSince1970: 1_750_000_000)
+    return ["ckpt-a", "ckpt-b", "ckpt-c", "ckpt-d"].map { id in
+        PhotoAssetRecord(
+            localIdentifier: id,
+            mediaType: .image,
+            mediaSubtypes: [],
+            pixelWidth: 1000,
+            pixelHeight: 1000,
+            creationDate: creation,
+            modificationDate: nil,
+            duration: 0,
+            isFavorite: false,
+            isHidden: false,
+            sourceType: .library,
+            hasAdjustments: false,
+            representsBurst: false,
+            burstIdentifier: nil
+        )
+    }
+}
+
+/// Runs the real engine once over `records`, capturing the evidence its sink reports —
+/// the same entries an interrupted run would have flushed to disk.
+private func capturedSimilarityCheckpoint(
+    records: [PhotoAssetRecord],
+    counter: RequestCounter
+) async throws -> ScanCheckpoint {
+    let sink = EvidenceBox()
+    let engine = PhotoSimilarityEngine(
+        thumbnailLoader: CheckpointCountingLoader(images: checkpointImages(for: records), counter: counter),
+        checkpointSink: { sink.append($0) }
+    )
+    for try await event in engine.makeAnalysisStream(records: records) {
+        if case .completed = event { break }
+    }
+    let hashes = sink.entries.compactMap { evidence -> PerceptualHashEntry? in
+        guard case .perceptualHash(let assetID, let modified, let bits) = evidence else { return nil }
+        return PerceptualHashEntry(assetID: assetID, modified: modified, bits: bits)
+    }
+    guard hashes.count == records.count else {
+        throw CheckpointTestError.didNotComplete("captured \(hashes.count) of \(records.count) hashes")
+    }
+    return ScanCheckpoint(
+        runSequence: 7,
+        kind: .similarity,
+        startedAt: Date(timeIntervalSinceReferenceDate: 10),
+        updatedAt: Date(timeIntervalSinceReferenceDate: 20),
+        stage: PhotoAnalysisStage.fingerprinting.rawValue,
+        completedUnits: hashes.count,
+        totalUnits: records.count,
+        perceptualHashes: hashes.sorted { $0.assetID < $1.assetID }
+    )
+}
+
+@MainActor
+private func makeCheckpointEnv(
+    records: [PhotoAssetRecord],
+    counter: RequestCounter,
+    checkpoint: ScanCheckpoint? = nil,
+    factoryCalls: FactoryCallBox = FactoryCallBox()
+) -> (env: AppEnvironment, checkpointStore: InMemoryScanCheckpointStore, factoryCalls: FactoryCallBox) {
+    let checkpointStore = InMemoryScanCheckpointStore()
+    if let checkpoint {
+        try? checkpointStore.save(checkpoint)
+    }
+    let env = AppEnvironment(
+        storageProvider: FakeStorage(),
+        photoPermission: CheckpointPermissionService(.authorized),
+        contactsPermission: CheckpointContactsPermissionService(),
+        makePhotoLibrary: {
+            factoryCalls.record()
+            return FakeLibrary(records: records)
+        },
+        thumbnailLoader: CheckpointCountingLoader(
+            images: checkpointImages(for: records),
+            counter: counter
+        ),
+        // Completions and restores in this suite must never touch the app's real files.
+        scanSnapshotStore: InMemoryScanSnapshotStore(),
+        checkpointStore: checkpointStore
+    )
+    env.photoPermissionState = .authorized
+    return (env, checkpointStore, factoryCalls)
+}
+
+/// Distinct deterministic noise images — no accidental hamming-0 collisions, so neither
+/// the content-length fingerprinter nor PhotoKit is ever reached with phantom ids.
+private func checkpointImages(for records: [PhotoAssetRecord]) -> [String: CGImage] {
+    var images: [String: CGImage] = [:]
+    for (index, record) in records.enumerated() {
+        images[record.localIdentifier] = blurTestNoise(
+            size: 96,
+            base: 48,
+            spread: 160,
+            seed: UInt64(index) + 1
+        )
+    }
+    return images
+}
+
+/// Records every thumbnail request — the observable difference between a fresh run and a
+/// resume seeded with checkpoint evidence.
+private final class RequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var log: [(assetID: String, mode: PhotoThumbnailRequestMode)] = []
+
+    func record(_ assetID: String, mode: PhotoThumbnailRequestMode) {
+        lock.lock()
+        log.append((assetID, mode))
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return log.count
+    }
+}
+
+private final class EvidenceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [CheckpointEvidence] = []
+
+    func append(_ evidence: CheckpointEvidence) {
+        lock.lock()
+        items.append(evidence)
+        lock.unlock()
+    }
+
+    var entries: [CheckpointEvidence] {
+        lock.lock()
+        defer { lock.unlock() }
+        return items
+    }
+}
+
+private struct CheckpointCountingLoader: PhotoThumbnailLoading {
+    let images: [String: CGImage]
+    let counter: RequestCounter
+
+    func thumbnail(
+        for assetID: String,
+        targetPixelSize: Int,
+        mode: PhotoThumbnailRequestMode
+    ) async throws -> CGImage {
+        counter.record(assetID, mode: mode)
+        guard let image = images[assetID] else {
+            throw PhotoContentError.unavailable
+        }
+        return image
+    }
+}
+
+private final class CheckpointPermissionService: PhotoLibraryPermissionServicing, @unchecked Sendable {
+    private let lock = NSLock()
+    private let state: PermissionState
+
+    init(_ state: PermissionState) {
+        self.state = state
+    }
+
+    func currentStatus() -> PermissionState {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+
+    func requestAccess() async -> PermissionState {
+        currentStatus()
+    }
+}
+
+private struct CheckpointContactsPermissionService: ContactsPermissionServicing {
+    func currentStatus() -> PermissionState { .notDetermined }
+    func requestAccess() async -> PermissionState { .notDetermined }
 }
 
 // MARK: - Fixtures

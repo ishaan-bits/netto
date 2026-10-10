@@ -1006,3 +1006,322 @@ private struct FakeLibrary: PhotoLibraryReading {
         return Array(records[lower..<upper])
     }
 }
+
+// MARK: - Checkpoint persistence + resume (Phase C)
+
+/// The sharpness pass's Phase C contract: a restored checkpoint presents a paused card
+/// without issuing a single request; resume reuses the saved verdicts (measured at
+/// engine level through the sink, so the evidence is real rather than fabricated);
+/// a calibration mismatch refuses the verdicts outright; a candidate without its score
+/// re-measures (review must be able to explain itself); and a blur resume with no fresh
+/// catalog chains a rebuild first and still completes with the carried payload.
+@MainActor
+struct BlurCheckpointFlowTests {
+    @Test func restoredCheckpointPresentsPausedBlurStateWithoutAnyRequest() async throws {
+        let checkpoint = try await capturedBlurCheckpoint()
+        let (env, probe, store) = makeCheckpointBlurEnv(checkpoint: checkpoint)
+
+        await env.bootstrap()
+
+        guard case .paused(let progress) = env.blurAnalysisState else {
+            Issue.record("expected paused after restore, got \(env.blurAnalysisState)")
+            return
+        }
+        #expect(progress.completedUnits == checkpoint.completedUnits)
+        #expect(progress.totalUnits == checkpoint.totalUnits)
+        #expect(probe.requestCount == 0)
+        #expect(store.load() == checkpoint)
+    }
+
+    @Test func resumeReusesSavedVerdictsAndCompletesWithoutRequestingThem() async throws {
+        let baseline = await freshBlurBaseline()
+        #expect(baseline.requests == 8)
+
+        let checkpoint = try await capturedBlurCheckpoint()
+        let (env, probe, store) = makeCheckpointBlurEnv(checkpoint: checkpoint)
+        await env.bootstrap()
+        guard case .paused = env.blurAnalysisState else {
+            Issue.record("expected paused after restore, got \(env.blurAnalysisState)")
+            return
+        }
+
+        env.resumeInterruptedWork()
+        guard let resumed = await resumedBlurResult(env) else { return }
+
+        #expect(probe.requestCount == 0)
+        #expect(resumed == baseline.result)
+        #expect(store.load() == nil)
+    }
+
+    @Test func thresholdsMismatchRefusesSavedVerdictsAndMeasuresEverythingAgain() async throws {
+        let baseline = await freshBlurBaseline()
+
+        let captured = try await capturedBlurCheckpoint()
+        // Same shape, different calibration: `blurSeed` refuses the payload before the
+        // engine ever sees it, so the pass is a full fresh measurement — never a mix.
+        let mismatched = ScanCheckpoint(
+            runSequence: captured.runSequence,
+            kind: captured.kind,
+            startedAt: captured.startedAt,
+            updatedAt: captured.updatedAt,
+            stage: captured.stage,
+            completedUnits: captured.completedUnits,
+            totalUnits: captured.totalUnits,
+            blurVerdicts: captured.blurVerdicts,
+            blurThresholds: BlurThresholds(
+                sharpMinVariance: 0.015,
+                blurryMaxVariance: 5e-4,
+                blurryMaxTenengrad: 5.0e-2,
+                minLuma: 0.08,
+                minTextureStdDev: 0.015
+            )
+        )
+        let (env, probe, store) = makeCheckpointBlurEnv(checkpoint: mismatched)
+        await env.bootstrap()
+        guard case .paused = env.blurAnalysisState else {
+            Issue.record("expected paused after restore, got \(env.blurAnalysisState)")
+            return
+        }
+
+        env.resumeInterruptedWork()
+        guard let resumed = await resumedBlurResult(env) else { return }
+
+        #expect(probe.requestCount == baseline.requests)
+        #expect(resumed == baseline.result)
+        #expect(store.load() == nil)
+    }
+
+    @Test func aCandidateWithoutItsScoreIsMeasuredAgainOnResume() async throws {
+        let baseline = await freshBlurBaseline()
+
+        let captured = try await capturedBlurCheckpoint()
+        // Review shows a candidate's score — an entry without one cannot explain itself,
+        // so those specific verdicts are dropped from the seed and re-measured; every
+        // other verdict (sharp, insufficient) is still reused.
+        let partial = ScanCheckpoint(
+            runSequence: captured.runSequence,
+            kind: captured.kind,
+            startedAt: captured.startedAt,
+            updatedAt: captured.updatedAt,
+            stage: captured.stage,
+            completedUnits: captured.completedUnits,
+            totalUnits: captured.totalUnits,
+            blurVerdicts: captured.blurVerdicts.map { entry in
+                guard entry.verdict.isCandidate else { return entry }
+                return BlurVerdictEntry(
+                    assetID: entry.assetID,
+                    modified: entry.modified,
+                    verdict: entry.verdict,
+                    laplacianVariance: nil
+                )
+            },
+            blurThresholds: captured.blurThresholds
+        )
+        let (env, probe, store) = makeCheckpointBlurEnv(checkpoint: partial)
+        await env.bootstrap()
+        guard case .paused = env.blurAnalysisState else {
+            Issue.record("expected paused after restore, got \(env.blurAnalysisState)")
+            return
+        }
+
+        env.resumeInterruptedWork()
+        guard let resumed = await resumedBlurResult(env) else { return }
+
+        // Exactly the two candidates came back for measurement — nothing else.
+        #expect(Set(probe.requestedIDs()) == ["blur-01", "blur-02"])
+        #expect(probe.requestCount == 2)
+        #expect(resumed == baseline.result)
+        #expect(store.load() == nil)
+    }
+
+    @Test func resumeWithoutACompletedCatalogRebuildsFirstThenCompletesTheBlurPass() async throws {
+        let baseline = await freshBlurBaseline()
+
+        let checkpoint = try await capturedBlurCheckpoint()
+        let (env, probe, store) = makeCheckpointBlurEnv(
+            checkpoint: checkpoint,
+            catalogCompleted: false
+        )
+        await env.bootstrap()
+        guard case .paused = env.blurAnalysisState else {
+            Issue.record("expected paused after restore, got \(env.blurAnalysisState)")
+            return
+        }
+        #expect(probe.requestCount == 0)
+
+        env.resumeInterruptedWork()
+
+        // The chained rebuild reads through the library fixture, never the blur probe —
+        // and the blur pass itself starts only after the catalog lands.
+        #expect(probe.requestCount == 0)
+        guard let resumed = await resumedBlurResult(env) else { return }
+        guard case .completed(let catalog) = env.catalogState else {
+            Issue.record("expected a completed chained catalog, got \(env.catalogState)")
+            return
+        }
+
+        #expect(catalog.records.count == blurFixtureRecords.count)
+        #expect(probe.requestCount == 0)
+        #expect(resumed == baseline.result)
+        #expect(store.load() == nil)
+    }
+}
+
+// MARK: - Checkpoint fixtures and helpers
+
+/// The same eight analyzable fixture images `makeBlurEnv` serves — one map so an
+/// engine-level capture and an environment-level resume classify identically.
+private let blurCheckpointImages: [String: CGImage] = [
+    "sharp-01": blurFixtureSharpChecker,
+    "sharp-02": blurFixtureScene,
+    "sharp-03": blurFixtureWideChecker,
+    "blur-04": blurFixtureStrongNoise,
+    "blur-01": blurFixtureBlurryScene,
+    "blur-02": blurFixtureBlurryScene,
+    "flat-01": blurFixtureFlat,
+    "dark-01": blurFixtureDarkNoise,
+]
+
+/// Runs one real sharpness pass over the fixture records at engine level and returns
+/// exactly what an interruption at completion would have persisted: the verdicts the
+/// sink produced (variances included), under the default calibration.
+private func capturedBlurCheckpoint() async throws -> ScanCheckpoint {
+    let probe = BlurProbe()
+    let sink = BlurEvidenceBox()
+    let engine = BlurAnalysisEngine(
+        configuration: BlurAnalysisConfiguration(),
+        thumbnailLoader: BlurEngineThumbnails(probe: probe, images: blurCheckpointImages),
+        now: { blurScanDate },
+        checkpointSink: { sink.append($0) }
+    )
+    for try await event in engine.makeAnalysisStream(records: blurFixtureRecords) {
+        if case .completed = event { break }
+    }
+    let entries = sink.evidence.compactMap { evidence -> BlurVerdictEntry? in
+        guard case .blurVerdict(let assetID, let modified, let verdict, let variance) = evidence
+        else { return nil }
+        return BlurVerdictEntry(
+            assetID: assetID,
+            modified: modified,
+            verdict: verdict,
+            laplacianVariance: variance
+        )
+    }
+    try #require(entries.count == 8, "expected one verdict per analyzable record, got \(entries.count)")
+    return ScanCheckpoint(
+        runSequence: 7,
+        kind: .blur,
+        startedAt: Date(timeIntervalSince1970: 1_760_000_400),
+        updatedAt: Date(timeIntervalSince1970: 1_760_000_450),
+        completedUnits: entries.count,
+        totalUnits: blurFixtureRecords.count,
+        blurVerdicts: entries.sorted { $0.assetID < $1.assetID },
+        blurThresholds: BlurAnalysisConfiguration().thresholds
+    )
+}
+
+/// Environment over the same fixture images, optionally pre-loaded with an interrupted
+/// checkpoint (and optionally without a completed catalog, to exercise the chained path).
+@MainActor
+private func makeCheckpointBlurEnv(
+    checkpoint: ScanCheckpoint? = nil,
+    catalogCompleted: Bool = true
+) -> (env: AppEnvironment, probe: BlurProbe, store: InMemoryScanCheckpointStore) {
+    let probe = BlurProbe()
+    let checkpointStore = InMemoryScanCheckpointStore()
+    if let checkpoint {
+        try? checkpointStore.save(checkpoint)
+    }
+    let env = AppEnvironment(
+        storageProvider: FakeStorage(),
+        photoPermission: FakePermissionService(.authorized),
+        contactsPermission: BlurCheckpointContactsPermissionService(),
+        makePhotoLibrary: { FakeLibrary(records: blurFixtureRecords) },
+        thumbnailLoader: BlurEngineThumbnails(probe: probe, images: blurCheckpointImages),
+        sizeProvider: FakeSizeProvider(sizes: [
+            "blur-01": 700,
+            "blur-02": 800,
+            "blur-04": 900,
+        ]),
+        deletionService: RecordingDeletionService(outcome: .succeeded(DeletionSuccess(
+            plannedCount: 1,
+            verifiedRemovedCount: 1,
+            remainingIDs: []
+        ))),
+        scanSnapshotStore: InMemoryScanSnapshotStore(),
+        checkpointStore: checkpointStore,
+        sessionToken: "session-1"
+    )
+    env.photoPermissionState = .authorized
+    env.blurAnalysisClock = { blurScanDate }
+    if catalogCompleted {
+        env.catalogState = .completed(CatalogScanResult(
+            records: blurFixtureRecords,
+            libraryAssetCount: blurFixtureRecords.count,
+            accessLevel: .authorized
+        ))
+    }
+    return (env, probe, checkpointStore)
+}
+
+/// One fresh pass to completion — the result every resumed run must equal, and the
+/// request count every resumed run must beat.
+@MainActor
+private func freshBlurBaseline() async -> (result: BlurAnalysisResult, requests: Int) {
+    let (env, probe, _) = makeBlurEnv()
+    env.startBlurAnalysis()
+    await waitForBlurSettled(env)
+    guard case .completed(let result) = env.blurAnalysisState else {
+        Issue.record("fresh blur run did not complete: \(env.blurAnalysisState)")
+        return (.empty, probe.requestCount)
+    }
+    return (result, probe.requestCount)
+}
+
+/// Waits for a resumed blur pass to reach a terminal state — `.paused` is a legal
+/// interim state (a chained catalog rebuild is still running), so the poll cannot key
+/// off `isRunning` alone.
+@MainActor
+private func resumedBlurResult(
+    _ env: AppEnvironment,
+    timeoutMilliseconds: Int = 15_000
+) async -> BlurAnalysisResult? {
+    let deadline = ContinuousClock.now.advanced(by: .milliseconds(timeoutMilliseconds))
+    while ContinuousClock.now < deadline {
+        switch env.blurAnalysisState {
+        case .completed, .failed, .cancelled:
+            break
+        default:
+            try? await Task.sleep(for: .milliseconds(20))
+            continue
+        }
+        break
+    }
+    guard case .completed(let result) = env.blurAnalysisState else {
+        Issue.record("resumed blur run did not complete: \(env.blurAnalysisState)")
+        return nil
+    }
+    return result
+}
+
+private final class BlurEvidenceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [CheckpointEvidence] = []
+
+    func append(_ evidence: CheckpointEvidence) {
+        lock.lock()
+        storage.append(evidence)
+        lock.unlock()
+    }
+
+    var evidence: [CheckpointEvidence] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+private struct BlurCheckpointContactsPermissionService: ContactsPermissionServicing {
+    func currentStatus() -> PermissionState { .notDetermined }
+    func requestAccess() async -> PermissionState { .notDetermined }
+}

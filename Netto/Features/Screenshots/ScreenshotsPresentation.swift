@@ -12,6 +12,9 @@ enum ScreenshotsPhase: Sendable, Equatable {
     case permissionDenied
     /// A catalog build is running.
     case buildingCatalog(CatalogScanProgress)
+    /// The catalog build was interrupted and saved its progress; the stage line is what it
+    /// had read so far. Resumable — never presented as a running build.
+    case paused(stage: String)
     /// Permission is fine but no catalog exists yet (or the last build was cancelled).
     case scanRequired
     /// The last catalog build failed; carries the user-facing message.
@@ -41,6 +44,8 @@ enum ScreenshotsPresentation {
         switch catalog {
         case .running(let progress):
             return .buildingCatalog(progress)
+        case .paused(let progress):
+            return .paused(stage: DashboardPresentation.catalogStage(progress))
         case .failed(let failure):
             return .failed(failure.userMessage)
         case .notStarted, .cancelled:
@@ -71,6 +76,8 @@ enum ScreenshotsPresentation {
             return progress.totalCount > 0
                 ? "Reading \(progress.enumeratedCount) of \(progress.totalCount) assets…"
                 : "Counting assets…"
+        case .paused:
+            return "Scan paused"
         case .failed(let message):
             return message
         case .empty:

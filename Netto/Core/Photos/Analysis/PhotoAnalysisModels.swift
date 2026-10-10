@@ -271,6 +271,10 @@ enum PhotoAnalysisFailure: Error, Sendable, Equatable {
 enum PhotoAnalysisState: Sendable, Equatable {
     case notStarted
     case running(PhotoAnalysisProgress)
+    /// Interrupted (backgrounding, expiration, or suspension) with a checkpoint on disk.
+    /// Not running — the pass holds no cores and no requests — but resumable, and never
+    /// to be presented as still scanning.
+    case paused(PhotoAnalysisProgress)
     case completed(PhotoAnalysisResult)
     case cancelled
     case failed(PhotoAnalysisFailure)
@@ -278,6 +282,12 @@ enum PhotoAnalysisState: Sendable, Equatable {
     var isRunning: Bool {
         if case .running = self { return true }
         return false
+    }
+
+    /// The progress this state is showing, for a paused state's saved snapshot.
+    var pausedProgress: PhotoAnalysisProgress? {
+        if case .paused(let progress) = self { return progress }
+        return nil
     }
 }
 

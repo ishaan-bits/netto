@@ -142,7 +142,7 @@ enum BlurVerdict: String, Sendable, Equatable, Codable {
 ///
 /// Real-device recalibration is required before these thresholds can be called accurate
 /// for photographs; until then every candidate is presented for explicit human review.
-struct BlurThresholds: Sendable, Equatable {
+struct BlurThresholds: Sendable, Equatable, Codable {
     /// Laplacian variance at or above this → `.sharp`.
     let sharpMinVariance: Float
     /// Laplacian variance at or below this (with the Tenengrad gate also satisfied)

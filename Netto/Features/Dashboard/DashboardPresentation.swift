@@ -85,6 +85,10 @@ enum DashboardPresentation {
         case permissionRequired
         case permissionDenied
         case scanning(stage: String, fraction: Double?, eta: ScanETA)
+        /// An interrupted run's saved state: the stage and counts it had reached when it
+        /// paused, shown as paused — never as a live scan, and without an ETA (the
+        /// estimator's anchors were reset with the pause; a countdown would be fiction).
+        case paused(stage: String, fraction: Double?)
         case idle
         case finished(analyzed: Int, total: Int, groups: Int, lastScannedAt: Date?)
         case cancelled
@@ -143,6 +147,13 @@ enum DashboardPresentation {
             )
         case .cancelled:
             return .cancelled
+        case .paused(let progress):
+            // Saved progress, presented as paused: the stage line keeps its counts, the
+            // bar shows where the run stopped, and no ETA is offered.
+            return .paused(
+                stage: SimilarPhotosPresentation.stageMessage(for: progress),
+                fraction: progress.fraction
+            )
         case .notStarted, .running, .failed:
             break
         }
@@ -152,6 +163,11 @@ enum DashboardPresentation {
             return result.isEmpty ? .emptyLibrary : .idle
         case .failed(let failure):
             return .failed(failure.userMessage)
+        case .paused(let progress):
+            return .paused(
+                stage: catalogStage(progress),
+                fraction: catalogFraction(progress)
+            )
         case .notStarted, .cancelled, .running:
             return .idle
         }
@@ -194,6 +210,17 @@ enum DashboardPresentation {
                 title: "Scanning your library",
                 body: lines.joined(separator: "\n"),
                 buttonTitle: "Cancel",
+                tone: .brand
+            )
+
+        case .paused(let stage, _):
+            // The stage line carries the saved counts; the Resume action continues the
+            // interrupted run (it never re-runs from scratch — that is a fresh Analyze).
+            return ScanCopy(
+                icon: "pause.circle",
+                title: "Scan paused",
+                body: stage,
+                buttonTitle: "Resume",
                 tone: .brand
             )
 

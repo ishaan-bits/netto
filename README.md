@@ -117,6 +117,47 @@ Scans of tens of thousands of assets additionally run under four load-shaping ru
   both the similarity and sharpness `isRunning` flags falling to false resume it.
   Catalog building and similarity analysis remain mutually exclusive as before.
 
+### Interrupted-run resilience (Phase C)
+
+Long scans are built to survive backgrounding, locking, expiration, and process death —
+without ever claiming the system will keep scanning in the background:
+
+- **Explicit lifecycle** — the app distinguishes active / inactive / background.
+  Going inactive insurance-flushes the checkpoint batcher (one bounded write). Going
+  background arms a short OS background task *only while work is actually in flight*;
+  when the system reclaims it, every running pass pauses synchronously at the last
+  deterministic moment: live progress is tagged, the checkpoint is written, a running
+  video measurement checkpoints its landed bytes, tasks are cancelled, and ETA anchors
+  drop — then the task is released. Returning to the foreground refreshes permissions
+  and storage, and auto-resumes only work interrupted *in this session*; a checkpoint
+  restored at launch waits for an explicit Resume tap.
+- **One bounded, versioned checkpoint file** — a single `checkpoint.json` (schema v1)
+  holds at most one pass's resume state: run sequence (monotonic, adopted across
+  launches so a stale write can never overwrite newer state), kind (catalog / similarity
+  / blur / video sizes), stage, processed evidence (reconcilable entries only — never
+  pixels, full-resolution content, or contact data), blur calibration, and timestamps.
+  Evidence flushes in bounded batches (256 entries or 3 s) off the main actor, with one
+  synchronous write at the pause transition; corrupt, obsolete-schema, or
+  unrecognizable-stage files degrade to "no checkpoint", never to a crash. A paused
+  heavy pass always owns the file slot; video-size checkpoints can only fill an empty
+  slot, never clobber heavier resume information.
+- **Idempotent resume** — every entry carries the asset id *and its exact modification
+  date*: deleted or re-exported assets are measured again (an asset the interrupted run
+  never judged is new work — nothing is marked analyzed without evidence), and a changed
+  asset's cached evidence is discarded. A fresh start (or an explicit cancel) discards
+  interrupted state so a straggler flush can never resurrect it; completion releases the
+  file kind-aware. Similarity resumes rebuild their own catalog as Stage A; a blur or
+  video resume with no fresh catalog chains a catalog rebuild first (that rebuild owns
+  no checkpoint of its own) and then resumes with the carried payload.
+- **Honest surfaces** — `.paused` is a distinct state from running / completed /
+  cancelled / failed: the dashboard shows the saved stage and percentage with a Resume
+  action and **no live countdown** (a paused ETA would be a lie), and the ETA estimator
+  resets on pause so foregrounding re-anchors from real post-resume samples.
+- **PhotoKit request lifetimes** — pending photo requests resolve exactly once
+  (success, failure, cancellation, timeout, or late callback — whichever lands first;
+  the rest become no-ops), timeouts and cancellations are distinguished from unavailable
+  content, and a resumed pass issues fresh requests rather than reusing a timed-out one.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -154,7 +195,7 @@ xcodebuild test -project Netto.xcodeproj -scheme Netto \
 | `-fixtureContacts` | Serves synthetic contacts instead of the store (reads only) |
 | `-seedFixtureContacts` | Seeds the fixture contacts into the simulator's store (idempotent) |
 | `-wipeFixtureContacts` | Removes previously seeded fixture contacts |
-| `-resetScanSnapshot` | Clears the persisted scan snapshot on launch |
+| `-resetScanSnapshot` | Clears the persisted scan snapshot and checkpoint file on launch |
 
 These exist so the whole pipeline can be exercised in Simulator against deterministic data.
 
@@ -180,7 +221,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 692 Swift Testing cases across 68 suites covering the pure
+- **Unit suite** — 46 files, 738 Swift Testing cases across 76 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -199,10 +240,30 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   references, and the analysis-pipeline coordination (video measurement refusing to
   start or resume while a pass owns the pipeline, resuming when it finishes, an
   in-flight measurement yielding to a similarity start).
+- **Interrupted-run coverage (Phase C)** — 46 cases over checkpoint persistence and
+  resume: the checkpoint file (round-trips including exact dates, first-launch, corrupt
+  and future-schema discard, kind-aware single-slot writes with run-sequence ordering
+  and adoption), the evidence accumulator (carry restores payload and progress, foreign
+  run sequences can never be smuggled in, blur calibration stamped only during a blur
+  run, batched and forced flushes), paused presentation (scan card, status copy, Resume
+  CTA, saved percentage, no live countdown), lifecycle (background expiration →
+  synchronous pause + checkpoint + released task, foreground auto-resume completing
+  without duplicates, relaunch restoring paused without auto-starting, unusable
+  checkpoints dropped, no background task when idle), engine-level checkpoint capture
+  and reuse for the similarity pass (seed reuse needs strictly fewer requests,
+  modification-date changes invalidate the evidence, deleted assets reconcile away,
+  a fresh start supersedes and cancel never resurrects) and the sharpness pass (seed
+  reuse at zero requests, calibration mismatch re-measures everything, candidates
+  without scores re-measure while other verdicts are reused, the chained catalog
+  rebuild path resumes with the carried payload), video sizes (a restored checkpoint
+  seeds the next measurement and wins over the provider, expiration mid-measurement
+  persists exactly what landed and foregrounding measures only the remainder, a paused
+  heavy pass's checkpoint keeps the file slot), and ETA reset semantics (reset drops
+  every sample; a countdown reappears only from fresh post-reset observations).
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification** — full suites green on the Phase B worktree: the unit run
-  reports "692 tests in 68 suites passed", plus 5/5 UI cases, and a clean
+- **Recent verification** — full suites green on the Phase C worktree: the unit run
+  reports "738 tests in 76 suites passed", plus 5/5 UI cases, and a clean
   `build-for-testing` with 0 errors and
   251 warnings, all inside the pre-existing UI-test-target baseline (the unit/app
   targets are warning-free). One case, `cancellationPropagatesOutOfTheLoader` in
@@ -253,10 +314,27 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   `isRunning` flag flips to false (an explicit resume also works); if the app is
   backgrounded or killed while yielded, measurement restarts from persisted partial
   results on the next session.
+- **Interrupted-run checkpointing (Phase C)** — checkpoints store resume *evidence*, not
+  finished results (a completed scan persists through the separate scan snapshot). A
+  resumed catalog restarts enumeration from the first asset — per-asset offsets are not
+  persisted — so it re-reads the library, though it never duplicates records and never
+  re-issues analysis work that already has surviving evidence. Checkpoint entries
+  compare exact modification dates through JSON-encoded `Date`s; the worst case for a
+  precision round-trip mismatch is one entry's evidence being dropped, which recomputes
+  that asset rather than corrupting anything. Video-size batches are cancellable as a
+  whole, but an individual provider call has no per-request timeout. None of this scans
+  in the background: the OS background task exists only to *save* a resumable checkpoint
+  before expiration, never to keep analyzing.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the
   Phase A commit) and is a Swift Testing suite-context quirk, not a suppressed failure.
+- **The scan-validation UI tests are timing-sensitive under load** — across back-to-back
+  full-suite runs on one warm simulator, `testFullScanReachesTerminalStateWithRealProgress`
+  and `testCancelStopsScanAndSecondRunWorks` each failed once with an element-snapshot
+  query timeout while the 90 s fixture scan was in flight; each passed in isolation and
+  in the final full-suite run (5/5). Treat a single UI failure as a flake to rerun, not
+  as a pass.
 - **The Phase B benchmark comparison is not isolated** — within one
   `BlurScanBenchmarkTests` run, the before and after engine paths now share the process
   asset-reference cache, so per-path request times are no longer independent; the

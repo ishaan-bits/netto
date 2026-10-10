@@ -11,6 +11,73 @@ enum DeletionSelectionSource: Sendable, Equatable {
     case blurReview
 }
 
+/// The app's lifecycle phase as the environment reasons about it — mapped from `ScenePhase`
+/// in `RootView`, deliberately distinct from it so the interruption logic can be driven by
+/// tests without a scene.
+enum AppLifecyclePhase: Sendable, Equatable {
+    case active
+    case inactive
+    case background
+}
+
+/// Seam over the OS background task. Tests drive expiration deterministically instead of
+/// racing the system clock, which is the only way the pause-and-checkpoint path can be
+/// tested as written (a simulator test cannot reproduce iOS's real suspension anyway).
+@MainActor
+protocol BackgroundTaskScheduling: Sendable {
+    /// Arms a background task; `onExpiration` runs on the main actor if the system
+    /// reclaims it before the work finishes. A second `begin` while held is a no-op.
+    func begin(onExpiration: @escaping @MainActor () -> Void)
+    /// Releases the task (completion, cancel, pause, foreground). No-op when unheld.
+    func end()
+    var isHolding: Bool { get }
+}
+
+/// Production seam: `UIApplication`'s named background task. Main-actor isolated (as
+/// `UIApplication` itself is), which also serializes `begin`/`end`/expiration — the
+/// expiration handler hops back onto the main actor before touching any state.
+@MainActor
+final class SystemBackgroundTaskScheduler: BackgroundTaskScheduling {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var expiration: (@MainActor () -> Void)?
+
+    var isHolding: Bool { identifier != .invalid }
+
+    func begin(onExpiration: @escaping @MainActor () -> Void) {
+        guard identifier == .invalid else { return }
+        expiration = onExpiration
+        let assigned = UIApplication.shared.beginBackgroundTask(
+            withName: "netto.scan.checkpoint"
+        ) { [weak self] in
+            // Called off the main actor by the system; all state lives on it.
+            Task { @MainActor [weak self] in
+                self?.handleExpiration()
+            }
+        }
+        identifier = assigned
+    }
+
+    func end() {
+        let current = identifier
+        identifier = .invalid
+        expiration = nil
+        guard current != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(current)
+    }
+
+    private func handleExpiration() {
+        // Only the owner ends the task: `end()` may have won the race after the system
+        // decided to reclaim it, and a double end is a real (logged) bug.
+        guard identifier != .invalid else { return }
+        let handler = expiration
+        let current = identifier
+        identifier = .invalid
+        expiration = nil
+        UIApplication.shared.endBackgroundTask(current)
+        handler?()
+    }
+}
+
 /// `@Observable` rather than `ObservableObject`: every view tracks only the properties it
 /// actually reads, so a selection toggle no longer invalidates the dashboard (and a progress
 /// tick no longer re-renders screens that never read progress).
@@ -157,6 +224,41 @@ final class AppEnvironment {
     /// the very reader that is asking.
     @ObservationIgnored private var builtBlurDatasetRecords: [PhotoAssetRecord] = []
 
+    // MARK: Interrupted-run state (Phase C)
+
+    /// Persistence seam for interrupted-run checkpoints. Injected so tests use temporary
+    /// storage instead of the app's real file (same rule as `scanSnapshotStore`).
+    let checkpointStore: any ScanCheckpointStore
+    /// Orders checkpoint writes (a superseded run's late flush can never overwrite a newer
+    /// checkpoint) and gates kind-conditional clears. Injected indirectly through the store.
+    private let checkpointWriter: ScanCheckpointWriter
+    /// In-memory batch for the active run's evidence; flushed in bounded batches, never
+    /// per asset, never on the main actor during a run.
+    private let checkpointAccumulator: ScanCheckpointAccumulator
+    /// Background-task seam: tests drive expiration deterministically instead of racing
+    /// the system clock.
+    private let backgroundTasks: any BackgroundTaskScheduling
+
+    /// The checkpoint that exists to be resumed: loaded at bootstrap, or written by an
+    /// in-session interruption. Carried into the accumulator when a run resumes, and read
+    /// by the video-size seed (which resumes without beginning an accumulator run).
+    private var resumableCheckpoint: ScanCheckpoint?
+    /// A resume waiting for the catalog rebuild its seed needs (blur and video sizes both
+    /// require fresh records to reconcile against).
+    private var pendingResume: ScanCheckpoint?
+    /// Monotonic run sequence for checkpoints — seeded past the restored file at bootstrap
+    /// so this session's runs always order after the previous session's writes.
+    private var nextRunSequence = 0
+    /// Sequence of the last video-size checkpoint written this session, for its completion
+    /// clear (kind-aware: never removes another pass's file).
+    private var lastVideoCheckpointSequence: Int?
+    /// True while *this session* interrupted work — gates same-session auto-resume on
+    /// foreground. A relaunch restores the checkpoint but never auto-starts: resume from a
+    /// previous session is always an explicit tap.
+    private var pausedThisSession = false
+    /// The last lifecycle phase reported by the view.
+    private var lifecyclePhase: AppLifecyclePhase = .active
+
     init(
         storageProvider: any StorageProviding = SystemStorageProvider(),
         photoPermission: any PhotoLibraryPermissionServicing = PhotoLibraryPermissionService(),
@@ -172,6 +274,8 @@ final class AppEnvironment {
         deletionService: any PhotoDeleting = PhotoDeletionService(),
         contactMutationService: any ContactMutating = ContactMutationService(),
         scanSnapshotStore: any ScanSnapshotStore = FileScanSnapshotStore(),
+        checkpointStore: any ScanCheckpointStore = FileScanCheckpointStore(),
+        backgroundTasks: any BackgroundTaskScheduling = SystemBackgroundTaskScheduler(),
         widgetSummaryStore: any WidgetSummaryStoring = FileWidgetSummaryStore(),
         sessionToken: String = UUID().uuidString
     ) {
@@ -186,6 +290,11 @@ final class AppEnvironment {
         self.deletionService = deletionService
         self.contactMutationService = contactMutationService
         self.scanSnapshotStore = scanSnapshotStore
+        self.checkpointStore = checkpointStore
+        let writer = ScanCheckpointWriter(store: checkpointStore)
+        self.checkpointWriter = writer
+        self.checkpointAccumulator = ScanCheckpointAccumulator(writer: writer)
+        self.backgroundTasks = backgroundTasks
         self.widgetSummaryStore = widgetSummaryStore
         self.deletionSessionToken = sessionToken
     }
@@ -231,7 +340,57 @@ final class AppEnvironment {
         // never overwrites what a scan or cleanup wrote since — it only repairs absence
         // (first run, wiped container, corrupt file).
         await writeWidgetSummaryOnLaunch(snapshot: restoredSnapshot)
+        // Restore an interrupted run's checkpoint as a resumable paused state (Phase C).
+        // Nothing starts: no PhotoKit request, no enumeration. A missing, corrupt, or
+        // incompatible checkpoint behaves exactly like a missing snapshot — first run.
+        await restoreInterruptedCheckpoint()
         flowState = .dashboard
+    }
+
+    /// Loads the interrupted-run checkpoint and represents it as the paused state the UI
+    /// shows. Best-effort by design: an unusable checkpoint is cleared, never crashed on,
+    /// and never resumed.
+    private func restoreInterruptedCheckpoint() async {
+        let store = checkpointStore
+        let checkpoint = await Task.detached(priority: .utility) { store.load() }.value
+        guard let checkpoint else { return }
+        // Future writes from this session must order after the file's run even if the
+        // checkpoint turns out to be unusable below.
+        nextRunSequence = max(nextRunSequence, checkpoint.runSequence + 1)
+        checkpointWriter.adopt(checkpoint)
+        if checkpoint.kind == .similarity, PhotoAnalysisStage(rawValue: checkpoint.stage) == nil {
+            // A similarity checkpoint without a recognizable stage cannot be shown or
+            // resumed honestly — drop it rather than present a dead paused card.
+            let writer = checkpointWriter
+            let sequence = checkpoint.runSequence
+            await Task.detached(priority: .utility) { writer.clear(through: sequence) }.value
+            return
+        }
+        resumableCheckpoint = checkpoint
+        switch checkpoint.kind {
+        case .similarity:
+            let stage = PhotoAnalysisStage(rawValue: checkpoint.stage) ?? .preparing
+            analysisState = .paused(PhotoAnalysisProgress(
+                stage: stage,
+                completedUnits: checkpoint.completedUnits,
+                totalUnits: checkpoint.totalUnits
+            ))
+        case .catalog:
+            catalogState = .paused(CatalogScanProgress(
+                enumeratedCount: checkpoint.completedUnits,
+                totalCount: checkpoint.totalUnits
+            ))
+        case .blur:
+            blurAnalysisState = .paused(BlurAnalysisProgress(
+                completedUnits: checkpoint.completedUnits,
+                totalUnits: checkpoint.totalUnits
+            ))
+        case .videoSizes:
+            // Sizes have no paused surface: the seed is applied the next time measurement
+            // starts (the Videos screen's own flow), and reconciled against the fresh
+            // catalog then.
+            break
+        }
     }
 
     /// Applies a persisted snapshot exactly as a fresh `.completed` write would: results into
@@ -371,7 +530,12 @@ final class AppEnvironment {
 
     /// Builds the metadata catalog. Enumeration runs on a detached producer task; this loop only
     /// consumes ordered events, so the main actor stays responsive while the library is read.
-    func startCatalogBuild() {
+    ///
+    /// `resuming` continues an interrupted build's checkpoint (progress display + run
+    /// identity — enumeration itself restarts, because partial offsets cannot be
+    /// reconstructed without persisting the whole catalog, which checkpoints deliberately
+    /// never do).
+    func startCatalogBuild(resuming checkpoint: ScanCheckpoint? = nil) {
         // One library reader at a time: an analysis run owns its own catalog stage, and a
         // rebuild started underneath an in-flight deletion would complete with pre-mutation
         // data. A sharpness pass snapshots the catalog records it was started with, so a
@@ -380,9 +544,16 @@ final class AppEnvironment {
         guard !analysisState.isRunning else { return }
         guard !blurAnalysisState.isRunning else { return }
         guard !deletionState.isDeleting else { return }
+        // A chained prerequisite (a blur/video resume rebuilding the catalog its seed
+        // reconciles against) owns no checkpoint of its own: it must neither begin one nor
+        // discard the checkpoint it is rebuilding for.
+        let isChainedPrerequisite = pendingResume != nil && checkpoint == nil
         catalogTask?.cancel()
         catalogGeneration += 1
         let generation = catalogGeneration
+        if !isChainedPrerequisite {
+            beginCheckpointRun(kind: .catalog, carrying: checkpoint)
+        }
 
         // A fresh run starts from no applied sample and an unknown denominator, so the
         // first event of each kind applies immediately instead of waiting out the interval.
@@ -418,10 +589,16 @@ final class AppEnvironment {
                     case .progress(let progress):
                         if self.catalogState.isRunning,
                            self.shouldApplyCatalogProgress(
-                               totalCount: progress.totalCount,
-                               isComplete: progress.isComplete
+                                totalCount: progress.totalCount,
+                                isComplete: progress.isComplete
                            ) {
                             self.catalogState = .running(progress)
+                            self.checkpointAccumulator.setProgress(
+                                kind: .catalog,
+                                stage: "catalog",
+                                completed: progress.enumeratedCount,
+                                total: progress.totalCount
+                            )
                             self.scanETAEstimator.record(
                                 stage: "catalog",
                                 completed: progress.enumeratedCount,
@@ -435,27 +612,43 @@ final class AppEnvironment {
                 }
             } catch let error as PhotoLibraryReadError {
                 guard self.isCurrentCatalog(generation) else { return }
-                self.catalogState = .failed(error.catalogFailure)
+                self.finishCatalogAttempt(.failed(error.catalogFailure))
             } catch is CancellationError {
                 guard self.isCurrentCatalog(generation) else { return }
-                self.catalogState = .cancelled
+                self.finishCatalogAttempt(.cancelled)
             } catch let failure as CatalogScanFailure {
                 guard self.isCurrentCatalog(generation) else { return }
-                self.catalogState = failure == .cancelled ? .cancelled : .failed(failure)
+                self.finishCatalogAttempt(failure == .cancelled ? .cancelled : .failed(failure))
             } catch {
                 guard self.isCurrentCatalog(generation) else { return }
-                self.catalogState = .failed(.underlying("Photos access is required to read your library."))
+                self.finishCatalogAttempt(.failed(.underlying("Photos access is required to read your library.")))
             }
         }
+        syncBackgroundTask()
+    }
+
+    /// Terminal transition for a catalog build that did not complete. Releases this run's
+    /// checkpoint (kind-aware — never another pass's file) and drops any chained resume:
+    /// a blur/video resume whose prerequisite failed keeps its own interrupted checkpoint
+    /// (still shown paused, resumable by an explicit tap) but does not retry itself.
+    private func finishCatalogAttempt(_ state: CatalogScanState) {
+        catalogState = state
+        pendingResume = nil
+        finishCheckpointRun(kind: .catalog)
+        syncBackgroundTask()
     }
 
     func cancelCatalogBuild() {
+        // An explicit cancel abandons resumable work too: state and file stay consistent
+        // (nothing paused, nothing to resume).
+        discardInterruptedCheckpoint()
         catalogTask?.cancel()
         catalogTask = nil
         catalogGeneration += 1
         if catalogState.isRunning {
             catalogState = .cancelled
         }
+        syncBackgroundTask()
     }
 
     private func isCurrentCatalog(_ generation: Int) -> Bool {
@@ -472,7 +665,13 @@ final class AppEnvironment {
     /// running: a standalone build is cancelled first, because two concurrent reads of the same
     /// library would only double the work). Starting a new analysis also invalidates any
     /// prepared deletion review: plans are bound to the dataset they were built from.
-    func startSimilarityAnalysis() {
+    ///
+    /// `resuming` carries an interrupted run's checkpoint: its evidence seeds the cheap
+    /// pass (already-hashed and already-keyed assets cost no request) and its progress
+    /// display survives the interruption. Enumeration (Stage A) still restarts — catalog
+    /// offsets cannot be reconstructed without persisting the whole catalog, which
+    /// checkpoints deliberately never do.
+    func startSimilarityAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !analysisState.isRunning else { return }
         // Stage A below rebuilds the catalog, and a sharpness pass owns a snapshot of the
         // records it was started with — a rebuild landing mid-run would hand its results a
@@ -517,6 +716,14 @@ final class AppEnvironment {
         analysisState = .running(
             PhotoAnalysisProgress(stage: .preparing, completedUnits: 0, totalUnits: 0)
         )
+        // Claim the single checkpoint slot: a resumed run adopts the carried payload, a
+        // fresh run discards whatever interrupted state existed before it (design: an
+        // explicit new run supersedes resumable work).
+        let runSequence = beginCheckpointRun(kind: .similarity, carrying: checkpoint)
+        let accumulator = checkpointAccumulator
+        let checkpointSink: (@Sendable (CheckpointEvidence) -> Void)? = { evidence in
+            accumulator.record(evidence, runSequence: runSequence)
+        }
 
         let builder = PhotoCatalogBuilder()
         #if DEBUG
@@ -531,13 +738,20 @@ final class AppEnvironment {
                 // instead of re-fetching them per stage.
                 thumbnailLoader: thumbnailLoader,
                 stageObserver: SignpostStageObserver(),
-                metrics: AnalysisMetrics()
+                metrics: AnalysisMetrics(),
+                checkpointSink: checkpointSink
             )
         } else {
-            engine = PhotoSimilarityEngine(thumbnailLoader: thumbnailLoader)
+            engine = PhotoSimilarityEngine(
+                thumbnailLoader: thumbnailLoader,
+                checkpointSink: checkpointSink
+            )
         }
         #else
-        let engine = PhotoSimilarityEngine(thumbnailLoader: thumbnailLoader)
+        let engine = PhotoSimilarityEngine(
+            thumbnailLoader: thumbnailLoader,
+            checkpointSink: checkpointSink
+        )
         #endif
 
         analysisTask = Task { [weak self] in
@@ -577,6 +791,14 @@ final class AppEnvironment {
                             total: progress.totalCount,
                             at: ScanETAEstimator.monotonicNow()
                         )
+                        // Tagged `.similarity`: this run owns the checkpoint slot, and its
+                        // stage A is the stage a resume would restore.
+                        self.checkpointAccumulator.setProgress(
+                            kind: .similarity,
+                            stage: PhotoAnalysisStage.preparing.rawValue,
+                            completed: progress.enumeratedCount,
+                            total: progress.totalCount
+                        )
                     case .completed(let result):
                         built = result
                         self.noteCatalogCompleted(result)
@@ -611,10 +833,16 @@ final class AppEnvironment {
             }
             guard self.isCurrentAnalysis(generation) else { return }
 
-            // Stage B — similarity analysis over the catalog.
+            // Stage B — similarity analysis over the catalog, seeded with whatever the
+            // interrupted run already earned (entries whose asset still exists with the
+            // exact recorded modification date; deleted or changed assets recompute).
             var sawCompletion = false
+            let seed = Self.fingerprintSeed(from: checkpoint, records: built.records)
             do {
-                for try await event in engine.makeAnalysisStream(records: built.records) {
+                for try await event in engine.makeAnalysisStream(
+                    records: built.records,
+                    seed: seed
+                ) {
                     guard self.isCurrentAnalysis(generation) else { return }
                     switch event {
                     case .progress(let progress):
@@ -623,6 +851,9 @@ final class AppEnvironment {
                         sawCompletion = true
                         self.selection = PhotoSelectionModel(result: result)
                         self.analysisState = .completed(result)
+                        // The run finished: its checkpoint has served its purpose —
+                        // completion clears (kind-aware, blocking this run's stragglers).
+                        self.finishCheckpointRun(kind: .similarity)
                         let completedAt = await self.persistCompletedScan(result)
                         await self.writeWidgetSummaryAfterScanCompleted(at: completedAt)
                     }
@@ -645,6 +876,7 @@ final class AppEnvironment {
                 )
             }
         }
+        syncBackgroundTask()
     }
 
     /// Cancels the in-flight run. The generation bump makes any late write from the old run a
@@ -656,6 +888,10 @@ final class AppEnvironment {
         if analysisState.isRunning {
             analysisState = .cancelled
         }
+        // An explicit cancel abandons resumable work too: state and file stay consistent
+        // (nothing paused, nothing to resume).
+        discardInterruptedCheckpoint()
+        syncBackgroundTask()
     }
 
     private func isCurrentAnalysis(_ generation: Int) -> Bool {
@@ -676,6 +912,14 @@ final class AppEnvironment {
         lastAppliedStage = progress.stage
         lastAppliedProgressAt = now
         analysisState = .running(progress)
+        // Same cadence as the state write: the checkpoint's saved stage never runs ahead of
+        // or behind what the UI was told, and a pause saves exactly the progress on screen.
+        checkpointAccumulator.setProgress(
+            kind: .similarity,
+            stage: progress.stage.rawValue,
+            completed: progress.completedUnits,
+            total: progress.totalUnits
+        )
         // Sampled at the same coalesced cadence the state is written, with monotonic time —
         // the estimator's own minimum sample interval smooths it further.
         scanETAEstimator.record(
@@ -716,6 +960,15 @@ final class AppEnvironment {
     private func finishAnalysis(_ generation: Int, as state: PhotoAnalysisState) {
         guard isCurrentAnalysis(generation) else { return }
         analysisState = state
+        // A run that did not finish leaves nothing worth resuming from *this* attempt:
+        // cancelled and failed runs release their checkpoint (a paused run never reaches
+        // here — pausing bumped the generation, so this write would be staled anyway).
+        if case .cancelled = state {
+            finishCheckpointRun(kind: .similarity)
+        } else if case .failed = state {
+            finishCheckpointRun(kind: .similarity)
+        }
+        syncBackgroundTask()
     }
 
     private static func analysisFailure(for error: PhotoLibraryReadError) -> PhotoAnalysisFailure {
@@ -740,7 +993,12 @@ final class AppEnvironment {
     /// it also invalidates any prepared deletion review — plans are bound to the dataset
     /// they were built from — and resets the blur selection, so a fresh run always opens
     /// with nothing marked.
-    func startBlurAnalysis() {
+    ///
+    /// `resuming` carries an interrupted pass's checkpoint: already-classified assets are
+    /// tallied without a request (only under the exact thresholds they were classified
+    /// with — a calibration change re-measures everything) and the saved progress display
+    /// continues.
+    func startBlurAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !blurAnalysisState.isRunning else { return }
         // Symmetric admission: the similarity pass owns the analysis machinery while it
         // runs — refused, not queued (an explicit user action; they can retry).
@@ -768,6 +1026,17 @@ final class AppEnvironment {
 
         blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 0, totalUnits: 0))
 
+        // Claim the checkpoint slot for this pass (adopting the carried payload on resume;
+        // discarding superseded interrupted state on a fresh start) and stamp the
+        // calibration the verdicts will be classified under.
+        let runSequence = beginCheckpointRun(kind: .blur, carrying: checkpoint)
+        let configuration = BlurAnalysisConfiguration()
+        checkpointAccumulator.noteBlurThresholds(configuration.thresholds)
+        let accumulator = checkpointAccumulator
+        let checkpointSink: (@Sendable (CheckpointEvidence) -> Void)? = { evidence in
+            accumulator.record(evidence, runSequence: runSequence)
+        }
+
         let records = catalog.records
         #if DEBUG
         // Same validation hook as the similarity pass: `NETTO_SCAN_METRICS=1` injects the
@@ -776,29 +1045,64 @@ final class AppEnvironment {
         let engine: BlurAnalysisEngine
         if ProcessInfo.processInfo.environment["NETTO_SCAN_METRICS"] == "1" {
             engine = BlurAnalysisEngine(
+                configuration: configuration,
                 thumbnailLoader: thumbnailLoader,
                 metrics: BlurAnalysisMetrics(),
-                now: blurAnalysisClock
+                now: blurAnalysisClock,
+                checkpointSink: checkpointSink
             )
         } else {
-            engine = BlurAnalysisEngine(thumbnailLoader: thumbnailLoader, now: blurAnalysisClock)
+            engine = BlurAnalysisEngine(
+                configuration: configuration,
+                thumbnailLoader: thumbnailLoader,
+                now: blurAnalysisClock,
+                checkpointSink: checkpointSink
+            )
         }
         #else
-        let engine = BlurAnalysisEngine(thumbnailLoader: thumbnailLoader, now: blurAnalysisClock)
+        let engine = BlurAnalysisEngine(
+            configuration: configuration,
+            thumbnailLoader: thumbnailLoader,
+            now: blurAnalysisClock,
+            checkpointSink: checkpointSink
+        )
         #endif
+
+        // Verdicts the interrupted run already earned, reconciled against the fresh
+        // catalog (deleted or re-exported assets re-measure) — nil when the calibration
+        // differs, which the engine also refuses, so a mismatch is always a full pass.
+        let seed = Self.blurSeed(
+            from: checkpoint,
+            records: records,
+            thresholds: configuration.thresholds
+        )
 
         blurAnalysisTask = Task { [weak self] in
             guard let self else { return }
             var sawCompletion = false
             do {
-                for try await event in engine.makeAnalysisStream(records: records) {
+                for try await event in engine.makeAnalysisStream(
+                    records: records,
+                    seed: seed
+                ) {
                     guard self.isCurrentBlurAnalysis(generation) else { return }
                     switch event {
                     case .progress(let progress):
                         self.blurAnalysisState = .running(progress)
+                        // Single-stage pass: counts only, tagged `.blur` so a chained
+                        // catalog rebuild can never rewrite this run's saved progress.
+                        self.checkpointAccumulator.setProgress(
+                            kind: .blur,
+                            stage: "",
+                            completed: progress.completedUnits,
+                            total: progress.totalUnits
+                        )
                     case .completed(let result):
                         sawCompletion = true
                         self.blurAnalysisState = .completed(result)
+                        // Finished: its checkpoint is released (kind-aware — it could
+                        // never have held another pass's file, and now it holds nothing).
+                        self.finishCheckpointRun(kind: .blur)
                         // Admission only: candidates become markable, nothing is marked.
                         self.synchronizeBlurDataset()
                     }
@@ -821,6 +1125,7 @@ final class AppEnvironment {
                 )
             }
         }
+        syncBackgroundTask()
     }
 
     /// Cancels the in-flight sharpness pass. The generation bump makes any late write
@@ -832,6 +1137,9 @@ final class AppEnvironment {
         if blurAnalysisState.isRunning {
             blurAnalysisState = .cancelled
         }
+        // An explicit cancel abandons resumable work too (same rule as the similarity pass).
+        discardInterruptedCheckpoint()
+        syncBackgroundTask()
     }
 
     private func isCurrentBlurAnalysis(_ generation: Int) -> Bool {
@@ -841,6 +1149,15 @@ final class AppEnvironment {
     private func finishBlurAnalysis(_ generation: Int, as state: BlurAnalysisState) {
         guard isCurrentBlurAnalysis(generation) else { return }
         blurAnalysisState = state
+        // Cancelled and failed passes release their checkpoint exactly like the
+        // similarity pass does; a paused pass never reaches here (its generation was
+        // bumped at pause, so this write would be staled).
+        if case .cancelled = state {
+            finishCheckpointRun(kind: .blur)
+        } else if case .failed = state {
+            finishCheckpointRun(kind: .blur)
+        }
+        syncBackgroundTask()
     }
 
     /// Same, for the blur selection — only stales a plan built from that source.
@@ -873,7 +1190,9 @@ final class AppEnvironment {
         switch blurAnalysisState {
         case .completed(let result):
             candidates = result.candidateIDs
-        case .notStarted, .running, .cancelled, .failed:
+        case .notStarted, .running, .paused, .cancelled, .failed:
+            // Paused has no result yet either — the pass saved its progress, not a
+            // dataset, and resume (or an explicit cancel) reconciles again afterwards.
             candidates = []
         }
         // A candidate whose record left the catalog (rebuild, deletion) is no longer part
@@ -885,8 +1204,10 @@ final class AppEnvironment {
             catalogImageIDs = Set(result.records.lazy.filter(\.isImage).map(\.localIdentifier))
         case .notStarted, .cancelled, .failed:
             catalogImageIDs = []
-        case .running:
-            catalogImageIDs = [] // A rebuild is in flight; reconcile again when it completes.
+        case .running, .paused:
+            // A rebuild is in flight — or was interrupted with no completed catalog to
+            // read from; reconcile again when it completes, resumes, or is cancelled.
+            catalogImageIDs = []
         }
         let effective = candidates.intersection(catalogImageIDs)
 
@@ -1377,11 +1698,26 @@ final class AppEnvironment {
     /// a rebuilt dataset can never leave a selection pointing at vanished assets.
     private func noteCatalogCompleted(_ result: CatalogScanResult, standalone: Bool = false) {
         catalogState = .completed(result)
+        if standalone {
+            // The catalog's own run is finished — release its checkpoint slot before any
+            // chained resume claims the file (kind-aware: an analysis Stage A completion
+            // passes `standalone: false` and never touches the `.similarity` file).
+            finishCheckpointRun(kind: .catalog)
+        }
         synchronizeScreenshotDataset()
         synchronizeVideoDataset()
         synchronizeBlurDataset()
         if standalone {
+            // Lift the chained resume out *before* invalidation: the invalidation below
+            // discards interrupted state (its own view of `pendingResume` must not race
+            // this dispatch), then the resumed pass claims a fresh slot for the same
+            // payload.
+            let pending = pendingResume
+            pendingResume = nil
             invalidateAnalysisAfterRebuild()
+            if let pending {
+                dispatchInterruptedResume(pending)
+            }
         }
     }
 
@@ -1391,6 +1727,11 @@ final class AppEnvironment {
     /// (screenshots and videos reconcile themselves above), so the invalidation is explicit
     /// here. Cannot run during an analysis, a sharpness pass (a standalone build is refused
     /// while either is running) or a deletion (same).
+    ///
+    /// The interrupted-run checkpoint is discarded with them — evidence gathered against the
+    /// superseded catalog is stale by definition. A chained resume is an exception: the
+    /// caller lifted its checkpoint out before calling, so it survives below and is
+    /// re-claimed afterwards.
     private func invalidateAnalysisAfterRebuild() {
         guard !analysisState.isRunning, !deletionState.isDeleting else { return }
         let blurIsClean: Bool = {
@@ -1412,6 +1753,7 @@ final class AppEnvironment {
         blurAnalysisTask = nil
         blurSelection = PhotoSelectionModel()
         blurAnalysisState = .notStarted
+        discardInterruptedCheckpoint()
     }
 
     /// Reconciles the screenshot selection with the current catalog and stales any screenshot
@@ -1423,8 +1765,10 @@ final class AppEnvironment {
             screenshotSelection.reconcile(with: ScreenshotDataset.identifiers(in: result))
         case .notStarted, .cancelled, .failed:
             screenshotSelection.reset()
-        case .running:
-            break // A rebuild is in flight; reconcile again when it completes.
+        case .running, .paused:
+            // A rebuild is in flight (or was interrupted); reconcile again when it
+            // completes, resumes, or is cancelled — never against partial enumeration.
+            break
         }
 
         guard planSource == .screenshots else { return }
@@ -1458,8 +1802,10 @@ final class AppEnvironment {
             videoSelection.reset()
             cancelVideoSizeResolution()
             videoSizeResolution = .idle
-        case .running:
-            break // A rebuild is in flight; reconcile again when it completes.
+        case .running, .paused:
+            // A rebuild is in flight (or was interrupted): nothing to reconcile against
+            // until it completes, resumes, or is cancelled.
+            break
         }
 
         guard planSource == .videos else { return }
@@ -1568,6 +1914,25 @@ final class AppEnvironment {
         } else {
             bytes = [:] // another dataset's bytes are never mixed into this one
         }
+        // Sizes an interrupted run already measured, validated against this catalog: only
+        // an asset that still exists with the exact recorded modification date
+        // contributes; deleted or re-exported videos are measured again.
+        if let checkpoint = resumableCheckpoint,
+           checkpoint.kind == .videoSizes,
+           !checkpoint.videoSizes.isEmpty {
+            var index: [String: PhotoAssetRecord] = [:]
+            index.reserveCapacity(videos.count)
+            for record in videos {
+                index[record.localIdentifier] = record
+            }
+            for entry in checkpoint.videoSizes {
+                guard bytes[entry.assetID] == nil,
+                      let record = index[entry.assetID],
+                      record.modificationDate == entry.modified
+                else { continue }
+                bytes[entry.assetID] = entry.bytes
+            }
+        }
         let total = videos.count
         let targets = videos.lazy.map(\.localIdentifier).filter { bytes[$0] == nil }
 
@@ -1579,6 +1944,9 @@ final class AppEnvironment {
                     total: total
                 )
             )
+            // The dataset is fully measured: its checkpoint has served its purpose.
+            clearVideoCheckpointIfOwned()
+            syncBackgroundTask()
             return
         }
 
@@ -1623,7 +1991,11 @@ final class AppEnvironment {
                 )
             )
             self.videoSizeTask = nil
+            // Fully measured: release the checkpoint that carried the run this far.
+            self.clearVideoCheckpointIfOwned()
+            self.syncBackgroundTask()
         }
+        syncBackgroundTask()
     }
 
     /// Cancels an in-flight measurement. Everything measured so far is kept as a settled
@@ -1636,6 +2008,360 @@ final class AppEnvironment {
         if case .measuring(let measurement) = videoSizeResolution {
             videoSizeResolution = .settled(measurement)
         }
+    }
+
+    // MARK: - Interrupted runs: checkpoints, pause, resume (Phase C)
+
+    /// Claims the single checkpoint slot for a run and returns the sequence its sink must
+    /// present. `carrying` resumes an interrupted run's payload; `nil` starts empty — and
+    /// first discards whatever interrupted state existed, because an explicit new run
+    /// supersedes resumable work (the Resume button is what continues it, never a fresh tap).
+    @discardableResult
+    private func beginCheckpointRun(
+        kind: ScanCheckpoint.Kind,
+        carrying checkpoint: ScanCheckpoint?
+    ) -> Int {
+        if checkpoint == nil {
+            discardInterruptedCheckpoint()
+        }
+        let sequence = nextRunSequence
+        nextRunSequence += 1
+        checkpointAccumulator.begin(kind: kind, runSequence: sequence, carrying: checkpoint)
+        // The accumulator owns the payload from here (video checkpoints are the exception:
+        // they never begin a run and keep `resumableCheckpoint` as their seed).
+        resumableCheckpoint = nil
+        return sequence
+    }
+
+    /// Abandons interrupted work entirely: file gone, no straggler can resurrect it, and
+    /// every paused surface returns to "not started". Used by explicit cancels, fresh runs,
+    /// and supersession — never by completion (which is kind-aware, via `finishCheckpointRun`).
+    private func discardInterruptedCheckpoint() {
+        checkpointAccumulator.endRun()
+        // Blocks every write at or below the last known run, so a late flush from the
+        // discarded run can never bring the file back.
+        checkpointWriter.clear(through: nextRunSequence - 1)
+        resumableCheckpoint = nil
+        pendingResume = nil
+        lastVideoCheckpointSequence = nil
+        if case .paused = analysisState { analysisState = .notStarted }
+        if case .paused = catalogState { catalogState = .notStarted }
+        if case .paused = blurAnalysisState { blurAnalysisState = .notStarted }
+    }
+
+    /// Completion (or non-pause cancellation) release for the pass that owns the
+    /// accumulator right now. A no-op when the slot belongs to another pass or to nobody —
+    /// that file is not this run's to clear, and blocking through a foreign sequence would
+    /// freeze the file's owner out of its own writes.
+    private func finishCheckpointRun(kind: ScanCheckpoint.Kind) {
+        guard checkpointAccumulator.activeKind == kind else { return }
+        let sequence = checkpointAccumulator.currentRunSequence
+        checkpointAccumulator.endRun()
+        checkpointWriter.clear(owning: kind, through: sequence)
+    }
+
+    /// Releases the video-size checkpoint once its dataset is fully measured. Only a video
+    /// file is ever removed (kind-aware), and only writes at or below its own sequence are
+    /// blocked — a heavier pass's file, if one exists, is untouched.
+    private func clearVideoCheckpointIfOwned() {
+        guard let checkpoint = resumableCheckpoint, checkpoint.kind == .videoSizes else { return }
+        let sequence = lastVideoCheckpointSequence ?? checkpoint.runSequence
+        lastVideoCheckpointSequence = nil
+        resumableCheckpoint = nil
+        checkpointWriter.clear(owning: .videoSizes, through: sequence)
+    }
+
+    /// Persists an in-flight video measurement as resumable state — only while a
+    /// measurement is running, only when the file slot holds no heavier pass's resume
+    /// information (a paused similarity/blur/catalog checkpoint always wins the single
+    /// slot), and only with bytes this catalog actually measured. One synchronous bounded
+    /// write at the pause transition: determinism matters more than a few milliseconds
+    /// there, and this is never a per-asset or per-batch write.
+    private func writeVideoSizeCheckpoint() {
+        guard case .measuring(let measurement) = videoSizeResolution else { return }
+        guard checkpointWriter.allows(.videoSizes) else { return }
+        guard case .completed(let catalog) = catalogState else { return }
+        let videos = VideoDataset.records(in: catalog)
+        guard !videos.isEmpty, !measurement.bytes.isEmpty else { return }
+        var index: [String: PhotoAssetRecord] = [:]
+        index.reserveCapacity(videos.count)
+        for record in videos {
+            if index[record.localIdentifier] == nil {
+                index[record.localIdentifier] = record
+            }
+        }
+        let entries = measurement.bytes.compactMap { assetID, bytes -> VideoSizeEntry? in
+            guard let record = index[assetID] else { return nil }
+            return VideoSizeEntry(assetID: assetID, modified: record.modificationDate, bytes: bytes)
+        }
+        guard !entries.isEmpty else { return }
+        let sequence = nextRunSequence
+        nextRunSequence += 1
+        let checkpoint = ScanCheckpoint(
+            runSequence: sequence,
+            kind: .videoSizes,
+            startedAt: Date(),
+            updatedAt: Date(),
+            stage: "",
+            completedUnits: entries.count,
+            totalUnits: measurement.total,
+            videoSizes: entries.sorted { $0.assetID < $1.assetID }
+        )
+        lastVideoCheckpointSequence = sequence
+        resumableCheckpoint = checkpoint
+        checkpointWriter.write(checkpoint)
+    }
+
+    /// Freezes every in-flight pass at an interruption (background expiration), in the one
+    /// order that keeps state and file consistent: stop each running pass and tag its
+    /// progress, write the accumulated checkpoint while it is still the newest state, then
+    /// let a running video measurement claim the slot (which it cannot do while a paused
+    /// heavy pass's file exists). Fully synchronous — this is the last deterministic moment.
+    private func pauseAllActiveWork() {
+        var interruptedWork = false
+        if case .running(let progress) = analysisState {
+            interruptedWork = true
+            analysisGeneration += 1
+            analysisTask?.cancel()
+            analysisTask = nil
+            // The progress on screen is the progress saved — no rounding to a stale tick.
+            analysisState = .paused(progress)
+            checkpointAccumulator.setProgress(
+                kind: .similarity,
+                stage: progress.stage.rawValue,
+                completed: progress.completedUnits,
+                total: progress.totalUnits
+            )
+        }
+        if case .running(let progress) = catalogState {
+            interruptedWork = true
+            catalogGeneration += 1
+            catalogTask?.cancel()
+            catalogTask = nil
+            catalogState = .paused(progress)
+            checkpointAccumulator.setProgress(
+                kind: .catalog,
+                stage: "catalog",
+                completed: progress.enumeratedCount,
+                total: progress.totalCount
+            )
+        }
+        if case .running(let progress) = blurAnalysisState {
+            interruptedWork = true
+            blurAnalysisGeneration += 1
+            blurAnalysisTask?.cancel()
+            blurAnalysisTask = nil
+            blurAnalysisState = .paused(progress)
+            checkpointAccumulator.setProgress(
+                kind: .blur,
+                stage: "",
+                completed: progress.completedUnits,
+                total: progress.totalUnits
+            )
+        }
+        // After this call the file is exactly what resume will start from.
+        checkpointAccumulator.flushNowSync()
+        if let paused = checkpointAccumulator.snapshot() {
+            resumableCheckpoint = paused
+        }
+        checkpointAccumulator.endRun()
+        if case .measuring = videoSizeResolution {
+            interruptedWork = true
+            // Checkpoint first (still `.measuring`, so its bytes are complete), then stop:
+            // at most one batch of sizes is lost if the process dies here.
+            writeVideoSizeCheckpoint()
+            cancelVideoSizeResolution()
+        }
+        // Estimator anchors from the live run would render as a live countdown against a
+        // paused card — reset so resume re-anchors from actual resumed samples.
+        scanETAEstimator.reset()
+        // Only an interruption *this session* auto-resumes on foreground. A checkpoint
+        // restored at launch keeps waiting for an explicit tap.
+        if interruptedWork {
+            pausedThisSession = true
+        }
+        syncBackgroundTask()
+    }
+
+    /// Whether anything is still computing. The background task is held only for this —
+    /// never as a promise of unlimited time, and never while foregrounded.
+    private var hasActiveWork: Bool {
+        analysisState.isRunning
+            || catalogState.isRunning
+            || blurAnalysisState.isRunning
+            || videoSizeResolution.isMeasuring
+    }
+
+    /// Keeps the OS background task aligned with reality: held only while backgrounded
+    /// with work in flight, released the moment either ends (completion, cancel, pause,
+    /// foreground). Expiration pauses the runs instead of racing the remaining time.
+    private func syncBackgroundTask() {
+        if lifecyclePhase == .background && hasActiveWork {
+            guard !backgroundTasks.isHolding else { return }
+            backgroundTasks.begin { [weak self] in
+                guard let self else { return }
+                self.handleBackgroundExpiration()
+            }
+        } else if backgroundTasks.isHolding {
+            backgroundTasks.end()
+        }
+    }
+
+    /// Scene-phase entry point. `.active` re-reconciles permissions and storage, releases
+    /// any background task, and auto-resumes what *this session* interrupted. `.inactive`
+    /// only flushes — the app may come straight back, and iOS allows a moment of work.
+    /// `.background` arms the interruption machinery. Nothing here assumes `background`
+    /// means imminent death, or that a background task buys uninterrupted execution.
+    func handleLifecycle(_ phase: AppLifecyclePhase) {
+        lifecyclePhase = phase
+        switch phase {
+        case .active:
+            // Returning from Settings (or the app being foregrounded) is the only moment a
+            // permission granted elsewhere becomes visible here — without this, both
+            // permission screens read the boot-time status forever.
+            refreshPermissions()
+            Task { await refreshStorage() }
+            syncBackgroundTask()
+            if pausedThisSession {
+                resumeInterruptedWork()
+            }
+        case .inactive:
+            checkpointAccumulator.flushNowSync()
+        case .background:
+            enterBackground()
+        }
+    }
+
+    /// The app left the foreground: insurance-flush whatever the batcher has not written
+    /// yet (one bounded write, not per asset), then hold a background task only if there
+    /// is work to protect. Video measurement keeps running under the task's budget.
+    private func enterBackground() {
+        checkpointAccumulator.flushNowSync()
+        syncBackgroundTask()
+    }
+
+    /// The system is about to reclaim the background task. Pause synchronously — this is
+    /// the last deterministic moment — then let `syncBackgroundTask` release it.
+    private func handleBackgroundExpiration() {
+        pauseAllActiveWork()
+        syncBackgroundTask()
+    }
+
+    /// Resumes the interrupted run, if the library still allows it. Safe to call
+    /// repeatedly: no-ops while work is running, during deletion, without Photos access,
+    /// or with nothing to resume.
+    func resumeInterruptedWork() {
+        guard !analysisState.isRunning,
+              !catalogState.isRunning,
+              !blurAnalysisState.isRunning
+        else { return }
+        guard !deletionState.isDeleting else { return }
+        guard photoPermissionState.isUsable else { return }
+        guard let checkpoint = resumableCheckpoint else {
+            pausedThisSession = false
+            return
+        }
+        pausedThisSession = false
+        dispatchInterruptedResume(checkpoint)
+    }
+
+    /// Routes a checkpoint to the pass that owns it — chaining a catalog rebuild first when
+    /// the seed needs fresh records to reconcile against (blur and video sizes both do;
+    /// similarity rebuilds its own catalog as Stage A regardless). The chained rebuild owns
+    /// no checkpoint of its own: it must not begin one, and must not discard the one it is
+    /// rebuilding for (`startCatalogBuild` keys that off `pendingResume`).
+    private func dispatchInterruptedResume(_ checkpoint: ScanCheckpoint) {
+        switch checkpoint.kind {
+        case .similarity:
+            startSimilarityAnalysis(resuming: checkpoint)
+        case .catalog:
+            startCatalogBuild(resuming: checkpoint)
+        case .blur:
+            if case .completed = catalogState {
+                startBlurAnalysis(resuming: checkpoint)
+            } else {
+                pendingResume = checkpoint
+                startCatalogBuild()
+            }
+        case .videoSizes:
+            if case .completed = catalogState {
+                resumableCheckpoint = checkpoint
+                resumeVideoSizeMeasurement()
+            } else {
+                pendingResume = checkpoint
+                startCatalogBuild()
+            }
+        }
+    }
+
+    /// Evidence from an interrupted similarity run that survives reconciliation against the
+    /// fresh catalog: an entry is trusted only when the asset still exists with the exact
+    /// modification date it was recorded under. Deleted or changed assets are recomputed,
+    /// and anything the checkpoint never saw is simply new work — an asset that was merely
+    /// unavailable during the interrupted run gets its one bounded retry here (a later
+    /// resume retries it again; nothing is ever marked analyzed without evidence).
+    private static func fingerprintSeed(
+        from checkpoint: ScanCheckpoint?,
+        records: [PhotoAssetRecord]
+    ) -> FingerprintSeed {
+        guard let checkpoint, checkpoint.kind == .similarity else { return .empty }
+        var index: [String: PhotoAssetRecord] = [:]
+        index.reserveCapacity(records.count)
+        for record in records {
+            if index[record.localIdentifier] == nil {
+                index[record.localIdentifier] = record
+            }
+        }
+        var seed = FingerprintSeed()
+        for entry in checkpoint.perceptualHashes {
+            guard let record = index[entry.assetID],
+                  record.modificationDate == entry.modified
+            else { continue }
+            seed.perceptualHashes[entry.assetID] = PerceptualHash(bits: entry.bits)
+        }
+        for entry in checkpoint.byteKeys {
+            guard let record = index[entry.assetID],
+                  record.modificationDate == entry.modified
+            else { continue }
+            seed.byteKeys[entry.assetID] = ContentByteKey(
+                imageBytes: entry.imageBytes,
+                videoBytes: entry.videoBytes
+            )
+        }
+        return seed
+    }
+
+    /// Verdicts from an interrupted sharpness pass that survive reconciliation: the asset
+    /// must still exist with the recorded modification date, and the calibration must be
+    /// the one this run will classify with — otherwise the seed is refused outright (the
+    /// engine refuses it too; both checks exist so no path can mix calibrations). A
+    /// candidate without its score cannot explain itself in review, so it re-measures.
+    private static func blurSeed(
+        from checkpoint: ScanCheckpoint?,
+        records: [PhotoAssetRecord],
+        thresholds: BlurThresholds
+    ) -> BlurAnalysisSeed? {
+        guard let checkpoint, checkpoint.kind == .blur else { return nil }
+        guard checkpoint.blurThresholds == thresholds else { return nil }
+        var index: [String: PhotoAssetRecord] = [:]
+        index.reserveCapacity(records.count)
+        for record in records {
+            if index[record.localIdentifier] == nil {
+                index[record.localIdentifier] = record
+            }
+        }
+        var seed = BlurAnalysisSeed(thresholds: thresholds)
+        for entry in checkpoint.blurVerdicts {
+            guard let record = index[entry.assetID],
+                  record.modificationDate == entry.modified
+            else { continue }
+            if entry.verdict.isCandidate, entry.laplacianVariance == nil { continue }
+            seed.verdicts[entry.assetID] = BlurSeedVerdict(
+                verdict: entry.verdict,
+                laplacianVariance: entry.laplacianVariance
+            )
+        }
+        return seed
     }
 
     /// Single gate for every deletion state change: legal transitions are applied, illegal ones
@@ -1669,9 +2395,12 @@ extension AppEnvironment {
         #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
         // UI tests wipe the persisted scan so every launch starts from the first-run state —
-        // the startup condition every existing dashboard UI test was written against.
+        // the startup condition every existing dashboard UI test was written against. The
+        // interrupted-run checkpoint goes with it: a leaked paused card would break the same
+        // tests on their second launch.
         if arguments.contains("-resetScanSnapshot") {
             FileScanSnapshotStore().clear()
+            FileScanCheckpointStore().clear()
         }
         if arguments.contains("-fixtureLibrary") {
             return AppEnvironment(
@@ -1729,12 +2458,27 @@ struct RootView: View {
             env.handleDeepLink(url)
         }
         .onChange(of: scenePhase) { _, newPhase in
-            // Returning from Settings (or the app being foregrounded) is the only moment a
-            // permission granted elsewhere becomes visible here — without this, both
-            // permission screens read the boot-time status forever.
-            guard newPhase == .active else { return }
-            env.refreshPermissions()
-            Task { await env.refreshStorage() }
+            // The environment owns lifecycle policy: permission reconciliation on return,
+            // checkpoint flushes on inactive, interruption handling on background, and
+            // same-session resume when active again (see `handleLifecycle`).
+            env.handleLifecycle(AppLifecyclePhase(scenePhase: newPhase))
+        }
+    }
+}
+
+extension AppLifecyclePhase {
+    init(scenePhase: ScenePhase) {
+        switch scenePhase {
+        case .active:
+            self = .active
+        case .inactive:
+            self = .inactive
+        case .background:
+            self = .background
+        @unknown default:
+            // A future phase behaves like the most conservative one we know: stop assuming
+            // foreground, flush, and treat it as background for task purposes.
+            self = .background
         }
     }
 }

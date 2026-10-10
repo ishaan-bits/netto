@@ -21,6 +21,9 @@ enum PotentiallyBlurryPhase: Sendable, Equatable {
     case notStarted
     /// The sharpness pass is running.
     case analyzing(BlurAnalysisProgress)
+    /// An interrupted run (the sharpness pass, or the catalog build it chains through)
+    /// saved its progress and can be continued — shown as paused, never as a live run.
+    case paused(stage: String, fraction: Double?)
     /// The last sharpness pass was cancelled.
     case cancelled
     /// The last sharpness pass failed; carries the user-facing message.
@@ -79,9 +82,25 @@ enum PotentiallyBlurryPresentation {
             break
         }
 
+        // A paused pass wins over the catalog's resting states: after a relaunch the
+        // catalog reads `.notStarted` until its chained rebuild runs, but the saved pass
+        // is what this screen must offer to continue. (Both states at once is impossible —
+        // one checkpoint file, and any fresh catalog start discards a paused pass.)
+        if case .paused(let progress) = blur {
+            return .paused(
+                stage: analyzingMessage(progress),
+                fraction: progress.fraction
+            )
+        }
+
         switch catalog {
         case .running(let progress):
             return .buildingCatalog(progress)
+        case .paused(let progress):
+            return .paused(
+                stage: DashboardPresentation.catalogStage(progress),
+                fraction: DashboardPresentation.catalogFraction(progress)
+            )
         case .failed(let failure):
             return .catalogFailed(failure.userMessage)
         case .notStarted, .cancelled:
@@ -93,6 +112,13 @@ enum PotentiallyBlurryPresentation {
                 return .notStarted
             case .running(let progress):
                 return .analyzing(progress)
+            case .paused(let progress):
+                // Unreachable above (returned before this switch), but honest if the
+                // ordering ever changes: paused is paused, never notStarted.
+                return .paused(
+                    stage: analyzingMessage(progress),
+                    fraction: progress.fraction
+                )
             case .cancelled:
                 return .cancelled
             case .failed(let failure):
@@ -144,6 +170,8 @@ enum PotentiallyBlurryPresentation {
             return "Not analyzed yet"
         case .analyzing(let progress):
             return analyzingMessage(progress)
+        case .paused:
+            return "Scan paused"
         case .cancelled:
             return "Last run cancelled"
         case .failed(let message):

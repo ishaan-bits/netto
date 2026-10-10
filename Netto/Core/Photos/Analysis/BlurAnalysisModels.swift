@@ -127,6 +127,8 @@ enum BlurAnalysisFailure: Error, Sendable, Equatable {
 enum BlurAnalysisState: Sendable, Equatable {
     case notStarted
     case running(BlurAnalysisProgress)
+    /// Interrupted with a checkpoint on disk — resumable, never presented as still running.
+    case paused(BlurAnalysisProgress)
     case completed(BlurAnalysisResult)
     case cancelled
     case failed(BlurAnalysisFailure)
@@ -134,6 +136,12 @@ enum BlurAnalysisState: Sendable, Equatable {
     var isRunning: Bool {
         if case .running = self { return true }
         return false
+    }
+
+    /// The progress this state is showing, for a paused state's saved snapshot.
+    var pausedProgress: BlurAnalysisProgress? {
+        if case .paused(let progress) = self { return progress }
+        return nil
     }
 
     var result: BlurAnalysisResult? {

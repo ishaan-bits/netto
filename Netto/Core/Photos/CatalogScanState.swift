@@ -148,6 +148,8 @@ struct CatalogScanResult: Sendable, Equatable {
 enum CatalogScanState: Sendable, Equatable {
     case notStarted
     case running(CatalogScanProgress)
+    /// Interrupted with a checkpoint on disk — resumable, never presented as still running.
+    case paused(CatalogScanProgress)
     case completed(CatalogScanResult)
     case cancelled
     case failed(CatalogScanFailure)
@@ -155,6 +157,12 @@ enum CatalogScanState: Sendable, Equatable {
     var isRunning: Bool {
         if case .running = self { return true }
         return false
+    }
+
+    /// The progress this state is showing, for a paused state's saved snapshot.
+    var pausedProgress: CatalogScanProgress? {
+        if case .paused(let progress) = self { return progress }
+        return nil
     }
 }
 

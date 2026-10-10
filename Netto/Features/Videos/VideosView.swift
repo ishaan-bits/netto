@@ -35,6 +35,7 @@ struct VideosView: View {
         case .failed: return "failed"
         case .empty: return "empty"
         case .measuringVideos: return "measuringVideos"
+        case .paused: return "paused"
         case .results: return "results"
         }
     }
@@ -159,6 +160,18 @@ struct VideosView: View {
                 fraction: total > 0 ? Double(measured) / Double(total) : nil,
                 cancel: { env.cancelVideoSizeResolution() }
             )
+
+        case .paused(let stage):
+            // A run feeding this screen was interrupted and saved its checkpoint; Resume
+            // continues it from where it stopped.
+            PhaseMessage(
+                systemImage: "pause.circle",
+                title: "Scan paused",
+                message: "\(stage) Nothing was changed — resume to continue where it stopped.",
+                buttonTitle: "Resume"
+            ) {
+                env.resumeInterruptedWork()
+            }
 
         case .results(let records):
             resultsContent(records)

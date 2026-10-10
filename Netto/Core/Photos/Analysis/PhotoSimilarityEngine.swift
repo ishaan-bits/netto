@@ -67,6 +67,17 @@ struct PhotoAnalysisConfiguration: Sendable, Equatable {
 /// - **Honest about gaps.** Every asset ends in exactly one bucket: analyzed (evidence
 ///   produced), unavailable (a request failed, with a reason), or skipped (no candidate partner
 ///   could exist — reported as skipped, never as failed and never as analyzed).
+/// Evidence an interrupted similarity run already earned, for resume: perceptual hashes
+/// and content-length keys keyed by asset identifier. The caller reconciles entries
+/// against the *fresh* catalog first (same identifier, unchanged modification date), so
+/// a deleted or re-exported asset can never be satisfied from a stale seed.
+struct FingerprintSeed: Sendable, Equatable {
+    var perceptualHashes: [String: PerceptualHash] = [:]
+    var byteKeys: [String: ContentByteKey] = [:]
+
+    static let empty = FingerprintSeed()
+}
+
 struct PhotoSimilarityEngine: Sendable {
     let configuration: PhotoAnalysisConfiguration
     let fingerprinter: any ContentFingerprinting
@@ -76,6 +87,10 @@ struct PhotoSimilarityEngine: Sendable {
     /// Device-validation hooks; `nil` (the default) records nothing. Tests inject one and read
     /// `snapshot()` — see `AnalysisMetrics`.
     let metrics: AnalysisMetrics?
+    /// Reports cheap evidence the moment it is computed, so an interruption can checkpoint
+    /// it. `nil` (the default) records nothing. Off the main actor by construction: the
+    /// sink is invoked from engine workers and must stay lock-cheap.
+    let checkpointSink: (@Sendable (CheckpointEvidence) -> Void)?
 
     init(
         configuration: PhotoAnalysisConfiguration = PhotoAnalysisConfiguration(),
@@ -83,7 +98,8 @@ struct PhotoSimilarityEngine: Sendable {
         thumbnailLoader: any PhotoThumbnailLoading = PhotoKitThumbnailLoader(),
         featureExtractor: any PhotoFeatureExtracting = VisionPhotoFeatureExtractor(),
         stageObserver: any PhotoAnalysisStageObserving = NoopStageObserver(),
-        metrics: AnalysisMetrics? = nil
+        metrics: AnalysisMetrics? = nil,
+        checkpointSink: (@Sendable (CheckpointEvidence) -> Void)? = nil
     ) {
         self.configuration = configuration
         self.fingerprinter = fingerprinter
@@ -91,19 +107,29 @@ struct PhotoSimilarityEngine: Sendable {
         self.featureExtractor = featureExtractor
         self.stageObserver = stageObserver
         self.metrics = metrics
+        self.checkpointSink = checkpointSink
     }
 
     /// Primary API. Ordered event stream: every progress update, then `.completed` last on
     /// success. Cancelling the consuming task terminates the stream and cancels the producer,
     /// which then unwinds through its cancellation checks — never a hung continuation.
+    ///
+    /// `seed` carries evidence an interrupted run already earned (validated against the
+    /// fresh catalog by the caller): seeded records cost no thumbnail and no stat — the
+    /// cheap pass computes only what is missing.
     func makeAnalysisStream(
-        records: [PhotoAssetRecord]
+        records: [PhotoAssetRecord],
+        seed: FingerprintSeed = .empty
     ) -> AsyncThrowingStream<PhotoAnalysisEvent, Error> {
         let engine = self
         return AsyncThrowingStream { continuation in
             let producer = Task.detached(priority: .userInitiated) {
                 do {
-                    let result = try await Self.run(engine: engine, records: records) { progress in
+                    let result = try await Self.run(
+                        engine: engine,
+                        records: records,
+                        seed: seed
+                    ) { progress in
                         continuation.yield(.progress(progress))
                     }
                     continuation.yield(.completed(result))
@@ -148,6 +174,7 @@ struct PhotoSimilarityEngine: Sendable {
     private static func run(
         engine: PhotoSimilarityEngine,
         records: [PhotoAssetRecord],
+        seed: FingerprintSeed = .empty,
         report: @escaping @Sendable (PhotoAnalysisProgress) -> Void
     ) async throws -> PhotoAnalysisResult {
         let runStart = DispatchTime.now().uptimeNanoseconds
@@ -230,10 +257,17 @@ struct PhotoSimilarityEngine: Sendable {
                 + multiVideoBuckets.reduce(0) { $0 + $1.records.count }
         )
         for bucket in multiImageBuckets {
-            for record in bucket.records { cheapWork.append(.perceptualHash(record)) }
+            for record in bucket.records {
+                // Seeded (already earned by an interrupted run): no request, no re-hash.
+                guard seed.perceptualHashes[record.localIdentifier] == nil else { continue }
+                cheapWork.append(.perceptualHash(record))
+            }
         }
         for bucket in multiVideoBuckets {
-            for record in bucket.records { cheapWork.append(.videoByteKey(record)) }
+            for record in bucket.records {
+                guard seed.byteKeys[record.localIdentifier] == nil else { continue }
+                cheapWork.append(.videoByteKey(record))
+            }
         }
         let cheapCount = cheapWork.count
 
@@ -244,8 +278,11 @@ struct PhotoSimilarityEngine: Sendable {
         let fingerprintWallStart = DispatchTime.now().uptimeNanoseconds
         try reporter.enter(.fingerprinting, total: cheapCount)
 
-        let perceptualHashes = LockedBox<[String: PerceptualHash]>([:])
-        let byteKeys = LockedBox<[String: ContentByteKey]>([:])
+        // The seed pre-populates both evidence maps: seeded records are already excluded
+        // from `cheapWork` above, and stage 4's gate / phase 2's collision pass read these
+        // maps, so resumed evidence participates exactly as freshly computed evidence.
+        let perceptualHashes = LockedBox<[String: PerceptualHash]>(seed.perceptualHashes)
+        let byteKeys = LockedBox<[String: ContentByteKey]>(seed.byteKeys)
         let fingerprintWidth = max(
             workerWidth,
             thermalPolicy.width(base: config.fingerprintThumbnailConcurrency)
@@ -269,6 +306,11 @@ struct PhotoSimilarityEngine: Sendable {
                     let hash = try PerceptualHasher.hash(of: image)
                     metrics?.increment(.thumbnailsSucceeded)
                     perceptualHashes.write(record.localIdentifier, hash)
+                    engine.checkpointSink?(.perceptualHash(
+                        assetID: record.localIdentifier,
+                        modified: record.modificationDate,
+                        bits: hash.bits
+                    ))
                 } catch is CancellationError {
                     return
                 } catch let failure as PhotoAnalysisFailure where failure == .cancelled {
@@ -298,6 +340,12 @@ struct PhotoSimilarityEngine: Sendable {
                     switch outcome {
                     case .key(let key):
                         byteKeys.write(record.localIdentifier, key)
+                        engine.checkpointSink?(.contentByteKey(
+                            assetID: record.localIdentifier,
+                            modified: record.modificationDate,
+                            imageBytes: key.imageBytes,
+                            videoBytes: key.videoBytes
+                        ))
                     case .unavailable(let reason):
                         // Failures get their own duration bucket: a run whose library is not
                         // local is almost entirely `contentFailed` time, and the report needs

@@ -49,6 +49,23 @@ struct BlurAnalysisConfiguration: Sendable, Equatable {
 ///   metadata reports no dimensions is refused as `.invalidDimensions` without issuing a
 ///   request; a failed or unmeasurable thumbnail is refused with the mapped reason.
 ///   Nothing is ever silently dropped or silently counted as sharp.
+/// One image's already-classified outcome from an interrupted run: verdict plus the score
+/// that produced it, so a candidate can still explain itself without re-measuring.
+struct BlurSeedVerdict: Sendable, Equatable {
+    let verdict: BlurVerdict
+    let laplacianVariance: Float?
+}
+
+/// Resume seed for the sharpness pass: verdicts already classified under `thresholds`,
+/// reconciled against the fresh catalog by the caller. The engine additionally refuses
+/// the seed unless `thresholds` equal the thresholds this run will classify with — a
+/// verdict from another calibration is never mixed in, it is simply re-measured.
+struct BlurAnalysisSeed: Sendable {
+    let thresholds: BlurThresholds
+    /// assetID → verdict.
+    var verdicts: [String: BlurSeedVerdict] = [:]
+}
+
 struct BlurAnalysisEngine: Sendable {
     let configuration: BlurAnalysisConfiguration
     let thumbnailLoader: any PhotoThumbnailLoading
@@ -59,30 +76,43 @@ struct BlurAnalysisEngine: Sendable {
     /// Injected clock for the result's `scannedAt` — production passes `Date.init`;
     /// tests pin it so a completed result is exactly reproducible.
     let now: @Sendable () -> Date
+    /// Reports each verdict the moment it is produced, so an interruption can checkpoint
+    /// it. `nil` (the default) records nothing; invoked from engine workers, lock-cheap.
+    let checkpointSink: (@Sendable (CheckpointEvidence) -> Void)?
 
     init(
         configuration: BlurAnalysisConfiguration = BlurAnalysisConfiguration(),
         thumbnailLoader: any PhotoThumbnailLoading = PhotoKitThumbnailLoader(),
         metrics: BlurAnalysisMetrics? = nil,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        checkpointSink: (@Sendable (CheckpointEvidence) -> Void)? = nil
     ) {
         self.configuration = configuration
         self.thumbnailLoader = thumbnailLoader
         self.metrics = metrics
         self.now = now
+        self.checkpointSink = checkpointSink
     }
 
     /// Primary API. Ordered event stream: throttled progress updates, then `.completed`
     /// last on success. Cancelling the consuming task terminates the stream and cancels
     /// the producer — never a hung continuation.
+    ///
+    /// `seed` lets an interrupted run continue: seeded records are tallied without a
+    /// request, and progress counts only the work that remains.
     func makeAnalysisStream(
-        records: [PhotoAssetRecord]
+        records: [PhotoAssetRecord],
+        seed: BlurAnalysisSeed? = nil
     ) -> AsyncThrowingStream<BlurAnalysisEvent, Error> {
         let engine = self
         return AsyncThrowingStream { continuation in
             let producer = Task.detached(priority: .userInitiated) {
                 do {
-                    let result = try await Self.run(engine: engine, records: records) { progress in
+                    let result = try await Self.run(
+                        engine: engine,
+                        records: records,
+                        seed: seed
+                    ) { progress in
                         continuation.yield(.progress(progress))
                     }
                     continuation.yield(.completed(result))
@@ -142,9 +172,16 @@ struct BlurAnalysisEngine: Sendable {
     private static func run(
         engine: BlurAnalysisEngine,
         records: [PhotoAssetRecord],
+        seed: BlurAnalysisSeed? = nil,
         report: @escaping @Sendable (BlurAnalysisProgress) -> Void
     ) async throws -> BlurAnalysisResult {
         let config = engine.configuration
+        // Resume seed, accepted only under the exact calibration it was classified with.
+        // A mismatch (or no seed) degrades to a full, fresh pass — never mixed verdicts.
+        let activeSeed: BlurAnalysisSeed? = {
+            guard let seed, seed.thresholds == config.thresholds else { return nil }
+            return seed
+        }()
         // Thermal-adaptive width (see `ScanConcurrencyPolicy`): the configured bound above,
         // scaled by the current thermal state; recorded below as the effective width.
         let thermalPolicy = ScanConcurrencyPolicy(thermalState: config.thermalState)
@@ -165,12 +202,18 @@ struct BlurAnalysisEngine: Sendable {
         engine.metrics?.set(.assetsConsidered, to: records.count)
         engine.metrics?.set(.workerWidth, to: workerWidth)
 
-        // Partition: every record lands in exactly one bucket up front — refused with a
-        // reason, or queued for measurement. Refusals never issue a request.
+        // Partition: every record lands in exactly one bucket up front — seeded (an
+        // interrupted run already classified it), refused with a reason, or queued for
+        // measurement. Refusals and seeds never issue a request.
         let unavailable = LockedBox<[String: PhotoAnalysisUnavailableReason]>([:])
         var work: [WorkItem] = []
+        var seeded: [(index: Int, assetID: String, entry: BlurSeedVerdict)] = []
         work.reserveCapacity(records.count)
         for (index, record) in records.enumerated() {
+            if let entry = activeSeed?.verdicts[record.localIdentifier] {
+                seeded.append((index: index, assetID: record.localIdentifier, entry: entry))
+                continue
+            }
             if !record.isImage {
                 unavailable.insert(record.localIdentifier, reason: .notAnalyzable)
                 continue
@@ -181,7 +224,10 @@ struct BlurAnalysisEngine: Sendable {
             }
             work.append(WorkItem(index: index, record: record))
         }
-        engine.metrics?.set(.refusedUpFront, to: records.count - work.count)
+        engine.metrics?.set(
+            .refusedUpFront,
+            to: records.count - work.count - seeded.count
+        )
 
         let reporter = BlurProgressReporter(total: work.count) { progress in
             // Emissions only (post-throttling): what the consumer actually saw.
@@ -191,6 +237,31 @@ struct BlurAnalysisEngine: Sendable {
         reporter.start()
 
         let tally = LockedBox<Tally>(Tally())
+        // Seeded verdicts rejoin the tally under their fresh-catalog index, so the final
+        // result's counts and candidate ordering match an uninterrupted run exactly.
+        if !seeded.isEmpty {
+            tally.mutate { state in
+                for item in seeded {
+                    switch item.entry.verdict {
+                    case .sharp:
+                        state.sharpCount += 1
+                    case .insufficientInformation:
+                        state.insufficientInformationCount += 1
+                    case .likelyBlurry, .borderline:
+                        state.candidates.append(
+                            (
+                                index: item.index,
+                                candidate: BlurCandidate(
+                                    assetID: item.assetID,
+                                    verdict: item.entry.verdict,
+                                    laplacianVariance: item.entry.laplacianVariance ?? 0
+                                )
+                            )
+                        )
+                    }
+                }
+            }
+        }
         try await BoundedWorkers.run(items: work, width: workerWidth) { item in
             guard !Task.isCancelled else { return }
             try await thermalPolicy.waitWhileCritical()
@@ -234,6 +305,14 @@ struct BlurAnalysisEngine: Sendable {
                 let verdict = config.thresholds.classify(score)
                 engine.metrics?.record(.classify, seconds: secondsSince(classifyStarted))
                 try Task.checkCancellation()
+                // Checkpoint the verdict the moment it exists — sharp ones too: a resumed
+                // pass skips every already-classified image, not just the candidates.
+                engine.checkpointSink?(.blurVerdict(
+                    assetID: assetID,
+                    modified: item.record.modificationDate,
+                    verdict: verdict,
+                    laplacianVariance: score.laplacianVariance
+                ))
                 tally.mutate { state in
                     switch verdict {
                     case .sharp:

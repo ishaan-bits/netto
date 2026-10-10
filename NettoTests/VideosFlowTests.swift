@@ -727,15 +727,23 @@ private func makeVideoEnv(
         plannedCount: 2,
         verifiedRemovedCount: 2,
         remainingIDs: []
-    ))
+    )),
+    contactsPermission: any ContactsPermissionServicing = VideoCheckpointContactsPermissionService(),
+    checkpointStore: InMemoryScanCheckpointStore = InMemoryScanCheckpointStore(),
+    scanSnapshotStore: InMemoryScanSnapshotStore = InMemoryScanSnapshotStore(),
+    backgroundTasks: any BackgroundTaskScheduling = FakeBackgroundTaskScheduler()
 ) -> (env: AppEnvironment, service: RecordingDeletionService) {
     let service = RecordingDeletionService(outcome: outcome)
     let env = AppEnvironment(
         storageProvider: FakeStorage(),
         photoPermission: FakePermissionService(.authorized),
+        contactsPermission: contactsPermission,
         makePhotoLibrary: { FakeLibrary(records: catalog.records) },
         sizeProvider: sizeProvider,
         deletionService: service,
+        scanSnapshotStore: scanSnapshotStore,
+        checkpointStore: checkpointStore,
+        backgroundTasks: backgroundTasks,
         sessionToken: "session-1"
     )
     env.photoPermissionState = .authorized
@@ -952,4 +960,214 @@ private struct FakeLibrary: PhotoLibraryReading {
         guard lower < upper else { return [] }
         return Array(records[lower..<upper])
     }
+}
+
+// MARK: - Checkpoint persistence + resume (Phase C)
+
+/// Video-size measurement's Phase C contract: a restored `.videoSizes` checkpoint seeds
+/// the next pass (checkpoint bytes win, the provider is never asked for seeded ids);
+/// background expiration mid-measurement persists exactly what landed, releases the
+/// background task, and foregrounding finishes only the remainder; and a paused heavy
+/// pass's checkpoint keeps the file slot — an expiration can never clobber it.
+@MainActor
+struct VideoCheckpointFlowTests {
+    @Test func restoredVideoSizesCheckpointSeedsTheNextMeasurement() async throws {
+        let records = videoRecords(count: 10)
+        let checkpointStore = InMemoryScanCheckpointStore()
+        // Deliberately different from what the provider answers for the same ids, so the
+        // final bytes prove *which* source won.
+        let seeded: [String: Int64] = [
+            "bulk-video-0": 42_424_242,
+            "bulk-video-1": 17_171_717,
+            "bulk-video-2": 9_999_999,
+        ]
+        try checkpointStore.save(ScanCheckpoint(
+            runSequence: 3,
+            kind: .videoSizes,
+            startedAt: Date(timeIntervalSince1970: 1_760_000_400),
+            updatedAt: Date(timeIntervalSince1970: 1_760_000_450),
+            completedUnits: seeded.count,
+            totalUnits: records.count,
+            videoSizes: seeded.map { assetID, bytes in
+                VideoSizeEntry(assetID: assetID, modified: nil, bytes: bytes)
+            }
+            .sorted { $0.assetID < $1.assetID }
+        ))
+        let provider = RecordingSizeProvider(sizes: syntheticSizes(count: 10))
+        let (env, _) = makeVideoEnv(
+            catalog: makeCatalog(records),
+            sizeProvider: provider,
+            checkpointStore: checkpointStore
+        )
+        await env.bootstrap()
+
+        // Restoring a video checkpoint has no paused surface: nothing starts, nothing
+        // claims the slot — the seed is applied the next time measurement starts.
+        #expect(env.videoSizeResolution.bytes.isEmpty)
+
+        env.resumeVideoSizeMeasurement()
+        await waitForSettled(env)
+
+        guard case .settled(let measurement) = env.videoSizeResolution else {
+            Issue.record("expected settled measurement, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(measurement.bytes.count == records.count)
+        #expect(!measurement.isPartial)
+        #expect(measurement.bytes["bulk-video-0"] == 42_424_242)
+        #expect(measurement.bytes["bulk-video-1"] == 17_171_717)
+        #expect(measurement.bytes["bulk-video-2"] == 9_999_999)
+        #expect(measurement.bytes["bulk-video-3"] == 1_000_003)
+        // The seeded ids were never handed to the provider — only the remainder was.
+        let asked = Set(provider.batches.flatMap { $0 })
+        #expect(asked.isDisjoint(with: Set(seeded.keys)))
+        #expect(checkpointStore.load() == nil)
+    }
+
+    @Test func expirationCheckpointsAPartialMeasurementAndForegroundFinishesOnlyTheRemainder()
+        async throws {
+        let records = videoRecords(count: 160)
+        let checkpointStore = InMemoryScanCheckpointStore()
+        let background = FakeBackgroundTaskScheduler()
+        // 160 videos at batch size 32 → five sequential batches; the first lands at
+        // ~120 ms, completion needs ~600 ms, so expiration mid-run is deterministic.
+        let provider = RecordingSizeProvider(
+            sizes: syntheticSizes(count: 160),
+            delayNanoseconds: 120_000_000
+        )
+        let (env, _) = makeVideoEnv(
+            catalog: makeCatalog(records),
+            sizeProvider: provider,
+            checkpointStore: checkpointStore,
+            backgroundTasks: background
+        )
+
+        env.handleLifecycle(.background)
+        #expect(!background.isHolding) // nothing to protect yet
+
+        env.resumeVideoSizeMeasurement()
+        guard case .measuring = env.videoSizeResolution else {
+            Issue.record("expected measuring, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(background.isHolding)
+
+        let firstBatchLanded = await waitForMeasuredBytes(env, atLeast: 32)
+        #expect(firstBatchLanded)
+
+        background.fireExpiration()
+
+        // The last deterministic moment: partial state kept on screen, the checkpoint
+        // written synchronously with exactly that progress, the task released.
+        guard case .settled(let partial) = env.videoSizeResolution else {
+            Issue.record("expected settled partial after expiration, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(partial.isPartial)
+        #expect(partial.measuredCount >= 32)
+        #expect(!background.isHolding)
+        let saved = try #require(checkpointStore.load())
+        #expect(saved.kind == .videoSizes)
+        #expect(saved.totalUnits == records.count)
+        #expect(saved.completedUnits == partial.measuredCount)
+
+        // Foregrounding resumes automatically (this session was interrupted) and measures
+        // only what the checkpoint never saw.
+        let batchesBefore = provider.batches.count
+        env.handleLifecycle(.active)
+        await waitForSettled(env)
+
+        guard case .settled(let finished) = env.videoSizeResolution else {
+            Issue.record("expected settled after resume, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(!finished.isPartial)
+        #expect(finished.bytes.count == records.count)
+        let newIDs = Set(provider.batches.dropFirst(batchesBefore).flatMap { $0 })
+        #expect(newIDs.count == records.count - partial.measuredCount)
+        #expect(newIDs.isDisjoint(with: Set(partial.bytes.keys)))
+        #expect(checkpointStore.load() == nil)
+        #expect(!background.isHolding)
+    }
+
+    @Test func aPausedHeavyPasssCheckpointKeepsTheSlotOverAVideoExpiration() async throws {
+        let records = videoRecords(count: 160)
+        let checkpointStore = InMemoryScanCheckpointStore()
+        let background = FakeBackgroundTaskScheduler()
+        let provider = RecordingSizeProvider(
+            sizes: syntheticSizes(count: 160),
+            delayNanoseconds: 120_000_000
+        )
+        // A paused blur pass owns the file: restore adopts it, and video measurement is
+        // allowed to run — but never to write over heavier resume information.
+        let blurCheckpoint = ScanCheckpoint(
+            runSequence: 9,
+            kind: .blur,
+            startedAt: Date(timeIntervalSince1970: 1_760_000_400),
+            updatedAt: Date(timeIntervalSince1970: 1_760_000_450),
+            completedUnits: 6,
+            totalUnits: 8,
+            blurThresholds: .corpusCalibrated
+        )
+        try checkpointStore.save(blurCheckpoint)
+        let (env, _) = makeVideoEnv(
+            catalog: makeCatalog(records),
+            sizeProvider: provider,
+            checkpointStore: checkpointStore,
+            backgroundTasks: background
+        )
+        await env.bootstrap()
+        guard case .paused = env.blurAnalysisState else {
+            Issue.record("expected a restored paused blur pass, got \(env.blurAnalysisState)")
+            return
+        }
+
+        env.handleLifecycle(.background)
+        env.resumeVideoSizeMeasurement()
+        #expect(background.isHolding)
+        let firstBatchLanded = await waitForMeasuredBytes(env, atLeast: 32)
+        #expect(firstBatchLanded)
+
+        background.fireExpiration()
+
+        // Video measurement settled as partial — and the blur checkpoint is untouched:
+        // the video write was refused, not allowed to clobber heavier resume info.
+        #expect(checkpointStore.load() == blurCheckpoint)
+        guard case .settled(let partial) = env.videoSizeResolution else {
+            Issue.record("expected settled partial after expiration, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(partial.isPartial)
+        #expect(!background.isHolding)
+        guard case .paused = env.blurAnalysisState else {
+            Issue.record("blur pass should still be paused, got \(env.blurAnalysisState)")
+            return
+        }
+    }
+}
+
+// MARK: - Checkpoint helpers
+
+/// Waits until a running measurement has actually merged at least `count` bytes — the
+/// provider records batches at request time, but the checkpoint can only see what landed.
+@MainActor
+private func waitForMeasuredBytes(
+    _ env: AppEnvironment,
+    atLeast count: Int,
+    timeoutMilliseconds: Int = 5_000
+) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .milliseconds(timeoutMilliseconds))
+    while ContinuousClock.now < deadline {
+        if case .measuring(let measurement) = env.videoSizeResolution,
+           measurement.bytes.count >= count {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return false
+}
+
+private struct VideoCheckpointContactsPermissionService: ContactsPermissionServicing {
+    func currentStatus() -> PermissionState { .notDetermined }
+    func requestAccess() async -> PermissionState { .notDetermined }
 }

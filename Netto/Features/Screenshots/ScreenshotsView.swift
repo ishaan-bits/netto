@@ -31,6 +31,7 @@ struct ScreenshotsView: View {
         case .permissionDenied: return "permissionDenied"
         case .scanRequired: return "scanRequired"
         case .buildingCatalog: return "buildingCatalog"
+        case .paused: return "paused"
         case .failed: return "failed"
         case .empty: return "empty"
         case .results: return "results"
@@ -104,6 +105,19 @@ struct ScreenshotsView: View {
                 buttonTitle: "Try Again"
             ) {
                 env.startCatalogBuild()
+            }
+
+        case .paused(let stage):
+            // A catalog run was interrupted and saved its checkpoint; Resume continues it
+            // from where it stopped. The full-library re-enumeration restarts (enumeration
+            // offsets cannot be reconstructed) but completed results are preserved.
+            PhaseMessage(
+                systemImage: "pause.circle",
+                title: "Scan paused",
+                message: "\(stage) Nothing was changed — resume to continue where it stopped.",
+                buttonTitle: "Resume"
+            ) {
+                env.resumeInterruptedWork()
             }
 
         case .empty:

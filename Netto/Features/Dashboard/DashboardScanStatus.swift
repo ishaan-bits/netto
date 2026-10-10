@@ -13,6 +13,9 @@ struct DashboardScanStatusCard: View {
     let onOpenSettings: () -> Void
     let onAnalyze: () -> Void
     let onCancel: () -> Void
+    /// Continues an interrupted run from its saved checkpoint (the paused state's own
+    /// action — never a fresh start, which would discard the saved progress instead).
+    var onResume: () -> Void = {}
     /// Whether the empty-library state is a *limited* permission state — only then does
     /// its copy get the "Open Settings" action its body asks for (U2); a genuinely empty
     /// authorized library has no Settings action to offer.
@@ -38,6 +41,11 @@ struct DashboardScanStatusCard: View {
 
             if case .scanning(_, let fraction, let eta) = status {
                 progress(fraction: fraction, eta: eta)
+            } else if case .paused(_, let fraction?) = status {
+                // The saved position as a static bar — only when the run had a measured
+                // one (no indeterminate pulse: nothing is moving) and never an ETA (the
+                // estimator was reset with the pause; a countdown would be fiction).
+                pausedProgress(fraction: fraction)
             }
 
             if let buttonTitle = copy.buttonTitle {
@@ -113,6 +121,15 @@ struct DashboardScanStatusCard: View {
             .accessibilityIdentifier("scanProgressBar")
     }
 
+    /// The paused bar: same measured track, but quiet — no pulse, no `updatesFrequently`
+    /// (VoiceOver should not re-announce a state that is not changing).
+    private func pausedProgress(fraction: Double) -> some View {
+        ScanProgressBar(fraction: fraction)
+            .accessibilityLabel("Scan progress")
+            .accessibilityValue("\(Int((fraction * 100).rounded())) percent, paused")
+            .accessibilityIdentifier("scanProgressBar")
+    }
+
     @ViewBuilder
     private func actionButton(_ title: String) -> some View {
         switch status {
@@ -147,6 +164,15 @@ struct DashboardScanStatusCard: View {
             }
             .buttonStyle(NettoPrimaryButtonStyle())
             .accessibilityIdentifier("retryAnalysisButton")
+        case .paused:
+            // Resume is the paused state's primary action: it continues the saved run,
+            // it does not start a new one.
+            Button(action: primaryAction) {
+                Text(title)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(NettoPrimaryButtonStyle())
+            .accessibilityIdentifier("resumeAnalysisButton")
         case .emptyLibrary where isLimitedAccess:
             // The settings action, in the same secondary treatment the denied state uses.
             Button(action: primaryAction) {
@@ -173,6 +199,8 @@ struct DashboardScanStatusCard: View {
             return onOpenSettings
         case .scanning:
             return onCancel
+        case .paused:
+            return onResume
         case .emptyLibrary where isLimitedAccess:
             return onOpenSettings
         case .idle, .finished, .cancelled, .emptyLibrary, .failed:

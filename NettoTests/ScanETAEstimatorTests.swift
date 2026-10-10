@@ -147,4 +147,37 @@ struct ScanETAEstimatorTests {
         }.value
         #expect(estimate == .remaining(seconds: 8))
     }
+
+    // MARK: Reset (pause / resume)
+
+    @Test func resetDropsEverySampleSoAPausedRunNeverShowsAStaleCountdown() {
+        var estimator = ScanETAEstimator()
+        estimator.record(stage: "catalog", completed: 0, total: 10_000, at: 0)
+        estimator.record(stage: "catalog", completed: 1_000, total: 10_000, at: 1)
+        estimator.record(stage: "catalog", completed: 2_000, total: 10_000, at: 2)
+        #expect(estimator.estimate() == .remaining(seconds: 8))
+
+        // The pause: anchors, samples, and stage all go — a paused card can never render
+        // a countdown anchored to throughput from before the interruption.
+        estimator.reset()
+        #expect(estimator.estimate() == .calculating)
+        #expect(estimator.observedThroughput == nil)
+    }
+
+    @Test func afterAResetTheEstimateReearnsItselfFromFreshSamples() {
+        var estimator = ScanETAEstimator()
+        estimator.record(stage: "catalog", completed: 0, total: 10_000, at: 0)
+        estimator.record(stage: "catalog", completed: 5_000, total: 10_000, at: 1)
+        estimator.record(stage: "catalog", completed: 9_000, total: 10_000, at: 2)
+        #expect(estimator.estimate() != .calculating)
+
+        estimator.reset()
+        // Post-reset samples must not borrow the pre-reset anchor: the first is a lone
+        // observation again (calculating), and only a second fresh one restores a countdown.
+        estimator.record(stage: "catalog", completed: 0, total: 10_000, at: 100)
+        estimator.record(stage: "catalog", completed: 1_000, total: 10_000, at: 101)
+        #expect(estimator.estimate() == .calculating)
+        estimator.record(stage: "catalog", completed: 2_000, total: 10_000, at: 102)
+        #expect(estimator.estimate() == .remaining(seconds: 8))
+    }
 }

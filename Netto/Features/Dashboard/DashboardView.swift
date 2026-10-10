@@ -109,6 +109,7 @@ struct DashboardView: View {
             onOpenSettings: openSettings,
             onAnalyze: { env.startSimilarityAnalysis() },
             onCancel: cancelScan,
+            onResume: { env.resumeInterruptedWork() },
             isLimitedAccess: env.photoPermissionState == .limited
         )
     }
@@ -353,6 +354,8 @@ struct DashboardView: View {
             return "Reading your library…"
         case .analyzing(let progress):
             return SimilarPhotosPresentation.stageMessage(for: progress)
+        case .paused:
+            return "Scan paused"
         case .emptyLibrary:
             return "No photos visible to Netto"
         case .cancelled:
@@ -389,6 +392,8 @@ struct DashboardView: View {
             return "Not scanned yet"
         case .running:
             return "Reading your library…"
+        case .paused:
+            return "Scan paused"
         case .cancelled:
             return "Last run cancelled"
         case .failed(let failure):
