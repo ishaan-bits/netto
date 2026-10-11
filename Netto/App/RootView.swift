@@ -335,11 +335,11 @@ final class AppEnvironment {
     @ObservationIgnored private var builtVideoSignatureGeneration: UInt64 = .max
     /// The cached video-dataset fingerprint (see `videoDatasetSignature`).
     @ObservationIgnored private var builtVideoSignature: String = ""
-    /// What `videoSignatureGeneration` + resolution the cached settled records reflect.
-    @ObservationIgnored private var builtSettledVideosGeneration: UInt64 = .max
-    @ObservationIgnored private var builtSettledVideosResolution: VideoSizeResolution?
-    /// The cached resolved, largest-first video records (see `settledVideoRecords`).
-    @ObservationIgnored private var builtSettledVideosRecords: [PhotoAssetRecord] = []
+    /// What `videoSignatureGeneration` + resolution the cached display records reflect.
+    @ObservationIgnored private var builtVideoRecordsGeneration: UInt64 = .max
+    @ObservationIgnored private var builtVideoRecordsResolution: VideoSizeResolution?
+    /// The cached, resolved, largest-first video inventory (see `videoRecordsForDisplay`).
+    @ObservationIgnored private var builtVideoRecords: [PhotoAssetRecord] = []
 
     // MARK: Interrupted-run state (Phase C)
 
@@ -465,37 +465,48 @@ final class AppEnvironment {
         return builtVideoSignature
     }
 
-    /// Resolved, largest-first video records for the settled measurement — cached across
-    /// renders the same way.
+    /// The current video inventory for display — cached across renders.
+    ///
+    /// Every completed catalog's videos, resolved with whatever the current measurement has
+    /// produced (measured bytes embedded; unknown stays unknown) and sorted largest-first —
+    /// or the raw sorted inventory when no current measurement exists. The Videos screen
+    /// renders this in every completed-catalog state, so enumeration completes first and
+    /// measurement only fills sizes in; it never gates the list.
     ///
     /// The resolve + sort is O(videos log videos) and used to run in every Videos screen
-    /// render while results were on screen (every selection toggle, every thumbnail state
-    /// change, every progress tick). It now rebuilds only when the catalog, the dataset
-    /// signature, or the measurement itself changes — settled measurements change once
-    /// per run, so a screen full of selection toggles costs no sorts at all.
-    var settledVideoRecords: [PhotoAssetRecord] {
+    /// render (every selection toggle, every thumbnail state change, every progress tick).
+    /// It now rebuilds only when the catalog or the measurement changes, so a screen full
+    /// of selection toggles costs no sorts at all. Observation still tracks `catalogState`
+    /// and `videoSizeResolution` directly (read first below), so a change re-renders
+    /// exactly the readers that ask.
+    var videoRecordsForDisplay: [PhotoAssetRecord] {
         let resolution = videoSizeResolution
         let signature = videoDatasetSignature // reads + registers catalogState
-        guard case .completed(let catalog) = catalogState,
-              case .settled(let measurement) = resolution,
-              !signature.isEmpty,
-              measurement.datasetSignature == signature
-        else {
-            builtSettledVideosRecords = []
-            builtSettledVideosGeneration = videoSignatureGeneration
-            builtSettledVideosResolution = resolution
+        guard case .completed(let catalog) = catalogState, !signature.isEmpty else {
+            builtVideoRecords = []
+            builtVideoRecordsGeneration = videoSignatureGeneration
+            builtVideoRecordsResolution = resolution
             return []
         }
-        if builtSettledVideosGeneration == videoSignatureGeneration,
-           builtSettledVideosResolution == resolution {
-            return builtSettledVideosRecords
+        if builtVideoRecordsGeneration == videoSignatureGeneration,
+           builtVideoRecordsResolution == resolution {
+            return builtVideoRecords
         }
-        let records = VideoDataset.sorted(
-            VideoDataset.resolved(VideoDataset.records(in: catalog), with: measurement.bytes)
-        )
-        builtSettledVideosRecords = records
-        builtSettledVideosGeneration = videoSignatureGeneration
-        builtSettledVideosResolution = resolution
+        let videos = VideoDataset.records(in: catalog)
+        let records: [PhotoAssetRecord]
+        if let measurement = resolution.measurement,
+           measurement.datasetSignature == signature {
+            records = VideoDataset.sorted(
+                VideoDataset.resolved(videos, with: measurement.bytes)
+            )
+        } else {
+            // No current measurement (idle, or another dataset's): the inventory still
+            // renders, every size unknown — never an empty screen waiting on measurement.
+            records = VideoDataset.sorted(videos)
+        }
+        builtVideoRecords = records
+        builtVideoRecordsGeneration = videoSignatureGeneration
+        builtVideoRecordsResolution = resolution
         return records
     }
 
@@ -2158,6 +2169,7 @@ final class AppEnvironment {
             let batchSize = VideoSizeResolution.measurementBatchSize
             var pending = Array(targets)
             var unavailableCount = 0
+            var lastPublish = ContinuousClock.now
             while !pending.isEmpty {
                 let batch = Array(pending.prefix(batchSize))
                 pending.removeFirst(batch.count)
@@ -2178,14 +2190,21 @@ final class AppEnvironment {
                         unavailableCount += 1
                     }
                 }
-                self.videoSizeResolution = .measuring(
-                    VideoSizeResolution.Measurement(
-                        datasetSignature: signature,
-                        bytes: measuredBytes,
-                        total: total,
-                        unavailableCount: unavailableCount
+                // Coalesced publishes: a cloud-only library resolves batches in
+                // milliseconds, and one observed-state write per batch would storm the
+                // main actor. At most ~4 updates per second; the settled state below
+                // always publishes, so the final frame is never dropped.
+                if ContinuousClock.now - lastPublish >= .milliseconds(250) {
+                    lastPublish = ContinuousClock.now
+                    self.videoSizeResolution = .measuring(
+                        VideoSizeResolution.Measurement(
+                            datasetSignature: signature,
+                            bytes: measuredBytes,
+                            total: total,
+                            unavailableCount: unavailableCount
+                        )
                     )
-                )
+                }
             }
             guard self.videoSizeGeneration == generation else { return }
             self.videoSizeResolution = .settled(

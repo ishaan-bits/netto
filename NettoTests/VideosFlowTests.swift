@@ -485,6 +485,96 @@ struct VideosFlowTests {
         #expect(measurement.bytes.isEmpty) // unknown, never zero
     }
 
+    @Test func aMixedLocalAndCloudLibrarySettlesWithConsistentCountsAndOrder() async {
+        // Half the library is measurable, half is not (the iCloud-only half): every
+        // video is counted exactly once — measured or unavailable, never both, never
+        // dropped — and only the measured ones enter the size ranking.
+        let catalog = makeCatalog(videoRecords(count: 12))
+        var sizes: [String: Int64] = [:]
+        for index in 0..<6 {
+            sizes["bulk-video-\(index)"] = Int64(10_000_000 + index * 1_000_000)
+        }
+        let provider = RecordingSizeProvider(sizes: sizes)
+        let env = makeVideoEnv(catalog: catalog, sizeProvider: provider).env
+
+        env.startVideoSizeResolution()
+        await waitForSettled(env)
+
+        guard case .settled(let measurement) = env.videoSizeResolution else {
+            Issue.record("expected settled, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(measurement.total == 12)
+        #expect(measurement.measuredCount == 6)
+        #expect(measurement.unavailableCount == 6)
+        // Internally consistent: the counts partition the inventory exactly.
+        #expect(measurement.resolvedCount == measurement.total)
+
+        let records = env.videoRecordsForDisplay
+        #expect(records.count == 12)
+        // The six measured videos sort largest-first and lead the list; the six unknown
+        // ones follow, never ranked among the measured sizes.
+        let measuredPrefix = Array(records.prefix(6))
+        #expect(measuredPrefix.allSatisfy { $0.sizeInBytes != nil })
+        let bytes = measuredPrefix.compactMap(\.sizeInBytes)
+        #expect(bytes == bytes.sorted(by: >))
+        #expect(records.dropFirst(6).allSatisfy { $0.sizeInBytes == nil })
+    }
+
+    @Test func theInventoryRendersDuringMeasurementAndRebuildsOnlyOnStateChanges() async {
+        // Enumerate first: while a measurement is in flight the screen already has the
+        // full list (sizes filling in), and the cached list rebuilds only when the
+        // catalog or the measurement itself changes — never per render.
+        let (env, _) = makeVideoEnv()
+        let signature = VideoDataset.signature(in: VideosFixture.completed)
+
+        // Idle: the raw inventory, every size unknown — never an empty screen.
+        let idleRecords = env.videoRecordsForDisplay
+        #expect(idleRecords.count == VideosFixture.videos.count)
+        #expect(idleRecords.allSatisfy { $0.sizeInBytes == nil })
+
+        // Measuring mid-flight: the partial bytes are embedded and sorted to the front.
+        env.videoSizeResolution = .measuring(
+            VideoSizeResolution.Measurement(
+                datasetSignature: signature,
+                bytes: ["video-03": 1_600_000_000],
+                total: VideosFixture.videos.count,
+                unavailableCount: 2
+            )
+        )
+        let measuringRecords = env.videoRecordsForDisplay
+        #expect(measuringRecords.count == VideosFixture.videos.count)
+        #expect(measuringRecords.first?.localIdentifier == "video-03")
+        #expect(measuringRecords.first?.sizeInBytes == 1_600_000_000)
+
+        // Same measurement state → the cache answers with the identical list.
+        #expect(env.videoRecordsForDisplay == measuringRecords)
+
+        // A new measurement invalidates the cache: the second size sorts by its bytes.
+        env.videoSizeResolution = .measuring(
+            VideoSizeResolution.Measurement(
+                datasetSignature: signature,
+                bytes: ["video-03": 1_600_000_000, "video-01": 240_000_000],
+                total: VideosFixture.videos.count
+            )
+        )
+        let updated = env.videoRecordsForDisplay
+        #expect(Array(updated.map(\.localIdentifier).prefix(2)) == ["video-03", "video-01"])
+
+        // A rebuilt catalog invalidates it too — the extra video appears, still sorted
+        // by the (still-current-signature-less) measurement dropped to unknown sizes.
+        env.catalogState = .completed(
+            CatalogScanResult(
+                records: VideosFixture.records + [Fixtures.extraVideo],
+                libraryAssetCount: VideosFixture.records.count + 1,
+                accessLevel: .authorized
+            )
+        )
+        env.synchronizeVideoDataset()
+        #expect(env.videoRecordsForDisplay.count == VideosFixture.videos.count + 1)
+        #expect(env.videoRecordsForDisplay.allSatisfy { $0.sizeInBytes == nil })
+    }
+
     @Test func cancelKeepsWhatWasMeasuredAndLateBatchesCannotOverwrite() async {
         let catalog = makeCatalog(videoRecords(count: 70))
         let provider = RecordingSizeProvider(
@@ -1172,6 +1262,54 @@ struct VideoCheckpointFlowTests {
             Issue.record("blur pass should still be paused, got \(env.blurAnalysisState)")
             return
         }
+    }
+}
+
+// MARK: - PhotoKit callback deadline (the cloud-only hang cannot recur)
+
+/// The M9 root cause this guards: `requestContentEditingInput` can delay its callback for
+/// a cloud-only asset indefinitely, which hung the size pass at "0 of N". The provider's
+/// every measurement path now races its callback against a hard deadline through these
+/// two primitives; the deadline's answer is always the honest `.unavailable`.
+struct VideoSizeDeadlineTests {
+    @Test func theFirstAnswerWinsAndLaterOnesAreDropped() async {
+        let box = OneShotValue<Int>()
+        box.settle(with: 1)
+        box.settle(with: 2) // a late PhotoKit callback after the deadline already won
+        #expect(await box.wait() == 1)
+    }
+
+    @Test func anAnswerThatArrivesBeforeTheWaitIsNotLost() async {
+        let box = OneShotValue<Int>()
+        box.settle(with: 7)
+        #expect(await box.wait() == 7)
+    }
+
+    @Test func aDeadlineThatFiresFirstDeliversAbsence() async {
+        let value = await PhotoKitAssetSizeProvider.withDeadline(nanoseconds: 30_000_000) {
+            (_: @escaping @Sendable (Int?) -> Void) in
+            // Never answers — the cloud-only callback that never comes.
+        }
+        #expect(value == nil)
+    }
+
+    @Test func aTimelyAnswerBeatsTheDeadline() async {
+        let value = await PhotoKitAssetSizeProvider.withDeadline(nanoseconds: 5_000_000_000) {
+            deliver in deliver(42)
+        }
+        #expect(value == 42)
+    }
+
+    @Test func aLateAnswerAfterTheDeadlineIsDroppedWithoutCrashing() async {
+        let value = await PhotoKitAssetSizeProvider.withDeadline(nanoseconds: 30_000_000) { deliver in
+            Task {
+                try? await Task.sleep(nanoseconds: 200_000_000) // well after the deadline
+                deliver(99) // dropped: the deadline already delivered absence
+            }
+        }
+        #expect(value == nil)
+        // Let the late callback land, proving it neither crashed nor double-resumed.
+        try? await Task.sleep(nanoseconds: 100_000_000)
     }
 }
 

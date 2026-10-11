@@ -105,28 +105,36 @@ extension Array where Element == PhotoAssetRecord {
     }
 }
 
-/// iOS 17-compatible exact sizing.
+/// iOS 17-compatible exact sizing, built so a cloud-only library can never hang the pass.
 ///
 /// `PHAssetResource.dataSize` does not exist before iOS 27, so there is no metadata-only byte
-/// count available at runtime. This provider instead asks PhotoKit for the asset's content editing
-/// input **with network access disabled** — which never downloads anything — and stats the file
-/// URLs it hands back:
+/// count available at runtime. Measurement therefore stats the content URLs PhotoKit hands
+/// back **with network access disabled** — which never downloads anything — racing every
+/// callback against a hard deadline:
 ///
-/// - photo / edited photo → `fullSizeImageURL` (the render actually on disk)
-/// - video and Live Photo paired video → `AVURLAsset.url`
-///
-/// Both are summed when present, which covers a Live Photo's still + movie. Adjustment blobs are
-/// not summed; per `AssetResourceScope` they are not counted, and on iOS 17 they are not
-/// measurable without fetching data.
+/// - **Plain videos** → `PHImageManager.requestAVAsset(forVideo:)`. A locally available
+///   video answers promptly with an `AVURLAsset` whose file URL is stat-ed; a cloud-only
+///   video answers promptly with nil (the API's documented "not available locally"
+///   behaviour) — the honest unavailable outcome at callback speed, not after a deadline
+///   wait. (The previous `requestContentEditingInput` path could delay its callback for a
+///   cloud-only video indefinitely, which hung the whole pass at "0 of N".)
+/// - **Live Photos and photos** → `requestContentEditingInput`, whose input hands back the
+///   full-size image URL and/or the paired-video `AVURLAsset` (both stat-ed; summed for a
+///   Live Photo, per `AssetResourceScope`).
 ///
 /// Limitations, stated rather than hidden:
-/// - An asset whose data lives only in iCloud has no local content URL here, so it is reported as
-///   unknown rather than guessed.
-/// - For an edited asset the measured image is the full-size render, not the pre-edit original.
-/// - Resolution is short-lived and never touches the network, so an in-flight request is allowed
-///   to complete rather than risking a continuation that PhotoKit never calls back into.
+/// - An asset whose data lives only in iCloud has no local content URL here, so it is
+///   reported as unavailable rather than guessed — and never downloaded to measure.
+/// - For an edited asset the measured content is the current version, not the pre-edit
+///   original.
+/// - `requestContentEditingInput` is documented to report failure for a cloud-only asset,
+///   but has been observed to delay that report indefinitely; the deadline race below is
+///   what keeps such a callback from hanging an entire measurement pass.
 struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     var maxConcurrentResolutions: Int = 4
+    /// Per-asset ceiling on a PhotoKit callback (see the type docs). Exceeding it yields an
+    /// honest `.unavailable` — never a hang, never zero.
+    var callbackDeadlineNanoseconds: UInt64 = 5_000_000_000
 
     func sizes(for localIdentifiers: [String]) async -> [String: Int64] {
         let outcomes = await outcomes(for: localIdentifiers)
@@ -161,6 +169,7 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         }
 
         let policy = ScanConcurrencyPolicy()
+        let deadline = callbackDeadlineNanoseconds
         var outcomes: [String: VideoSizeOutcome] = [:]
         outcomes.reserveCapacity(localIdentifiers.count)
 
@@ -184,7 +193,10 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             ) { group in
                 for asset in batch {
                     group.addTask {
-                        let bytes = await Self.contentBytes(for: asset)
+                        let bytes = await Self.contentBytes(
+                            for: asset,
+                            deadlineNanoseconds: deadline
+                        )
                         return SizeMeasurement(
                             localIdentifier: asset.localIdentifier,
                             outcome: bytes.map(VideoSizeOutcome.measured) ?? .unavailable
@@ -216,28 +228,87 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         let outcome: VideoSizeOutcome
     }
 
-    private static func contentBytes(for asset: PHAsset) async -> Int64? {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Int64?, Never>) in
+    /// First-answer-wins race of a PhotoKit callback against a hard deadline. Returns the
+    /// callback's answer if it arrives in time, `nil` if the deadline wins; a callback that
+    /// arrives late is dropped without a second resume. This is what keeps a pathological
+    /// PhotoKit callback from hanging an entire measurement pass.
+    static func withDeadline<Value: Sendable>(
+        nanoseconds: UInt64,
+        start: (@escaping @Sendable (Value?) -> Void) -> Void
+    ) async -> Value? {
+        let box = OneShotValue<Value>()
+        let deadline = Task {
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            box.settle(with: nil)
+        }
+        start { box.settle(with: $0) }
+        let value = await box.wait()
+        deadline.cancel()
+        return value
+    }
+
+    private static func contentBytes(
+        for asset: PHAsset,
+        deadlineNanoseconds: UInt64
+    ) async -> Int64? {
+        switch asset.mediaType {
+        case .video where !asset.mediaSubtypes.contains(.photoLive):
+            return await videoBytes(for: asset, deadlineNanoseconds: deadlineNanoseconds)
+        default:
+            // Live Photos keep the content-editing-input measurement (still + paired video,
+            // per AssetResourceScope); photos use the same path for their full-size render.
+            return await editingInputBytes(for: asset, deadlineNanoseconds: deadlineNanoseconds)
+        }
+    }
+
+    /// The plain-video path: `requestAVAsset` with network access disabled answers promptly
+    /// for both a local video (an `AVURLAsset` to stat) and a cloud-only one (nil).
+    private static func videoBytes(
+        for asset: PHAsset,
+        deadlineNanoseconds: UInt64
+    ) async -> Int64? {
+        await withDeadline(nanoseconds: deadlineNanoseconds) { deliver in
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = false
+            options.version = .current
+            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+                guard let url = (avAsset as? AVURLAsset)?.url else {
+                    deliver(nil)
+                    return
+                }
+                deliver(fileSize(at: url))
+            }
+        }
+    }
+
+    /// The Live Photo / photo path: the full-size render URL and the paired-video URL are
+    /// both stat-ed and summed when present, covering a Live Photo's still + movie.
+    private static func editingInputBytes(
+        for asset: PHAsset,
+        deadlineNanoseconds: UInt64
+    ) async -> Int64? {
+        await withDeadline(nanoseconds: deadlineNanoseconds) { deliver in
             let options = PHContentEditingInputRequestOptions()
             options.isNetworkAccessAllowed = false
             options.canHandleAdjustmentData = { _ in false }
 
             _ = asset.requestContentEditingInput(with: options) { input, _ in
                 guard let input else {
-                    continuation.resume(returning: nil)
+                    deliver(nil)
                     return
                 }
                 var total: Int64 = 0
                 var found = false
-                if let url = input.fullSizeImageURL, let size = Self.fileSize(at: url) {
+                if let url = input.fullSizeImageURL, let size = fileSize(at: url) {
                     total += size
                     found = true
                 }
-                if let urlAsset = input.audiovisualAsset as? AVURLAsset, let size = Self.fileSize(at: urlAsset.url) {
+                if let urlAsset = input.audiovisualAsset as? AVURLAsset, let size = fileSize(at: urlAsset.url) {
                     total += size
                     found = true
                 }
-                continuation.resume(returning: found ? total : nil)
+                deliver(found ? total : nil)
             }
         }
     }
@@ -247,5 +318,50 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
               let number = values[.size] as? NSNumber else { return nil }
         let bytes = number.int64Value
         return bytes > 0 ? bytes : nil
+    }
+}
+
+/// One-shot, first-wins delivery box for a callback that may answer late — or never.
+///
+/// The earliest `settle` wins; later settles (a PhotoKit callback arriving after the
+/// deadline fired) are dropped without resuming twice. `wait` sees the value whether it
+/// settles before or after the wait begins, so there is no lost-answer window.
+///
+/// `@unchecked Sendable`: every access goes through `lock`; `Value` is only moved, never
+/// mutated.
+final class OneShotValue<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var settled = false
+    private var value: Value?
+    private var continuation: CheckedContinuation<Value?, Never>?
+
+    /// Delivers `value` — unless something has already been delivered.
+    func settle(with value: Value?) {
+        lock.lock()
+        guard !settled else {
+            lock.unlock()
+            return
+        }
+        settled = true
+        self.value = value
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: value)
+    }
+
+    /// Suspends for the first delivery — or returns it immediately if one already happened.
+    func wait() async -> Value? {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if settled {
+                let value = self.value
+                lock.unlock()
+                continuation.resume(returning: value)
+            } else {
+                self.continuation = continuation
+                lock.unlock()
+            }
+        }
     }
 }

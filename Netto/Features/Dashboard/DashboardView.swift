@@ -175,7 +175,7 @@ struct DashboardView: View {
                         catalog: env.catalogState,
                         resolution: env.videoSizeResolution,
                         datasetSignature: env.videoDatasetSignature,
-                        settledRecords: env.settledVideoRecords
+                        settledRecords: env.videoRecordsForDisplay
                     ),
                     assetID: videosAssetID,
                     initials: nil,
@@ -310,7 +310,7 @@ struct DashboardView: View {
             catalog: env.catalogState,
             resolution: env.videoSizeResolution,
             datasetSignature: env.videoDatasetSignature,
-            settledRecords: env.settledVideoRecords
+            settledRecords: env.videoRecordsForDisplay
         ) else { return nil }
         return records.first?.localIdentifier
     }

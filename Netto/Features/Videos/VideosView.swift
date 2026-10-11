@@ -22,7 +22,7 @@ struct VideosView: View {
             catalog: env.catalogState,
             resolution: env.videoSizeResolution,
             datasetSignature: env.videoDatasetSignature,
-            settledRecords: env.settledVideoRecords
+            settledRecords: env.videoRecordsForDisplay
         )
     }
 
@@ -154,19 +154,16 @@ struct VideosView: View {
                 }
             }
 
-        case .measuringVideos(let measured, let total, let unavailable):
-            // An idle resolution has started nothing — say what is about to happen
-            // instead of claiming a progress that is not running.
-            let isActive = !env.videoSizeResolution.isIdle
-            progressState(
-                message: VideosPresentation.measuringMessage(
-                    measured: measured,
-                    total: total,
-                    unavailable: unavailable,
-                    isActive: isActive
-                ),
-                fraction: isActive && total > 0 ? Double(measured) / Double(total) : nil,
-                cancel: { env.cancelVideoSizeResolution() }
+        case .measuringVideos(let measured, _, let unavailable):
+            // Enumeration is already complete — the full inventory renders immediately and
+            // measurement only fills sizes in; the screen never waits on measurement.
+            // (The phase's `total` equals the display records' count — both are the
+            // catalog's videos — so the list and the counts can never disagree.)
+            inventoryContent(
+                records: env.videoRecordsForDisplay,
+                measured: measured,
+                unavailable: unavailable,
+                isActive: !env.videoSizeResolution.isIdle
             )
 
         case .paused(let stage):
@@ -182,13 +179,24 @@ struct VideosView: View {
             }
 
         case .results(let records):
-            resultsContent(records)
+            let measurement = env.videoSizeResolution.measurement
+            inventoryContent(
+                records: records,
+                measured: measurement?.measuredCount ?? records.count,
+                unavailable: measurement?.unavailableCount ?? 0,
+                isActive: false
+            )
         }
     }
 
-    // MARK: Results
+    // MARK: Inventory (list first; measurement fills sizes in)
 
-    private func resultsContent(_ records: [PhotoAssetRecord]) -> some View {
+    private func inventoryContent(
+        records: [PhotoAssetRecord],
+        measured: Int,
+        unavailable: Int,
+        isActive: Bool
+    ) -> some View {
         List {
             if VideosPresentation.showsLimitedAccessNotice(permission: env.photoPermissionState) {
                 Section {
@@ -196,19 +204,41 @@ struct VideosView: View {
                 }
             }
 
-            if let measurement = env.videoSizeResolution.measurement, measurement.isPartial {
-                Section {
-                    VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
-                        Label(
-                            "\(measurement.measuredCount) of \(measurement.total) sizes measured. Videos with an unknown size are listed after every measured one.",
-                            systemImage: "exclamationmark.circle"
+            Section {
+                VStack(alignment: .leading, spacing: Theme.Spacing.sm) {
+                    ForEach(
+                        Array(
+                            VideosPresentation.inventorySummary(
+                                total: records.count,
+                                measured: measured,
+                                unavailable: unavailable
+                            ).enumerated()
+                        ),
+                        id: \.offset
+                    ) { _, line in
+                        Text(line)
+                            .font(.caption)
+                            .foregroundStyle(NettoColor.textSecondary)
+                    }
+
+                    if isActive {
+                        NettoProgressPanel(
+                            message: VideosPresentation.measuringMessage(
+                                measured: measured,
+                                total: records.count,
+                                unavailable: unavailable,
+                                isActive: true
+                            ),
+                            fraction: records.count > 0
+                                ? Double(measured + unavailable) / Double(records.count)
+                                : nil,
+                            cancel: { env.cancelVideoSizeResolution() }
                         )
-                        .font(.caption)
-                        .foregroundStyle(NettoColor.warning)
-                        if measurement.unavailableCount > 0 {
+                    } else if shouldOfferMeasure {
+                        if unavailable > 0 {
                             // Attempted but not measurable (iCloud-only, unreadable) —
                             // named as its own figure, never folded into "measured".
-                            Text("\(measurement.unavailableCount) of these could not be measured — download them in iCloud Photos, then measure again.")
+                            Text("\(unavailable) of these could not be measured — download them in iCloud Photos, then measure again.")
                                 .font(.caption)
                                 .foregroundStyle(NettoColor.textSecondary)
                         }
@@ -218,8 +248,8 @@ struct VideosView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
-                    .padding(.vertical, Theme.Spacing.xs)
                 }
+                .padding(.vertical, Theme.Spacing.xs)
             }
 
             Section {
@@ -238,6 +268,13 @@ struct VideosView: View {
                 selectAllButton
             }
         }
+    }
+
+    /// Measure is offered whenever some sizes are still unknown: nothing measured yet
+    /// (idle), or a settled partial (cancelled, expired, or unreadable).
+    private var shouldOfferMeasure: Bool {
+        guard let measurement = env.videoSizeResolution.measurement else { return true }
+        return measurement.isPartial
     }
 
     private func row(for record: PhotoAssetRecord) -> some View {

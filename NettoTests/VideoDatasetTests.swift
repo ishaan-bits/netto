@@ -492,6 +492,46 @@ struct VideoDatasetTests {
         )
     }
 
+    // MARK: Inventory summary (enumeration counts first, always)
+
+    @Test func inventorySummaryShowsTheTotalWhileNothingIsMeasured() {
+        // Enumerate first: the inventory total never waits on measurement, and an idle
+        // run says so instead of claiming a progress that is not running.
+        #expect(
+            VideosPresentation.inventorySummary(total: 6, measured: 0, unavailable: 0)
+                == ["6 videos total", "Sizes not measured yet"]
+        )
+    }
+
+    @Test func inventorySummaryNamesMixedMeasuredAndUnavailableCounts() {
+        #expect(
+            VideosPresentation.inventorySummary(total: 6, measured: 4, unavailable: 2)
+                == [
+                    "6 videos total",
+                    "2 sizes unavailable — stored in iCloud or unavailable locally",
+                    "4 videos sorted by known size",
+                ]
+        )
+    }
+
+    @Test func anAllCloudInventoryNamesItsTotalAndUnavailableFigure() {
+        // The iCloud-only library: total first, then exactly why nothing sorted — the
+        // screen is never "0 videos", and it never claims a measurement that never ran.
+        #expect(
+            VideosPresentation.inventorySummary(total: 7061, measured: 0, unavailable: 7061)
+                == [
+                    "7061 videos total",
+                    "7061 sizes unavailable — stored in iCloud or unavailable locally",
+                ]
+        )
+    }
+
+    @Test func inventorySummaryOfAnEmptyLibraryIsEmpty() {
+        #expect(
+            VideosPresentation.inventorySummary(total: 0, measured: 0, unavailable: 0).isEmpty
+        )
+    }
+
     @Test func durationTextFormatsClockReadouts() {
         #expect(VideosPresentation.durationText(0) == "0:00")
         #expect(VideosPresentation.durationText(7) == "0:07")

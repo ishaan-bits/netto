@@ -307,6 +307,40 @@ failure's *mechanism* still needs device logs to confirm (see Known limitations)
   tap-to-start blur seed walk (every catalog record against every saved verdict)
   similarly moved off the main actor.
 
+### Large Videos: instant inventory (M9)
+
+On an iCloud-only iPhone library the Large Videos screen remained stuck at "0 of N"
+after M8's outcome accounting. Root cause, confirmed in code: the size provider
+measured every asset through `requestContentEditingInput` and awaited its callback in
+an unbounded continuation — for a cloud-only video (network access disabled) PhotoKit
+can delay that callback indefinitely, so the first batch never completed and the screen
+never left "0 of N". Even when the callback arrived, it was slow enough that a
+7 000-video cloud-only pass crawled.
+
+- **Plain videos measure through `requestAVAsset`** — with network access disabled this
+  API answers promptly for both a local video (an `AVURLAsset` whose file URL is stat-ed
+  for exact bytes) and a cloud-only one (nil — the honest unavailable outcome, at
+  callback speed). Live Photos and photos keep the content-editing-input measurement
+  (still + paired video, per `AssetResourceScope`), now also deadline-bounded — which
+  incidentally bounds the same hang risk on the photo-sizing path used at deletion
+  review.
+- **Every PhotoKit callback races a hard deadline** — a first-answer-wins box
+  (`OneShotValue` + `PhotoKitAssetSizeProvider.withDeadline`, 5 s default) means a
+  pathological callback yields `.unavailable` instead of hanging the pass; a late answer
+  is dropped without a double resume. The whole library always finishes.
+- **Enumerate first; measure second** — the Videos screen renders the full inventory as
+  soon as the catalog is complete: every video listed immediately, sizes filling in as
+  they measure, a summary of the real counts (`N videos total` / `Y sizes unavailable —
+  stored in iCloud or unavailable locally` / `Z videos sorted by known size`), and a
+  compact progress panel with cancel while measurement runs. An idle screen offers
+  "Measure Sizes" instead of blocking. Unknown sizes stay after every measured one —
+  never ranked, never zero — and rows say so.
+- **Cached inventory, coalesced updates** — `AppEnvironment.videoRecordsForDisplay`
+  (replacing the settled-only cache) serves the resolved, largest-first list and
+  rebuilds only when the catalog or measurement changes, never per render; measurement
+  publishes its state at most ~4×/second (the settled state always publishes), so a
+  fast pass over thousands of cloud-only videos cannot storm the main actor.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -370,7 +404,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 780 Swift Testing cases across 78 suites covering the pure
+- **Unit suite** — 46 files, 791 Swift Testing cases across 79 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -452,12 +486,14 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification (M8)** — focused runs green for the new coverage (the 2
-  watchdog tests in `NettoWidgetProviderTests`; the video presentation tests over
-  unavailable figures, the verbatim settled-records list, and the measuring message;
-  the flow tests over outcome accounting and an all-unavailable batch), then one
-  full-suite run: **780 tests in 78 suites passed** (previous: 773), and one clean
-  build of the app, widget extension, and test target. One case,
+- **Recent verification (M9)** — focused video suites after the large-videos fix:
+  `VideoDatasetTests`, `VideosFlowTests`, `VideoCheckpointFlowTests`, and the new
+  `VideoSizeDeadlineTests` — **80 tests across 4 suites green** (11 new: inventory
+  summary honesty, mixed local/cloud counts and ordering, the inventory rendering
+  during measurement with cache invalidation, and the PhotoKit callback-deadline race),
+  plus one clean build of the app, widget extension, and test target. The last
+  *full-suite* run (M8 work) reported "780 tests in 78 suites passed"; the M9 cases
+  were verified focused, not in a new full-suite run. One case,
   `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests`, is cancelled when run inside the full suite but
   passes in isolation; this is a pre-existing Swift Testing suite-context quirk,
@@ -531,7 +567,8 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   compare exact modification dates through JSON-encoded `Date`s; the worst case for a
   precision round-trip mismatch is one entry's evidence being dropped, which recomputes
   that asset rather than corrupting anything. Video-size batches are cancellable as a
-  whole, but an individual provider call has no per-request timeout. None of this scans
+  whole; since M9 each asset's PhotoKit callback is additionally bounded by a hard
+  deadline (whose answer is an honest "unavailable"). None of this scans
   in the background: the OS background task exists only to *save* a resumable checkpoint
   before expiration, never to keep analyzing.
 - **Swipe Review session persistence (Phase D)** — the session restores when the Swipe
@@ -552,6 +589,13 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   Netto's own confirmation. Real-device validation of the end-to-end deletion flow
   (including this summary) has not been performed — see the device-matrix limitation
   above.
+- **Large Videos sizing (Phase M9)** — the `requestAVAsset`-based local/cloud
+  classification and the 5-second callback deadline are verified by unit tests over the
+  race primitives and the flow, not against a real iCloud-only library on a physical
+  device; the actual PhotoKit callback latencies on such a library have not been
+  measured. Cloud-only videos are reported with their sizes unavailable (never zero,
+  never downloaded); the only way to rank them largest-first is to download them in
+  Photos first and re-measure — Netto never initiates that download.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the

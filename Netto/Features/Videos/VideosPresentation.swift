@@ -187,6 +187,33 @@ enum VideosPresentation {
         return message
     }
 
+    /// The inventory summary lines — enumeration's counts first, always, then honest
+    /// measurement figures derived from actual data. Illustrative shape:
+    ///
+    ///     7,061 videos total
+    ///     7,061 sizes unavailable — stored in iCloud or unavailable locally
+    ///     12 videos sorted by known size
+    ///
+    /// - `total` is the enumerated inventory — it never waits on measurement.
+    /// - `unavailable` counts attempted-and-unmeasurable sizes (stored in iCloud, unreadable);
+    ///   never folded into measured, never zero.
+    /// - `measured` counts videos actually sorted by a known size; the line is omitted
+    ///   while nothing has been measured yet (an idle run says so instead, and an
+    ///   all-unavailable library names only its unavailable figure).
+    static func inventorySummary(total: Int, measured: Int, unavailable: Int) -> [String] {
+        guard total > 0 else { return [] }
+        var lines = ["\(total) videos total"]
+        if unavailable > 0 {
+            lines.append("\(unavailable) sizes unavailable — stored in iCloud or unavailable locally")
+        }
+        if measured > 0 {
+            lines.append("\(measured) videos sorted by known size")
+        } else if unavailable == 0 {
+            lines.append("Sizes not measured yet")
+        }
+        return lines
+    }
+
     /// `0:14` / `1:03` / `1:02:05` — playback time, from the duration already in the catalog.
     static func durationText(_ seconds: TimeInterval) -> String {
         let total = Int(seconds.rounded())
