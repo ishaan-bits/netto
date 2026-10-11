@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The dashboard: identity, one honest headline, the storage hero, one scan surface, and the
-/// five primary cleanup sections.
+/// four primary cleanup sections.
 ///
 /// Composition runs top to bottom in a single vertical stack with one spacing token, so every
 /// block is laid out by normal container rules — no offsets, no fixed coordinates, no layer
@@ -122,9 +122,9 @@ struct DashboardView: View {
         }
     }
 
-    // MARK: CLEANUP — the five primary sections
+    // MARK: CLEANUP — the four primary sections
 
-    /// The five primary cleanup sections. Each row reports only what the app's current state
+    /// The four primary cleanup sections. Each row reports only what the app's current state
     /// can honestly back (a real count, real progress, or a real blocking reason) and routes
     /// into exactly one hub or feature screen. Nothing here starts an analysis on appear.
     private var cleanupSection: some View {
@@ -178,7 +178,6 @@ struct DashboardView: View {
         switch section {
         case .imageCleanup: ImageCleanupView()
         case .videoCleanup: VideoCleanupView()
-        case .largeFiles: LargeFilesView()
         case .duplicateContacts: DuplicateContactsView()
         case .swipeCleanup: SwipeReviewView()
         }

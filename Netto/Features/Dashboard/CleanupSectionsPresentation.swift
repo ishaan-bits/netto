@@ -449,105 +449,13 @@ enum VideoCleanupDestination: String, CaseIterable, Sendable, Equatable {
     }
 }
 
-// MARK: - Large Files
+// MARK: - Dashboard four-section hierarchy
 
-/// The Large Files screen: the library's videos sorted by measured size, largest first.
-///
-/// Sizes come only from the shared size provider; an asset whose size could not be measured
-/// (cloud-only, unreadable) is shown in a distinct "Size not measured" section, never ranked
-/// as zero. Photos are not listed here — see `LargeFilesView` for why eager full-library
-/// photo measurement is not a safe thing to do behind a navigation tap.
-enum LargeFilesPresentation {
-    /// The phase the Large Files screen can be in, derived — never stored.
-    enum Phase: Equatable, Sendable {
-        case permissionRequired
-        case permissionDenied
-        case buildingCatalog(CatalogScanProgress)
-        case paused(stage: String)
-        case scanRequired
-        case failed(String)
-        case empty
-        /// Sizes are being measured. `measured` only counts videos whose size the provider
-        /// actually resolved — unknowns are never counted as zero; `unavailable` counts the
-        /// ones the provider *attempted* and could not measure.
-        case measuring(measured: Int, total: Int, unavailable: Int)
-        /// The video dataset, sorted largest first, with measured sizes embedded per record
-        /// (`sizeInBytes == nil` = size unknown, never zero).
-        case results([PhotoAssetRecord])
-    }
-
-    /// The single permission → catalog → measurement → phase mapping, identical to the video
-    /// inventory's so the two screens can never disagree about the same measurement.
-    static func phase(
-        permission: PermissionState,
-        catalog: CatalogScanState,
-        resolution: VideoSizeResolution,
-        datasetSignature: String,
-        settledRecords: [PhotoAssetRecord]? = nil
-    ) -> Phase {
-        switch VideosPresentation.phase(
-            permission: permission,
-            catalog: catalog,
-            resolution: resolution,
-            datasetSignature: datasetSignature,
-            settledRecords: settledRecords
-        ) {
-        case .permissionRequired: return .permissionRequired
-        case .permissionDenied: return .permissionDenied
-        case .buildingCatalog(let progress): return .buildingCatalog(progress)
-        case .paused(let stage): return .paused(stage: stage)
-        case .scanRequired: return .scanRequired
-        case .failed(let message): return .failed(message)
-        case .empty: return .empty
-        case .measuringVideos(let measured, let total, let unavailable):
-            return .measuring(measured: measured, total: total, unavailable: unavailable)
-        case .results(let records): return .results(records)
-        }
-    }
-
-    /// Largest measured first; unknown sizes sort after every measured asset and are never
-    /// treated as zero. Deterministic tie-break chain identical to `VideoDataset.sorted`.
-    static func sortedRecords(_ records: [PhotoAssetRecord]) -> [PhotoAssetRecord] {
-        VideoDataset.sorted(records)
-    }
-
-    /// The dashboard's one-line status for the Large Files section, derived from the same
-    /// honest phase. Never invents a byte total the provider did not measure.
-    static func dashboardStatus(phase: Phase) -> CleanupDestinationStatus {
-        switch phase {
-        case .permissionRequired:
-            return .unavailable(reason: "Allow Photos access to continue.")
-        case .permissionDenied:
-            return .unavailable(reason: "Photos access is off — enable it in Settings.")
-        case .scanRequired:
-            return .unknownCount("Not scanned yet")
-        case .buildingCatalog:
-            return .progress(message: "Reading library…", fraction: nil)
-        case .paused:
-            return .paused("Scan paused")
-        case .failed(let message):
-            return .failed(message)
-        case .empty:
-            return .empty("No videos found")
-        case .measuring(let measured, let total, _):
-            return .measurement("Measuring sizes · \(measured) of \(total)…")
-        case .results(let records):
-            let known = records.filter(\.isSizeKnown).count
-            return known == 0
-                ? .unknownCount("\(records.count) videos · sizes not measured yet")
-                : .count(known)
-        }
-    }
-}
-
-// MARK: - Dashboard five-section hierarchy
-
-/// The five primary cleanup sections of the dashboard, in their fixed display order.
+/// The four primary cleanup sections of the dashboard, in their fixed display order.
 /// Each row routes into exactly one hub or feature screen; no section is decorative.
 enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
     case imageCleanup = "Image Cleanup"
     case videoCleanup = "Video Cleanup"
-    case largeFiles = "Large Files"
     case duplicateContacts = "Duplicate Contacts"
     case swipeCleanup = "Swipe Cleanup"
 
@@ -557,7 +465,6 @@ enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
         switch self {
         case .imageCleanup: return "photo.stack"
         case .videoCleanup: return "video"
-        case .largeFiles: return "internaldrive"
         case .duplicateContacts: return "person.2"
         case .swipeCleanup: return "arrow.left.and.right"
         }
@@ -567,7 +474,6 @@ enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
         switch self {
         case .imageCleanup: return "imageCleanupSection"
         case .videoCleanup: return "videoCleanupSection"
-        case .largeFiles: return "largeFilesSection"
         case .duplicateContacts: return "duplicateContactsSection"
         case .swipeCleanup: return "swipeCleanupSection"
         }
@@ -580,8 +486,6 @@ enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
             return "Duplicates, similar shots, blur, old screenshots"
         case .videoCleanup:
             return "Recorded and downloaded videos, by size"
-        case .largeFiles:
-            return "Your biggest photos and videos, largest first"
         case .duplicateContacts:
             return "Likely-duplicate contact entries"
         case .swipeCleanup:
@@ -635,17 +539,6 @@ enum DashboardCleanupPresentation {
                 recordedVideos: recordedVideos,
                 downloadedVideos: downloadedVideos,
                 otherVideoCount: otherVideoCount
-            )
-
-        case .largeFiles:
-            return LargeFilesPresentation.dashboardStatus(
-                phase: LargeFilesPresentation.phase(
-                    permission: permission,
-                    catalog: catalog,
-                    resolution: resolution,
-                    datasetSignature: videoSignature,
-                    settledRecords: videoRecords
-                )
             )
 
         case .duplicateContacts:

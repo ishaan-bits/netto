@@ -25,11 +25,10 @@ final class DashboardLayoutQATests: XCTestCase {
         "scanStatusCard"
     ]
 
-    // The five primary cleanup sections, in their fixed display order (a vertical list).
+    // The four primary cleanup sections, in their fixed display order (a vertical list).
     private let sectionIDs = [
         "imageCleanupSection",
         "videoCleanupSection",
-        "largeFilesSection",
         "duplicateContactsSection",
         "swipeCleanupSection"
     ]
@@ -38,7 +37,6 @@ final class DashboardLayoutQATests: XCTestCase {
         "cleanupSectionTitle",
         "imageCleanupSection",
         "videoCleanupSection",
-        "largeFilesSection",
         "duplicateContactsSection",
         "swipeCleanupSection"
     ]
@@ -72,7 +70,7 @@ final class DashboardLayoutQATests: XCTestCase {
         log += "ring → stats gap: \(value(gap: "storageRing", "storageStats")) pt\n"
         shot("01-top")
 
-        // Cleanup list: scroll the "Clean up" section into view, then measure it. The five
+        // Cleanup list: scroll the "Clean up" section into view, then measure it. The four
         // sections are a vertical list, so the contract is: no overlap, and each section
         // sits strictly below the previous one (fixed display order, top to bottom).
         scrollToGrid()

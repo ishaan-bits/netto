@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The two reusable building blocks of the M11 dashboard and its hub screens.
 ///
-/// `CleanupSectionCard` is one primary dashboard section (the five). `CleanupDestinationRow`
+/// `CleanupSectionCard` is one primary dashboard section (the four). `CleanupDestinationRow`
 /// is one destination inside a hub (Image Cleanup's four, Video Cleanup's two). Both are
 /// status-driven: they render whatever honest `CleanupDestinationStatus` the presentation
 /// layer computed, never a fabricated count.

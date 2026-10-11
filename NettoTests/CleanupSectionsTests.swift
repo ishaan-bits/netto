@@ -10,10 +10,9 @@ private func record(
     mediaType: PhotoMediaType = .image,
     subtypes: PhotoMediaSubtypes = [],
     creationDate: Date? = nil,
-    sourceType: PhotoSourceTypes = [.library],
-    sizeInBytes: Int64? = nil
+    sourceType: PhotoSourceTypes = [.library]
 ) -> PhotoAssetRecord {
-    var r = PhotoAssetRecord(
+    let r = PhotoAssetRecord(
         localIdentifier: id,
         mediaType: mediaType,
         mediaSubtypes: subtypes,
@@ -29,7 +28,6 @@ private func record(
         representsBurst: false,
         burstIdentifier: nil
     )
-    r.sizeInBytes = sizeInBytes
     return r
 }
 
@@ -177,55 +175,15 @@ struct OldScreenshotsTests {
     }
 }
 
-// MARK: - Large Files phase / sorting
-
-/// Large Files shares the videos pipeline's phase, so a disagreement here would be a
-/// disagreement between two screens showing the same measurement.
-struct LargeFilesTests {
-    @Test func permissionRequiredMapsToPermissionRequiredAndScanBlockedMapsToScanRequired() {
-        let notDetermined = LargeFilesPresentation.phase(
-            permission: .notDetermined, catalog: .notStarted, resolution: .idle, datasetSignature: "sig"
-        )
-        #expect(notDetermined == .permissionRequired)
-
-        let authorizedNotScanned = LargeFilesPresentation.phase(
-            permission: .authorized, catalog: .notStarted, resolution: .idle, datasetSignature: "sig"
-        )
-        #expect(authorizedNotScanned == .scanRequired)
-
-        let authorizedNotStarted = LargeFilesPresentation.phase(
-            permission: .authorized, catalog: .notStarted, resolution: .idle, datasetSignature: "sig"
-        )
-        #expect(authorizedNotStarted == .scanRequired)
-    }
-
-    @Test func sortedRecordsPlacesUnknownSizesAfterMeasuredOnesAndNeverAsZero() {
-        let big = record(id: "big", mediaType: .video, sizeInBytes: 5_000)
-        let small = record(id: "small", mediaType: .video, sizeInBytes: 100)
-        let unknown = record(id: "unknown", mediaType: .video, sizeInBytes: nil)
-
-        let sorted = LargeFilesPresentation.sortedRecords([unknown, small, big])
-
-        #expect(sorted.map(\.localIdentifier) == ["big", "small", "unknown"])
-    }
-
-    @Test func dashboardStatusSurfacesPermissionAndScanBlockersVerbatim() {
-        #expect(LargeFilesPresentation.dashboardStatus(phase: .permissionRequired)
-                == .unavailable(reason: "Allow Photos access to continue."))
-        #expect(LargeFilesPresentation.dashboardStatus(phase: .scanRequired)
-                == .unknownCount("Not scanned yet"))
-    }
-}
-
 // MARK: - Dashboard section status aggregation
 
 /// A section must never show a confident count while a harder blocker (permission, scan,
 /// failure) is what actually stands in the way.
 struct DashboardSectionsTests {
-    @Test func allFiveSectionsExistInOrder() {
-        #expect(DashboardCleanupSection.allCases.count == 5)
+    @Test func allFourSectionsExistInOrder() {
+        #expect(DashboardCleanupSection.allCases.count == 4)
         #expect(DashboardCleanupSection.allCases.map(\.self) == [
-            .imageCleanup, .videoCleanup, .largeFiles, .duplicateContacts, .swipeCleanup
+            .imageCleanup, .videoCleanup, .duplicateContacts, .swipeCleanup
         ])
     }
 

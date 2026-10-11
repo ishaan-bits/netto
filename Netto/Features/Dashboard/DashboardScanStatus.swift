@@ -21,18 +21,14 @@ struct DashboardScanStatusCard: View {
     /// authorized library has no Settings action to offer.
     var isLimitedAccess: Bool = false
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Drives the indicator's breathing while a scan runs. It is always the *same* indicator
-    /// and the same colour — only its emphasis moves, and only for as long as the scan does.
-    @State private var pulsing = false
-
     private var copy: DashboardPresentation.ScanCopy {
         DashboardPresentation.scanCopy(for: status, limitedAccess: isLimitedAccess)
     }
 
-    private var isScanning: Bool {
-        if case .scanning = status { return true }
-        return false
+    /// The scan core's phase, derived once from the real status so the animation and the copy
+    /// can never disagree about what the app is actually doing.
+    private var corePhase: ScanCorePresentation.Phase {
+        ScanCorePresentation.phase(for: status)
     }
 
     var body: some View {
@@ -57,24 +53,14 @@ struct DashboardScanStatusCard: View {
         .nettoLayeredSurface(.panel, cornerRadius: NettoLayout.Radius.card)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("scanStatusCard")
-        .onAppear { syncPulse() }
-        .onChange(of: status) { _, _ in syncPulse() }
-        .onChange(of: reduceMotion) { _, _ in syncPulse() }
-    }
-
-    /// The pulse runs only while a scan is running and only when Reduce Motion is off; when
-    /// either ends, the indicator settles back at full strength instead of being left dim.
-    private func syncPulse() {
-        let shouldPulse = isScanning && !reduceMotion
-        guard shouldPulse != pulsing else { return }
-        pulsing = shouldPulse
     }
 
     private var header: some View {
         HStack(alignment: .top, spacing: NettoLayout.Spacing.md) {
-            ScanIndicator(icon: copy.icon, tint: toneColor)
-                .opacity(pulsing ? 0.5 : 1)
-                .animation(indicatorAnimation, value: pulsing)
+            // The scan core: luminous centre, concentric rings, and a slow sweep — it animates
+            // only while a run is in flight and settles the moment that ends (see
+            // `ScanCoreView`). Under Reduce Motion it is a static mark.
+            ScanCoreView(phase: corePhase, tint: toneColor)
 
             VStack(alignment: .leading, spacing: NettoLayout.Spacing.xs) {
                 Text(copy.title)
@@ -90,15 +76,6 @@ struct DashboardScanStatusCard: View {
             Spacer(minLength: 0)
         }
         .accessibilityElement(children: .combine)
-    }
-
-    /// Breathing while a scan runs; a short settle when it stops; nothing at all under
-    /// Reduce Motion (the value simply never changes).
-    private var indicatorAnimation: Animation? {
-        guard isScanning, !reduceMotion else {
-            return NettoMotion.animation(for: .quick, reduceMotion: reduceMotion)
-        }
-        return .easeInOut(duration: 1.15).repeatForever(autoreverses: true)
     }
 
     /// Determinate when the stage reports a real fraction; indeterminate otherwise — a bar
@@ -221,42 +198,6 @@ struct DashboardScanStatusCard: View {
         case .muted:
             return NettoColor.textTertiary
         }
-    }
-}
-
-/// The scan card's indicator: one rounded tile carrying the state's own icon in the state's
-/// own tone. Shared surfaces keep their circular bubble — this is the dashboard's own.
-private struct ScanIndicator: View {
-    let icon: String
-    let tint: Color
-
-    private var cornerRadius: CGFloat { NettoLayout.Radius.button }
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [tint.opacity(0.24), tint.opacity(0.10)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [tint.opacity(0.45), tint.opacity(0.10)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                }
-            NettoIcon(name: icon, size: NettoIconSize.feature, weight: .semibold, tint: tint)
-        }
-        .frame(width: 44, height: 44)
-        .accessibilityHidden(true)
     }
 }
 

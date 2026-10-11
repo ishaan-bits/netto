@@ -7,16 +7,21 @@ is no backend, no cloud processing, and no third-party analytics.
 
 ## Core features
 
-- **Storage dashboard** — storage and permission status up front, then five primary
-  cleanup sections (**Image Cleanup**, **Video Cleanup**, **Large Files**,
-  **Duplicate Contacts**, **Swipe Cleanup**), each with live scan progress and a status
-  line derived from real app state. Image Cleanup groups the four photo destinations
-  (duplicates, similar shots, blurry, old screenshots) behind one row; Old Screenshots
-  lists screenshots at least **90 days** old (oldest first, unknown dates never counted
-  as old). Video Cleanup splits the library into **Recorded**, **Downloaded**, and a
-  reported **other/unknown** count that is never guessed into a source. Large Files
-  shows the biggest measured assets, largest first, never ranking an unknown size as
-  zero.
+- **Storage dashboard** — storage and permission status up front, then four primary
+  cleanup sections (**Image Cleanup**, **Video Cleanup**, **Duplicate Contacts**,
+  **Swipe Cleanup**), each with live scan progress and a status line derived from real
+  app state. Image Cleanup groups the four photo destinations (duplicates, similar
+  shots, blurry, old screenshots) behind one row; Old Screenshots lists screenshots at
+  least **90 days** old (oldest first, unknown dates never counted as old). Video
+  Cleanup splits the library into **Recorded**, **Downloaded**, and a reported
+  **other/unknown** count that is never guessed into a source, with the biggest measured
+  videos reviewed first.
+- **Premium scan animation** — the dashboard's scan core is a native SwiftUI visual: a
+  luminous green centre, concentric rings, and a slow sweep that runs **only** while a
+  scan is actually in flight and settles the moment it is paused, cancelled, failed, or
+  finished. It shows the stage's **real** fraction (or no ring at all when a stage
+  reports no denominator), respects Reduce Motion, and never invents a percentage, stage,
+  or completion.
 - **Similar / duplicate photo detection** — exact duplicates and near-duplicate shots
   found through content fingerprints, perceptual hashes, and Vision features, presented
   as reviewable groups.
@@ -395,12 +400,15 @@ watchdog.
   declare the store's exact App Group, so provisioning drift fails the suite instead
   of the home screen.
 
-### Dashboard IA: five primary sections (M11)
+### Dashboard IA: four primary sections (M11, trimmed in M12)
 
 The dashboard previously showed a flat grid of cards, one per destination. It is now
-organised around the five things a person actually does — Image Cleanup, Video
-Cleanup, Large Files, Duplicate Contacts, Swipe Cleanup — with the photo destinations
-grouped behind the Image Cleanup row.
+organised around the things a person actually does — Image Cleanup, Video Cleanup,
+Duplicate Contacts, Swipe Cleanup — with the photo destinations grouped behind the
+Image Cleanup row and the biggest measured videos surfaced inside Video Cleanup. (A
+fifth "Large Files" section shipped briefly in M11 and was removed in M12; its honest
+size-measurement behaviour now lives entirely in Video Cleanup, which shares the same
+measurement pipeline.)
 
 - **Every status is derived, never stored** — `DashboardCleanupPresentation.status(for:)`
   is the single pure mapping from app state (permission, catalog, analysis, blur,
@@ -416,12 +424,39 @@ grouped behind the Image Cleanup row.
 - **Video sources are classified, not guessed** — `VideoSourceClassification` maps each
   video's PhotoKit source evidence to Recorded, Downloaded, or other/unknown; the
   other/unknown bucket is surfaced as its own count rather than folded into a guess.
-  Large Files shows measured sizes largest-first and never ranks an unknown size as
-  zero (measurement state is shared with the video inventory, keyed to the catalog
-  generation so a rebuild invalidates it).
-- **No analysis starts on open** — the new sections and hubs read existing state only;
+  Video Cleanup orders the biggest measured videos first and never ranks an unknown
+  size as zero (measurement state is shared with the video inventory, keyed to the
+  catalog generation so a rebuild invalidates it).
+- **No analysis starts on open** — the sections and hubs read existing state only;
   requesting a pass is still an explicit user action through the M10 coordinator, whose
   one-slot queue, checkpoint safety, and deletion-confirmation contract are unchanged.
+
+### Premium scan animation (M12)
+
+The dashboard's scan card grew a proper scan core in native SwiftUI — a luminous green
+centre, concentric rings, and a slow sweep — replacing the previous pulsing icon tile.
+The animation is a pure function of real state, so it cannot out-say the app.
+
+- **`ScanCorePresentation` decides, `ScanCoreView` draws** — `phase(for:)` is a single
+  pure, tested mapping from `DashboardPresentation.ScanStatus` to a small phase set
+  (resting / running / paused / finished / cancelled / failed). The view renders that
+  phase and nothing more, so the animation and the copy can never disagree about what
+  the app is doing.
+- **Real progress only** — the sweep turns **only** while a run is in flight; a paused,
+  terminal, or resting core is still. The progress ring shows the stage's **real**
+  fraction and is simply absent when a stage reports no denominator (catalog
+  enumeration, measuring) — never a fabricated ring at a made-up position.
+- **Every scan state is covered** — idle/ready, starting + catalog enumeration,
+  active analysis with real progress, finishing, paused/queued, cancellation, failure,
+  and successful completion all map to a distinct, honest visual.
+- **Reduce Motion and lifecycle respected** — under Reduce Motion the sweep never spins
+  and the rings never pulse (a static, legible mark instead). The repeating animation is
+  gated on the scene being active and is stopped on disappear, so nothing outlives the
+  card. No timers, no per-asset animation tasks, and nothing is published into app-wide
+  state — only local `@State` driving the existing `NettoMotion` curves.
+- **Nothing was measured on a physical iPhone** — the animation's frame rate, battery,
+  and thermal behaviour were not profiled on device; validation is Simulator and code
+  inspection only.
 
 ## Privacy
 
@@ -486,7 +521,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 805 Swift Testing cases across 79 suites covering the pure
+- **Unit suite** — 49 files, 838 Swift Testing cases across 83 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -568,17 +603,26 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M12)** — after removing Large Files and adding the scan-core
+  animation, a full-suite run reported **838 tests in 83 suites, 0 failures** (the
+  pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged),
+  plus one clean build of the app with no warnings and all 5 UI cases passing (dashboard
+  layout QA and the end-to-end scan reaching a terminal state). Large Files' section,
+  view, and its 3 phase/sorting unit cases were removed (Video Cleanup keeps the shared
+  size-measurement pipeline untouched); 10 new unit cases (`ScanCorePresentationTests`)
+  pin the scan core's state→visual mapping — resting/paused/terminal cores never sweep,
+  an indeterminate stage draws no progress ring, a measured fraction is passed through
+  (and clamped) exactly, and only an in-flight run ever moves.
 - **Recent verification (M11)** — after the dashboard-IA restructuring, a full-suite
   run reported **836 tests: 835 passed, 0 failed, 1 skipped** (the skip is the
   pre-existing `cancellationPropagatesOutOfTheLoader` suite-context quirk, unchanged),
   plus one clean build of the app with no warnings. The 26 new unit cases
-  (`CleanupSectionsTests`) pin the five-section contract (all five present, in order),
-  the worst-blocker ranking, the Old Screenshots rule (90-day default, oldest-first,
-  unknown-date never old, custom threshold), the Large Files phase/sorting honesty
-  (unknown sizes last, never zero), and the video-source classification (never a
-  guess); the 5 UI cases were updated to the new section identifiers and assert the
-  five sections in fixed vertical order with no overlap, plus the end-to-end scan
-  reaching the Image Cleanup destinations.
+  (`CleanupSectionsTests`) pin the section contract (all present, in order), the
+  worst-blocker ranking, the Old Screenshots rule (90-day default, oldest-first,
+  unknown-date never old, custom threshold), and the video-source classification (never
+  a guess); the 5 UI cases were updated to the new section identifiers and assert the
+  sections in fixed vertical order with no overlap, plus the end-to-end scan reaching
+  the Image Cleanup destinations.
 - **Recent verification (M10)** — after the coordination + widget work, a full-suite
   run reported **"805 tests in 79 suites passed"** (14 new: the queue's start-once /
   cancel / failure / replace / paused / deletion contracts in both directions, the
