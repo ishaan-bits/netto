@@ -710,7 +710,9 @@ enum DashboardCleanupPresentation {
             return .failed(message)
         case .empty:
             return .empty("No videos found")
-        case .measuringVideos(let measured, let total, let unavailable):
+        case .measuringVideos:
+            // The associated counts are re-derived by statusText from the same inputs,
+            // so they are unused here; matching without binding keeps it warning-free.
             return .measurement(
                 VideosPresentation.statusText(
                     permission: permission,
