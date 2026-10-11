@@ -20,7 +20,8 @@ struct SimilarPhotosView: View {
         SimilarPhotosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            analysis: env.analysisState
+            analysis: env.analysisState,
+            pendingBehindOtherPass: env.pendingAnalysisRequest == .similarity
         )
     }
 
@@ -90,6 +91,20 @@ struct SimilarPhotosView: View {
             // The run was interrupted (backgrounding, termination, lock) and saved its
             // checkpoint; resume continues it from the saved stage — never a fresh start.
             pausedState(stage: stage, fraction: fraction)
+
+        case .queuedBehindBlur:
+            // The tap was never dropped (M10): the run is in the coordinator's queue and
+            // starts automatically. Start Now is the explicit cancel-and-switch; Remove
+            // clears the queue and leaves the running sharpness pass untouched.
+            PhaseMessage(
+                systemImage: "hourglass",
+                title: "Sharpness check running",
+                message: "Your Similar Photos analysis is queued. It starts automatically when the sharpness check finishes — nothing is deleted during either check.",
+                buttonTitle: "Start Now (Cancels Sharpness Check)",
+                buttonAction: { env.startPendingAnalysisNow() },
+                secondaryButtonTitle: "Remove from Queue",
+                secondaryButtonAction: { env.cancelPendingAnalysis() }
+            )
 
         case .cancelled:
             PhaseMessage(
@@ -405,6 +420,7 @@ struct SimilarPhotosView: View {
         case .permissionRequired: return "permissionRequired"
         case .permissionDenied: return "permissionDenied"
         case .idle: return "idle"
+        case .queuedBehindBlur: return "queuedBehindBlur"
         case .buildingCatalog: return "buildingCatalog"
         case .analyzing: return "analyzing"
         case .paused: return "paused"
@@ -437,6 +453,10 @@ struct PhaseMessage: View {
     let message: String
     var buttonTitle: String?
     var buttonAction: () -> Void = {}
+    /// Optional second action under the primary button — coordination states only
+    /// ("Remove from Queue" under "Start Now"); single-action phases leave it nil.
+    var secondaryButtonTitle: String?
+    var secondaryButtonAction: () -> Void = {}
 
     private var isPositive: Bool {
         systemImage.hasPrefix("checkmark") || systemImage.hasPrefix("person.crop.circle.badge")
@@ -472,6 +492,12 @@ struct PhaseMessage: View {
             if let buttonTitle {
                 Button(buttonTitle, action: buttonAction)
                     .buttonStyle(NettoPrimaryButtonStyle())
+                    .padding(.horizontal, NettoLayout.Spacing.xl)
+            }
+
+            if let secondaryButtonTitle {
+                Button(secondaryButtonTitle, action: secondaryButtonAction)
+                    .buttonStyle(NettoSecondaryButtonStyle())
                     .padding(.horizontal, NettoLayout.Spacing.xl)
             }
 

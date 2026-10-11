@@ -115,23 +115,28 @@ struct NettoWidgetProvider: TimelineProvider {
     /// races a watchdog: whichever settles first delivers exactly once, and a hung read
     /// falls back to the empty-state entry — branded content the system can always
     /// render — instead of the blank skeleton WidgetKit shows when a completion never
-    /// arrives. Each outcome is logged by category (never content) so a physical-device
-    /// blank widget can be diagnosed from `log stream`.
+    /// arrives. Both racers are *detached* (M10): neither may inherit whatever actor
+    /// context WidgetKit invoked the provider on, so a blocked caller actor can never
+    /// starve the watchdog into silence — that coupling was the one way the M8 design
+    /// could still end with no completion and a blank skeleton. Each outcome is logged
+    /// by category (never content) so a physical-device blank widget can be diagnosed
+    /// from `log stream`.
     func loadEntry(
         now: Date = Date(),
         completion: @escaping @Sendable (NettoWidgetEntry) -> Void
     ) {
         let store = self.store
+        let timeoutNanos = loadTimeoutNanos
         let gate = EntryDeliveryGate()
-        Task {
+        Task.detached(priority: .utility) {
             let summary = await store.load()
             guard gate.deliver() else { return }
             Logger.widget.info("entry delivered status=\(summary?.status.rawValue ?? "none", privacy: .public)")
             completion(Self.entry(for: summary, now: now))
         }
-        Task {
+        Task.detached(priority: .userInitiated) {
             do {
-                try await Task.sleep(nanoseconds: loadTimeoutNanos)
+                try await Task.sleep(nanoseconds: timeoutNanos)
             } catch {
                 return // watchdog cancelled by process teardown — nothing to deliver
             }

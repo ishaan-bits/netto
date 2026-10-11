@@ -120,6 +120,59 @@ struct SimilarPhotosPresentationTests {
             == "Every item was the only candidate in its group, so there is nothing marked for cleanup.")
     }
 
+    // MARK: - Queue acknowledgement (M10)
+
+    /// A queued request is reported as queued — never folded back into idle, results, or
+    /// any other resting state the tap came from.
+    @Test func thePhaseReportsQueuedWhileAnotherPassOwnsThePipeline() {
+        let completedCatalog = CatalogScanResult(records: [], libraryAssetCount: 0, accessLevel: .authorized)
+        let resting: [PhotoAnalysisState] = [
+            .notStarted,
+            .completed(fixture),
+            .cancelled,
+        ]
+        for analysis in resting {
+            #expect(
+                SimilarPhotosPresentation.phase(
+                    permission: .authorized,
+                    catalog: .completed(completedCatalog),
+                    analysis: analysis,
+                    pendingBehindOtherPass: true
+                ) == .queuedBehindBlur
+            )
+            // Without the queue flag the same inputs map to their ordinary phase — the
+            // queued case is exactly the flag, nothing else.
+            #expect(
+                SimilarPhotosPresentation.phase(
+                    permission: .authorized,
+                    catalog: .completed(completedCatalog),
+                    analysis: analysis,
+                    pendingBehindOtherPass: false
+                ) != .queuedBehindBlur
+            )
+        }
+        // A running pass still wins: the queue only appears once the pipeline is free
+        // enough to acknowledge the waiting request.
+        #expect(
+            SimilarPhotosPresentation.phase(
+                permission: .authorized,
+                catalog: .completed(completedCatalog),
+                analysis: .running(PhotoAnalysisProgress(stage: .comparing, completedUnits: 1, totalUnits: 4)),
+                pendingBehindOtherPass: true
+            ) == .analyzing(PhotoAnalysisProgress(stage: .comparing, completedUnits: 1, totalUnits: 4))
+        )
+        // Permission still gates everything — a queued request off a revoked grant must
+        // not render a coordination state.
+        #expect(
+            SimilarPhotosPresentation.phase(
+                permission: .denied,
+                catalog: .completed(completedCatalog),
+                analysis: .notStarted,
+                pendingBehindOtherPass: true
+            ) == .permissionDenied
+        )
+    }
+
     @Test func permissionGatesEvenAFinishedResult() {
         let completed = PhotoAnalysisState.completed(fixture)
 

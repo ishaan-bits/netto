@@ -82,6 +82,14 @@ final class SystemBackgroundTaskScheduler: BackgroundTaskScheduling {
     }
 }
 
+/// The heavy pass a queued request will start — the coordinator's one-slot queue (M10).
+/// Same-request taps are no-ops; a different request replaces the slot, so the latest
+/// user intent is what runs next.
+enum PendingAnalysisRequest: Equatable, Sendable {
+    case similarity
+    case blur
+}
+
 /// `@Observable` rather than `ObservableObject`: every view tracks only the properties it
 /// actually reads, so a selection toggle no longer invalidates the dashboard (and a progress
 /// tick no longer re-renders screens that never read progress).
@@ -124,7 +132,16 @@ final class AppEnvironment {
             videoSignatureGeneration &+= 1
         }
     }
-    var analysisState: PhotoAnalysisState = .notStarted
+    var analysisState: PhotoAnalysisState = .notStarted {
+        didSet {
+            // A running pass releasing the pipeline (completion, failure, or cancel) is
+            // exactly when a queued pass may start (M10). Paused is not running but still
+            // owns the slot — `drivePendingAnalysis` refuses while a pause stands.
+            if oldValue.isRunning, !analysisState.isRunning {
+                drivePendingAnalysis()
+            }
+        }
+    }
     /// When the current completed result reached its terminal state — from the restored
     /// snapshot on launch, or `Date()` on a fresh completion. `nil` before any scan has
     /// completed; drives the dashboard's dynamic "Last scanned …" text.
@@ -138,7 +155,14 @@ final class AppEnvironment {
     /// unlike the similarity snapshot it is never persisted, so a verdict can never
     /// outlive the catalog it was computed over.
     var blurAnalysisState: BlurAnalysisState = .notStarted {
-        didSet { blurDatasetGeneration &+= 1 }
+        didSet {
+            blurDatasetGeneration &+= 1
+            // Same coordination hook as `analysisState` (M10): a terminal flip may hand
+            // the pipeline to the queued pass.
+            if oldValue.isRunning, !blurAnalysisState.isRunning {
+                drivePendingAnalysis()
+            }
+        }
     }
     /// Injected clock stamped into a completed result's `scannedAt`. Production uses the
     /// default (`Date()`); tests pin it so a completed run is exactly reproducible.
@@ -152,7 +176,21 @@ final class AppEnvironment {
     /// (they resolve sizes only at review time), so the largest-first ordering can be honest.
     var videoSizeResolution: VideoSizeResolution = .idle
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
-    var deletionState: DeletionState = .noSelection
+    var deletionState: DeletionState = .noSelection {
+        didSet {
+            // A deletion leaving `.deleting` releases the pipeline the mutation owned;
+            // a pass queued during the mutation starts now (M10). Entering `.deleting`
+            // never drives — `drivePendingAnalysis` refuses while a deletion is in flight.
+            if oldValue.isDeleting, !deletionState.isDeleting {
+                drivePendingAnalysis()
+            }
+        }
+    }
+    /// The one queued heavy-analysis request — the coordinator's single queue slot (M10).
+    /// Set when the user asks for the pass that is not currently running; cleared when
+    /// that pass starts, when the queue is removed, or when an explicit cancel-and-switch
+    /// claims it. In-memory only: an app kill drops the queue with the unstarted request.
+    private(set) var pendingAnalysisRequest: PendingAnalysisRequest?
     /// The space-freed summary for a completed deletion — set exactly once per outcome, in
     /// `handleDeletionOutcome`, together with `flowState == .deletionCompleted`, and only
     /// when at least one item was verified removed. Cleared the moment that result is
@@ -840,6 +878,52 @@ final class AppEnvironment {
         catalogGeneration == generation
     }
 
+    // MARK: - Analysis coordination (M10)
+
+    /// Starts the queued pass, if any, now that the pipeline is free. Called only from
+    /// terminal transitions — completion, failure, or cancel of a heavy pass (the `didSet`
+    /// observers on `analysisState` / `blurAnalysisState`), or a deletion leaving
+    /// `.deleting` — never while a pause still owns the pipeline: a paused run resumes
+    /// itself and keeps the queue waiting.
+    private func drivePendingAnalysis() {
+        guard let request = pendingAnalysisRequest else { return }
+        // A paused pass still owns the slot (it will resume itself); handing the pipeline
+        // over now would run two passes the moment the app returns to the foreground.
+        if case .paused = analysisState { return }
+        if case .paused = blurAnalysisState { return }
+        guard !analysisState.isRunning, !blurAnalysisState.isRunning else { return }
+        // A deletion in flight keeps the queue; the flip out of `.deleting` drives again
+        // (see `deletionState`'s observer).
+        guard !deletionState.isDeleting else { return }
+        pendingAnalysisRequest = nil
+        switch request {
+        case .similarity: startSimilarityAnalysis()
+        case .blur: startBlurAnalysis()
+        }
+    }
+
+    /// Removes the queued request without touching the running pass. Idempotent.
+    func cancelPendingAnalysis() {
+        pendingAnalysisRequest = nil
+    }
+
+    /// Explicit cancel-and-switch: the running pass is cancelled through its normal
+    /// generation-guarded path and the queued pass starts immediately, without waiting for
+    /// any other transition. The queue slot is claimed first so the cancel's own terminal
+    /// flip cannot also drive it (exactly-once).
+    func startPendingAnalysisNow() {
+        guard let request = pendingAnalysisRequest else { return }
+        pendingAnalysisRequest = nil
+        switch request {
+        case .similarity:
+            cancelBlurAnalysis()
+            startSimilarityAnalysis()
+        case .blur:
+            cancelSimilarityAnalysis()
+            startBlurAnalysis()
+        }
+    }
+
     // MARK: - Similarity analysis
 
     /// Runs the full review pipeline: metadata catalog read, then similarity analysis over it.
@@ -858,13 +942,18 @@ final class AppEnvironment {
     /// checkpoints deliberately never do.
     func startSimilarityAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !analysisState.isRunning else { return }
-        // Stage A below rebuilds the catalog, and a sharpness pass owns a snapshot of the
-        // records it was started with — a rebuild landing mid-run would hand its results a
-        // catalog that no longer matches (the same reason startCatalogBuild refuses). All
-        // three requests are explicit user actions, so dropping this one is honest.
-        guard !blurAnalysisState.isRunning else { return }
+        // The sharpness pass owns the pipeline (each pass snapshots the catalog it started
+        // with, and both contend for the same thumbnail pipeline and cores). Queue the
+        // request — visible on the Similar Photos screen, started automatically when the
+        // pass releases the pipeline — never a silent drop (M10).
+        if blurAnalysisState.isRunning {
+            pendingAnalysisRequest = .similarity
+            return
+        }
         // Never rebuild datasets underneath an in-flight Photos mutation.
         guard !deletionState.isDeleting else { return }
+        // The request is admitted past the coordination guards; any queue entry is spent.
+        pendingAnalysisRequest = nil
         guard photoPermissionState.isUsable else {
             analysisState = .failed(.underlying("Photos access is required to read your library."))
             return
@@ -1034,11 +1123,12 @@ final class AppEnvironment {
                         self.applyAnalysisProgress(progress)
                     case .completed(let result):
                         sawCompletion = true
+                        // The slot is released *before* the terminal state write: the
+                        // flip may hand the pipeline to a queued pass (M10), which must
+                        // find the checkpoint free.
+                        self.finishCheckpointRun(kind: .similarity)
                         self.selection = PhotoSelectionModel(result: result)
                         self.analysisState = .completed(result)
-                        // The run finished: its checkpoint has served its purpose —
-                        // completion clears (kind-aware, blocking this run's stragglers).
-                        self.finishCheckpointRun(kind: .similarity)
                         let completedAt = await self.persistCompletedScan(result)
                         await self.writeWidgetSummaryAfterScanCompleted(at: completedAt)
                     }
@@ -1070,12 +1160,14 @@ final class AppEnvironment {
         analysisGeneration += 1
         analysisTask?.cancel()
         analysisTask = nil
+        // The checkpoint is abandoned before the state flip: cancelling a running pass is
+        // a terminal transition, and the flip may drive a queued pass (M10) that claims
+        // the slot. State and file stay consistent either way (nothing paused, nothing
+        // to resume).
+        discardInterruptedCheckpoint()
         if analysisState.isRunning {
             analysisState = .cancelled
         }
-        // An explicit cancel abandons resumable work too: state and file stay consistent
-        // (nothing paused, nothing to resume).
-        discardInterruptedCheckpoint()
         syncBackgroundTask()
     }
 
@@ -1144,15 +1236,16 @@ final class AppEnvironment {
 
     private func finishAnalysis(_ generation: Int, as state: PhotoAnalysisState) {
         guard isCurrentAnalysis(generation) else { return }
-        analysisState = state
-        // A run that did not finish leaves nothing worth resuming from *this* attempt:
-        // cancelled and failed runs release their checkpoint (a paused run never reaches
-        // here — pausing bumped the generation, so this write would be staled anyway).
+        // Release the checkpoint slot before the terminal write (M10 — same order as the
+        // sharpness pass): the flip may drive a queued pass that claims the slot. A
+        // paused run never reaches here (pausing bumped the generation, so this write
+        // would be staled anyway).
         if case .cancelled = state {
             finishCheckpointRun(kind: .similarity)
         } else if case .failed = state {
             finishCheckpointRun(kind: .similarity)
         }
+        analysisState = state
         syncBackgroundTask()
     }
 
@@ -1185,11 +1278,17 @@ final class AppEnvironment {
     /// continues.
     func startBlurAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !blurAnalysisState.isRunning else { return }
-        // Symmetric admission: the similarity pass owns the analysis machinery while it
-        // runs — refused, not queued (an explicit user action; they can retry).
-        guard !analysisState.isRunning else { return }
+        // Symmetric admission (M10): the similarity pass owns the analysis machinery while
+        // it runs. Queue the request — visible on the Potentially Blurry screen, started
+        // automatically when the run releases the pipeline — never a silent drop.
+        if analysisState.isRunning {
+            pendingAnalysisRequest = .blur
+            return
+        }
         // Never rebuild datasets underneath an in-flight Photos mutation.
         guard !deletionState.isDeleting else { return }
+        // The request is admitted past the coordination guards; any queue entry is spent.
+        pendingAnalysisRequest = nil
         guard photoPermissionState.isUsable else {
             blurAnalysisState = .failed(.underlying("Photos access is required to read your library."))
             return
@@ -1292,10 +1391,11 @@ final class AppEnvironment {
                         )
                     case .completed(let result):
                         sawCompletion = true
-                        self.blurAnalysisState = .completed(result)
-                        // Finished: its checkpoint is released (kind-aware — it could
-                        // never have held another pass's file, and now it holds nothing).
+                        // The slot is released *before* the terminal state write: the
+                        // flip may hand the pipeline to a queued pass (M10), which must
+                        // find the checkpoint free.
                         self.finishCheckpointRun(kind: .blur)
+                        self.blurAnalysisState = .completed(result)
                         // Admission only: candidates become markable, nothing is marked.
                         self.synchronizeBlurDataset()
                     }
@@ -1327,11 +1427,13 @@ final class AppEnvironment {
         blurAnalysisGeneration += 1
         blurAnalysisTask?.cancel()
         blurAnalysisTask = nil
+        // The checkpoint is abandoned before the state flip: cancelling a running pass is
+        // a terminal transition, and the flip may drive a queued pass (M10) that claims
+        // the slot.
+        discardInterruptedCheckpoint()
         if blurAnalysisState.isRunning {
             blurAnalysisState = .cancelled
         }
-        // An explicit cancel abandons resumable work too (same rule as the similarity pass).
-        discardInterruptedCheckpoint()
         syncBackgroundTask()
     }
 
@@ -1341,15 +1443,16 @@ final class AppEnvironment {
 
     private func finishBlurAnalysis(_ generation: Int, as state: BlurAnalysisState) {
         guard isCurrentBlurAnalysis(generation) else { return }
-        blurAnalysisState = state
-        // Cancelled and failed passes release their checkpoint exactly like the
-        // similarity pass does; a paused pass never reaches here (its generation was
-        // bumped at pause, so this write would be staled).
+        // Release the checkpoint slot before the terminal write: flipping the state may
+        // drive a queued pass into `beginCheckpointRun` (M10), which must find the slot
+        // free. A paused pass never reaches here (its generation was bumped at pause, so
+        // this write would be staled anyway).
         if case .cancelled = state {
             finishCheckpointRun(kind: .blur)
         } else if case .failed = state {
             finishCheckpointRun(kind: .blur)
         }
+        blurAnalysisState = state
         syncBackgroundTask()
     }
 

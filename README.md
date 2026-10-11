@@ -341,6 +341,52 @@ never left "0 of N". Even when the callback arrived, it was slow enough that a
   publishes its state at most ~4×/second (the settled state always publishes), so a
   fast pass over thousands of cloud-only videos cannot storm the main actor.
 
+### Analysis coordination & widget delivery (M10)
+
+Two failures from a fresh iPhone 17 Pro recording: the Similar Photos screen's
+"Analyze Photo Library" button did nothing while a sharpness pass was running (2 731 /
+33 949 photos in), and the home-screen widget stayed a blank skeleton despite M8's
+watchdog.
+
+- **One coordinator, never a silent drop (Part A)** — `AppEnvironment` now owns a
+  one-slot queue (`pendingAnalysisRequest`). Requesting the pass that is not currently
+  running no longer returns silently: the request is queued, the requesting screen
+  (Similar Photos, Potentially Blurry, and the dashboard's Similar Photos card) shows
+  an explicit "queued" state with two actions — **Start Now (cancels the running pass)**
+  and **Remove from Queue** — and the queued pass starts itself automatically when the
+  running pass reaches a terminal state (completion, failure, or cancel) or when a
+  deletion leaves `.deleting`. Same-request taps are no-ops; a different request
+  replaces the slot (latest intent wins). A paused pass still owns the pipeline — the
+  queue waits for its own resume-and-finish rather than racing a foreground resume.
+  Checkpoint safety: every terminal write now releases its checkpoint slot *before*
+  the state flip that may drive the queue, so the queued pass's `beginCheckpointRun`
+  always finds the slot free; the generation guards make a superseded run's late write
+  both state- and queue-safe (the queue is spent exactly once).
+- **Blur responsiveness (Part A)** — the sharpness engine already runs a bounded,
+  thermal-scaled worker pool (`ScanConcurrencyPolicy`, M4B) with 250 ms progress
+  coalescing; the device symptom was the silent-ignore above, not an unbounded scan, so
+  the engine is unchanged. PhotoKit callbacks stay off the main queue (M8) and the
+  coordinator keeps exactly one heavy pass on the cores at a time.
+- **Widget delivery (Part B)** — the data path was re-traced end to end: matching App
+  Group entitlements on both targets, a correctly embedded extension, a writer on
+  scan/cleanup/launch-repair, and a provider that renders designed branded content for
+  *every* load outcome (missing, corrupt, unsupported schema, hung read via the
+  watchdog) within a 2 s bound. A *persistent blank skeleton* therefore means the
+  extension never delivered any entry at all — which the repo alone cannot prove or
+  fix further; the remaining suspects (extension process crash at launch, system-side
+  budget/redaction, a stale pre-M8 widget configuration) need the device's Console
+  logs (capture steps under Known limitations). What could be hardened in code, was:
+  the store's file I/O now runs on a detached utility task and the provider's
+  load/watchdog racers are both `Task.detached`, so neither can inherit — and be
+  starved by — whatever actor context WidgetKit invokes the provider on. That actor
+  coupling was the one remaining way the M8 design could still end with no completion
+  and a blank skeleton.
+- **Fallbacks pinned by tests** — the empty-state copy ("No estimate yet" / "Open
+  Netto and scan your library to see cleanup estimates.") is asserted across all four
+  unusable-store outcomes, and a source-tree test asserts both entitlement files
+  declare the store's exact App Group, so provisioning drift fails the suite instead
+  of the home screen.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -404,7 +450,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 791 Swift Testing cases across 79 suites covering the pure
+- **Unit suite** — 46 files, 805 Swift Testing cases across 79 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -486,6 +532,14 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M10)** — after the coordination + widget work, a full-suite
+  run reported **"805 tests in 79 suites passed"** (14 new: the queue's start-once /
+  cancel / failure / replace / paused / deletion contracts in both directions, the
+  queued phase mappings, the designed widget fallback copy across every unusable store
+  outcome, and the two-target App Group assertion), plus one clean build of the app,
+  widget extension, and test target with no warnings. The two admission tests that
+  previously pinned the silent-refusal rule were rewritten to pin the queue rule
+  (same no-clobber guarantees, plus the acknowledged queue).
 - **Recent verification (M9)** — focused video suites after the large-videos fix:
   `VideoDatasetTests`, `VideosFlowTests`, `VideoCheckpointFlowTests`, and the new
   `VideoSizeDeadlineTests` — **80 tests across 4 suites green** (11 new: inventory
@@ -596,6 +650,18 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   measured. Cloud-only videos are reported with their sizes unavailable (never zero,
   never downloaded); the only way to rank them largest-first is to download them in
   Photos first and re-measure — Netto never initiates that download.
+- **Home-screen widget can still show a blank skeleton on device (M10, unresolved
+  without logs)** — the repo-side data path is complete and every store outcome renders
+  designed branded content within a 2 s watchdog bound (unit-tested, and both racers are
+  now detached from any caller actor). A *persistent* skeleton therefore means the
+  extension never delivered an entry at all, which is one of: the extension process
+  crashing at launch, a system-side refresh budget/redaction, or a stale widget
+  configuration placed before M8. Distinguishing them needs the device's Console:
+  `log stream --predicate 'subsystem == "com.ishaanparimal.netto"'` (category `widget`
+  shows summary load/save/deliver/timeout lines; a `NettoWidget` crash report in
+  Settings → Privacy & Security → Analytics → Crash Logs would confirm the first
+  suspect). Removing and re-adding the widget from the gallery after a fresh install is
+  also worth doing to rule out the stale-configuration suspect.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the

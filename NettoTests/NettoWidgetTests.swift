@@ -104,8 +104,80 @@ struct NettoWidgetProviderTests {
         // is the branded empty state, and it arrived promptly.
         #expect(entry.model == WidgetSummaryPresentation.model(for: nil, now: entry.date))
         #expect(entry.model.figure == .none)
+        // The fallback is designed content, not an empty box (M10): the exact copy the
+        // empty state ships, with no manufactured digit anywhere.
+        #expect(entry.model.headline == "No estimate yet")
+        #expect(entry.model.detail == "Open Netto and scan your library to see cleanup estimates.")
+        #expect(!containsAnyDigit(entry.model.headline))
+        #expect(!containsAnyDigit(entry.model.detail))
         let elapsed = ContinuousClock.now - started
         #expect(elapsed < .seconds(2), "watchdog took \(elapsed) — far past its 50 ms budget")
+    }
+
+    /// Every provider path renders the same designed empty state when there is no
+    /// trustworthy summary — missing file, corrupt file, unsupported schema, and the
+    /// watchdog timeout are four routes to one interpretation, never four different
+    /// blank-ish boxes. (M10: pins the fallback copy, not just its shape.)
+    @Test func everyUnusableStoreOutcomeRendersTheSameDesignedEmptyState() async throws {
+        let now = Date()
+        let expected = WidgetSummaryPresentation.model(for: nil, now: now)
+        #expect(expected.headline == "No estimate yet")
+        #expect(expected.detail == "Open Netto and scan your library to see cleanup estimates.")
+        #expect(expected.figure == .none)
+
+        // Missing file.
+        let missingDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("netto-widget-designed-missing-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: missingDir) }
+        let missing = await FileWidgetSummaryStore(directoryOverride: missingDir, onReload: {}).load()
+        #expect(NettoWidgetProvider.entry(for: missing, now: now).model == expected)
+
+        // Corrupt file.
+        let corruptDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("netto-widget-designed-corrupt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: corruptDir) }
+        try FileManager.default.createDirectory(at: corruptDir, withIntermediateDirectories: true)
+        try Data("not json at all".utf8).write(to: corruptDir.appendingPathComponent(FileWidgetSummaryStore.fileName))
+        let corrupt = await FileWidgetSummaryStore(directoryOverride: corruptDir, onReload: {}).load()
+        #expect(NettoWidgetProvider.entry(for: corrupt, now: now).model == expected)
+
+        // Unsupported schema: a valid document under a future version must be rejected
+        // whole — never partially rendered.
+        let futureDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("netto-widget-designed-future-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: futureDir) }
+        try FileManager.default.createDirectory(at: futureDir, withIntermediateDirectories: true)
+        let futureJSON = """
+        {"schemaVersion":9999,"status":"scanReady","estimateBytes":null,"isEstimated":false,"updatedAt":700000000}
+        """
+        try Data(futureJSON.utf8).write(to: futureDir.appendingPathComponent(FileWidgetSummaryStore.fileName))
+        let future = await FileWidgetSummaryStore(directoryOverride: futureDir, onReload: {}).load()
+        #expect(NettoWidgetProvider.entry(for: future, now: now).model == expected)
+    }
+
+    /// Both targets must declare the exact App Group the store reads and writes (M10's
+    /// device-diagnosis item): a mismatch is invisible in Simulator and fatal on device —
+    /// the app writes into a container the extension can never open. This test reads the
+    /// entitlement files from the source tree so a provisioning drift fails the suite,
+    /// not the home screen.
+    @Test func bothTargetsDeclareTheStoreSAppGroup() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // NettoTests/
+            .deletingLastPathComponent() // repo root
+        let entitlements = [
+            repoRoot.appendingPathComponent("Netto/Netto.entitlements"),
+            repoRoot.appendingPathComponent("NettoWidget/NettoWidget.entitlements"),
+        ]
+        for url in entitlements {
+            let data = try Data(contentsOf: url)
+            let plist = try PropertyListSerialization.propertyList(from: data, format: nil)
+            let dict = try #require(plist as? [String: Any])
+            let groups = try #require(dict["com.apple.security.application-groups"] as? [String])
+            #expect(
+                groups.contains(FileWidgetSummaryStore.appGroupID),
+                "\(url.lastPathComponent) is missing \(FileWidgetSummaryStore.appGroupID)"
+            )
+        }
     }
 
     @Test func aResponsiveStoreStillWinsTheRaceAgainstTheWatchdog() async throws {

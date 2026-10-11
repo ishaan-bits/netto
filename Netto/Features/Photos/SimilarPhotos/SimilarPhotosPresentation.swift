@@ -29,6 +29,10 @@ enum SimilarPhotosPhase: Sendable, Equatable {
     case cancelled
     /// The last run failed; carries the user-facing message.
     case failed(String)
+    /// This pass is queued behind the sharpness pass, which currently owns the pipeline
+    /// (M10). Shown instead of the resting state so the tap that queued the run is always
+    /// acknowledged — never a silent no-op.
+    case queuedBehindBlur
 }
 
 enum SimilarPhotosPresentation {
@@ -40,10 +44,14 @@ enum SimilarPhotosPresentation {
     /// 2. A running analysis wins over everything else: it is what the user is waiting on.
     /// 3. Then a running catalog build (it is a prerequisite step in progress).
     /// 4. Then analysis outcomes, then catalog outcomes, then the resting states.
+    /// - Parameter pendingBehindOtherPass: the coordinator (M10) holds this pass in its
+    ///   one-slot queue — the sharpness pass is running and this run starts automatically
+    ///   when it finishes. Reported as `queuedBehindBlur` once the running checks pass.
     static func phase(
         permission: PermissionState,
         catalog: CatalogScanState,
-        analysis: PhotoAnalysisState
+        analysis: PhotoAnalysisState,
+        pendingBehindOtherPass: Bool = false
     ) -> SimilarPhotosPhase {
         switch permission {
         case .notDetermined:
@@ -59,6 +67,11 @@ enum SimilarPhotosPresentation {
         }
         if case .running(let progress) = catalog {
             return .buildingCatalog(progress)
+        }
+        // The queue acknowledgement (M10): a request that could not start yet is shown
+        // as queued, never folded back into the idle/results state the tap came from.
+        if pendingBehindOtherPass {
+            return .queuedBehindBlur
         }
 
         switch analysis {

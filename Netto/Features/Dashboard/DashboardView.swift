@@ -276,7 +276,8 @@ struct DashboardView: View {
         SimilarPhotosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            analysis: env.analysisState
+            analysis: env.analysisState,
+            pendingBehindOtherPass: env.pendingAnalysisRequest == .similarity
         )
     }
 
@@ -360,6 +361,8 @@ struct DashboardView: View {
             return SimilarPhotosPresentation.stageMessage(for: progress)
         case .paused:
             return "Scan paused"
+        case .queuedBehindBlur:
+            return "Queued — starts after the sharpness check"
         case .emptyLibrary:
             return "No photos visible to Netto"
         case .cancelled:
