@@ -372,6 +372,113 @@ struct SpaceFreedSummaryTests {
         #expect(env.storageSnapshot != nil)
     }
 
+    // MARK: 10. Device-shaped pipeline — real service, trashed-but-fetchable PhotoKit
+
+    @Test func deviceShapedDeletionPresentsTheSummaryThroughTheRealService() async {
+        // Real PhotoKit keeps a deleted asset fetchable by identifier until Recently Deleted
+        // purges it; the scripted fakes cannot represent that, and the missing-summary bug
+        // hid exactly there. This drives the real `PhotoDeletionService` through a device-
+        // shaped backing: confirmation → committed change → submission accounting → summary.
+        let backing = DeviceShapedBacking(present: ["a", "b"])
+        let records = [makeRecord(id: "a"), makeRecord(id: "b")]
+        let env = AppEnvironment(
+            storageProvider: FakeStorage(),
+            photoPermission: FakePermissionService(.authorized),
+            makePhotoLibrary: { FakeLibrary(records: records) },
+            sizeProvider: FakeSizeProvider(sizes: ["a": 1_000, "b": 2_000]),
+            deletionService: PhotoDeletionService(backing: backing),
+            scanSnapshotStore: InMemoryScanSnapshotStore(),
+            sessionToken: "session-1"
+        )
+        env.photoPermissionState = .authorized
+        env.catalogState = .completed(CatalogScanResult(
+            records: records,
+            libraryAssetCount: records.count,
+            accessLevel: .authorized
+        ))
+        env.analysisState = .completed(SummaryFixtures.result)
+
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        #expect(backing.deleteCalls == [["a", "b"]])
+        #expect(env.flowState == .deletionCompleted)
+        guard let summary = env.spaceFreedSummary else {
+            Issue.record("expected the summary when a committed device-shaped change confirms the removals")
+            return
+        }
+        #expect(summary.confirmedCount == 2)
+        #expect(summary.measuredBytes == 3_000)
+        #expect(!summary.isPartial)
+        #expect(SpaceFreedSummaryPresentation.failureDisclosure(summary) == nil)
+        #expect(SpaceFreedSummaryPresentation.metricLabel(summary) == "Estimated space freed")
+        // Results are pruned and the selection emptied — the phantom-partial path is gone.
+        guard case .completed(let pruned) = env.analysisState else {
+            Issue.record("expected the analysis to stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(pruned.exactGroups.isEmpty)
+        #expect(env.selection.selectedCount == 0)
+    }
+
+    // MARK: 11. Repeated cleanup — a fresh summary replaces the dismissed one
+
+    @Test func aSecondCleanupPresentsAFreshSummaryNeverTheStaleOne() async {
+        let first = DeletionSuccess(plannedCount: 2, verifiedRemovedCount: 2, remainingIDs: [])
+        let second = DeletionSuccess(plannedCount: 2, verifiedRemovedCount: 1, remainingIDs: ["b"])
+        let (env, service, _) = makeEnv(outcomes: [
+            .succeeded(first),
+            .succeeded(second)
+        ])
+
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard let firstSummary = env.spaceFreedSummary else {
+            Issue.record("expected the first summary")
+            return
+        }
+        #expect(firstSummary.confirmedCount == 2)
+        #expect(firstSummary.measuredBytes == 3_000)
+        env.finishSpaceFreedSummary()
+        #expect(env.flowState == .dashboard)
+        #expect(env.spaceFreedSummary == nil)
+
+        // A later cleanup runs against a fresh scan result (catalog + analysis restored, as
+        // a rescan would) and must present its own summary — never resurrect the dismissed
+        // one, never reuse its figures.
+        let rescanned = [makeRecord(id: "a"), makeRecord(id: "b")]
+        env.catalogState = .completed(CatalogScanResult(
+            records: rescanned,
+            libraryAssetCount: rescanned.count,
+            accessLevel: .authorized
+        ))
+        env.analysisState = .completed(SummaryFixtures.result)
+        selectBoth(in: env)
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        #expect(service.callCount == 2)
+        #expect(env.flowState == .deletionCompleted)
+        guard let secondSummary = env.spaceFreedSummary else {
+            Issue.record("expected a fresh summary for the second cleanup")
+            return
+        }
+        #expect(secondSummary.confirmedCount == 1)
+        #expect(secondSummary.measuredBytes == 1_000)
+        #expect(secondSummary.isPartial)
+        #expect(secondSummary.measuredBytes != firstSummary.measuredBytes)
+        #expect(SpaceFreedSummaryPresentation.failureDisclosure(secondSummary) == "1 item could not be removed.")
+    }
+
     // MARK: - Harness
 
     private func makeEnv(
@@ -382,9 +489,11 @@ struct SpaceFreedSummaryTests {
             verifiedRemovedCount: 2,
             remainingIDs: []
         )),
+        outcomes: [DeletionOutcome]? = nil,
         snapshotStore: InMemoryScanSnapshotStore = InMemoryScanSnapshotStore()
     ) -> (env: AppEnvironment, service: RecordingDeletionService, store: InMemoryScanSnapshotStore) {
-        let service = RecordingDeletionService(outcome: outcome)
+        let service = outcomes.map(RecordingDeletionService.init(outcomes:))
+            ?? RecordingDeletionService(outcome: outcome)
         let env = AppEnvironment(
             storageProvider: FakeStorage(),
             photoPermission: FakePermissionService(.authorized),
@@ -485,11 +594,15 @@ private final class FakePermissionService: PhotoLibraryPermissionServicing, @unc
 
 private final class RecordingDeletionService: PhotoDeleting, @unchecked Sendable {
     private let lock = NSLock()
-    private let scriptedOutcome: DeletionOutcome
+    private var scriptedOutcomes: [DeletionOutcome]
     private var calls = 0
 
     init(outcome: DeletionOutcome) {
-        scriptedOutcome = outcome
+        scriptedOutcomes = [outcome]
+    }
+
+    init(outcomes: [DeletionOutcome]) {
+        scriptedOutcomes = outcomes.isEmpty ? [.cancelled] : outcomes
     }
 
     func execute(
@@ -506,7 +619,10 @@ private final class RecordingDeletionService: PhotoDeleting, @unchecked Sendable
         lock.lock()
         defer { lock.unlock() }
         calls += 1
-        return scriptedOutcome
+        if scriptedOutcomes.count > 1 {
+            return scriptedOutcomes.removeFirst()
+        }
+        return scriptedOutcomes[0]
     }
 
     var callCount: Int {

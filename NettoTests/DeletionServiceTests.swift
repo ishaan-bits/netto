@@ -212,9 +212,10 @@ struct DeletionServiceTests {
         #expect(success.verifiedRemovedCount == 2)
     }
 
-    @Test func partiallyRemovedAssetsReportPartialSuccessNeverFull() async {
-        // Deletion removes only "a" — "b" survives (e.g., an external change mid-flight).
-        let backing = FakeBacking(present: ["a", "b"], deleting: ["a"])
+    @Test func identifiersNeverSubmittedToTheChangeBlockReportAsRemaining() async {
+        // Revalidation sees both; an external change removes `b` before the change block
+        // fetches, so only `a` is submitted and only `a` is confirmed removed.
+        let backing = FakeBacking(present: ["a", "b"], vanishingBeforeMutation: ["b"])
         let service = PhotoDeletionService(backing: backing)
 
         let outcome = await service.execute(
@@ -249,6 +250,54 @@ struct DeletionServiceTests {
         if case .succeeded = outcome {
             Issue.record("verification failure must never be reported as success")
         }
+    }
+
+    // MARK: Recently Deleted (device-shaped) semantics
+
+    @Test func aCommittedChangeVerifiesAsFullSuccessEvenWhileTrashedAssetsStayFetchable() async {
+        // PhotoKit keeps a trashed asset (one in Recently Deleted) fetchable by its local
+        // identifier, so the post-commit library read still returns every planned ID.
+        // Counting that ambiguous fetch used to turn a full success into a phantom
+        // zero-confirmed partial failure: results were never pruned and the Space Freed
+        // Summary — gated on confirmed removals — never appeared.
+        let backing = DeviceShapedBacking(present: ["a", "b"])
+        let service = PhotoDeletionService(backing: backing)
+
+        let outcome = await service.execute(
+            try! makePlan(ids: ["a", "b"]).confirmed(),
+            in: context(selectionIDs: ["a", "b"])
+        )
+
+        guard case .succeeded(let success) = outcome else {
+            Issue.record("expected succeeded, got \(outcome)")
+            return
+        }
+        #expect(success.isFullyRemoved)
+        #expect(!success.isPartial)
+        #expect(success.verifiedRemovedCount == 2)
+        #expect(success.remainingIDs.isEmpty)
+        #expect(backing.deleteCalls == [["a", "b"]])
+    }
+
+    @Test func deviceShapedInBlockGapStillReportsTheUnsubmittedAssetHonestly() async {
+        // The change block's fetch found only `a` (an external change mid-flight): only the
+        // submitted identifier is confirmed removed, even though the ambiguous post-commit
+        // fetch still resolves both.
+        let backing = DeviceShapedBacking(present: ["a", "b"], inBlockVisible: ["a"])
+        let service = PhotoDeletionService(backing: backing)
+
+        let outcome = await service.execute(
+            try! makePlan(ids: ["a", "b"]).confirmed(),
+            in: context(selectionIDs: ["a", "b"])
+        )
+
+        guard case .succeeded(let success) = outcome else {
+            Issue.record("expected succeeded, got \(outcome)")
+            return
+        }
+        #expect(success.isPartial)
+        #expect(success.verifiedRemovedCount == 1)
+        #expect(success.remainingIDs == ["b"])
     }
 
     // MARK: Fixtures
@@ -291,7 +340,7 @@ private final class FakeBacking: PhotoMutationBacking, @unchecked Sendable {
     private let lock = NSLock()
     private var authorization: PermissionState
     private var present: Set<String>
-    private let deletingSubset: Set<String>?
+    private let vanishingBeforeMutation: Set<String>
     private let fetchError: Error?
     private let fetchErrorAfterMutation: Error?
     private let deleteError: Error?
@@ -303,14 +352,14 @@ private final class FakeBacking: PhotoMutationBacking, @unchecked Sendable {
     init(
         present: Set<String>,
         authorization: PermissionState = .authorized,
-        deleting subset: Set<String>? = nil,
+        vanishingBeforeMutation: Set<String> = [],
         fetchError: Error? = nil,
         fetchErrorAfterMutation: Error? = nil,
         deleteError: Error? = nil
     ) {
         self.present = present
         self.authorization = authorization
-        self.deletingSubset = subset
+        self.vanishingBeforeMutation = vanishingBeforeMutation
         self.fetchError = fetchError
         self.fetchErrorAfterMutation = fetchErrorAfterMutation
         self.deleteError = deleteError
@@ -327,7 +376,7 @@ private final class FakeBacking: PhotoMutationBacking, @unchecked Sendable {
         try fetchIdentifiers(localIdentifiers)
     }
 
-    func deleteAssets(localIdentifiers: [String]) async throws {
+    func deleteAssets(localIdentifiers: [String]) async throws -> DeletedAssetSubmission {
         try performDelete(localIdentifiers)
     }
 
@@ -340,6 +389,11 @@ private final class FakeBacking: PhotoMutationBacking, @unchecked Sendable {
         let preError = fetchError
         let postError = fetchErrorAfterMutation
         let snapshot = present
+        if isFirstFetch {
+            // An external change lands right after the revalidation read: the vanished
+            // identifiers are gone by the time the change block fetches.
+            present.subtract(vanishingBeforeMutation)
+        }
         lock.unlock()
 
         if isFirstFetch, let preError { throw preError }
@@ -347,21 +401,19 @@ private final class FakeBacking: PhotoMutationBacking, @unchecked Sendable {
         return snapshot.intersection(localIdentifiers)
     }
 
-    private func performDelete(_ localIdentifiers: [String]) throws {
+    private func performDelete(_ localIdentifiers: [String]) throws -> DeletedAssetSubmission {
         lock.lock()
         deletions.append(localIdentifiers)
         let error = deleteError
-        let subset = deletingSubset
+        // The change block fetches first: exactly what is still present can be submitted.
+        let submitted = present.intersection(localIdentifiers)
         if error == nil {
-            if let subset {
-                present.subtract(subset)
-            } else {
-                present.subtract(localIdentifiers)
-            }
+            present.subtract(submitted)
         }
         lock.unlock()
 
         if let error { throw error }
+        return DeletedAssetSubmission(submittedIDs: submitted)
     }
 
     var authReadCount: Int {
@@ -374,6 +426,60 @@ private final class FakeBacking: PhotoMutationBacking, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return fetches
+    }
+
+    var deleteCalls: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return deletions
+    }
+}
+
+/// Mimics the live PhotoKit backing's Recently Deleted semantics: after a committed
+/// change the planned assets remain raw-fetchable by identifier (they sit in Recently
+/// Deleted), while the change block's own fetch is the submission of record. Internal
+/// (not file-private): the summary end-to-end tests drive the real service through this
+/// backing too, because the scripted fakes cannot represent the trashed-but-fetchable
+/// device behavior that hid the missing-summary bug.
+final class DeviceShapedBacking: PhotoMutationBacking, @unchecked Sendable {
+    private let lock = NSLock()
+    private let present: Set<String>
+    private let inBlockVisible: Set<String>?
+    private var deletions: [[String]] = []
+
+    init(present: Set<String>, inBlockVisible: Set<String>? = nil) {
+        self.present = present
+        self.inBlockVisible = inBlockVisible
+    }
+
+    func currentAuthorization() -> PermissionState {
+        .authorized
+    }
+
+    func existingIdentifiers(_ localIdentifiers: [String]) async throws -> Set<String> {
+        // Raw PhotoKit fetch: trashed assets stay addressable by identifier, so the
+        // post-commit read resolves every planned ID regardless of the deletion.
+        intersectionWithPresent(localIdentifiers)
+    }
+
+    func deleteAssets(localIdentifiers: [String]) async throws -> DeletedAssetSubmission {
+        submit(localIdentifiers)
+    }
+
+    // Synchronous so `NSLock` (unavailable in async contexts) can be used safely.
+    private func intersectionWithPresent(_ localIdentifiers: [String]) -> Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return present.intersection(localIdentifiers)
+    }
+
+    // Synchronous so `NSLock` (unavailable in async contexts) can be used safely.
+    private func submit(_ localIdentifiers: [String]) -> DeletedAssetSubmission {
+        lock.lock()
+        defer { lock.unlock() }
+        deletions.append(localIdentifiers)
+        let visible = inBlockVisible ?? present
+        return DeletedAssetSubmission(submittedIDs: visible.intersection(localIdentifiers))
     }
 
     var deleteCalls: [[String]] {

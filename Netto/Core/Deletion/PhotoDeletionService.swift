@@ -12,8 +12,18 @@ protocol PhotoMutationBacking: Sendable {
     /// Which of the given identifiers currently resolve in the library (visible under the
     /// current authorization). Used for pre-mutation revalidation and post-mutation verification.
     func existingIdentifiers(_ localIdentifiers: [String]) async throws -> Set<String>
-    /// Performs the Photos change for **exactly** the given identifiers.
-    func deleteAssets(localIdentifiers: [String]) async throws
+    /// Performs the Photos change for **exactly** the given identifiers. The returned
+    /// submission names the identifiers the change block actually fetched and submitted:
+    /// only those can be trusted to have moved to Recently Deleted (an empty or partial
+    /// in-block fetch is reported, never papered over).
+    func deleteAssets(localIdentifiers: [String]) async throws -> DeletedAssetSubmission
+}
+
+/// What a committed Photos change actually submitted: the planned identifiers the change
+/// block fetched and handed to `deleteAssets`. Committed ⇒ every submitted asset moved to
+/// Recently Deleted.
+struct DeletedAssetSubmission: Equatable, Sendable {
+    let submittedIDs: Set<String>
 }
 
 /// What the app layer may ask of the deletion boundary. The only accepted payload is a
@@ -34,8 +44,11 @@ protocol PhotoDeleting: Sendable {
 /// 3. authorization-must-permit check (otherwise: permission error, zero mutations),
 /// 4. pure plan-vs-context staleness validation (selection, session, analysis, authorization),
 /// 5. resolve every planned identifier against the live library (missing → stale, never shrunk),
-/// 6. only then: `deleteAssets` with exactly the plan's identifiers,
-/// 7. post-mutation verification against the live library.
+/// 6. only then: `deleteAssets` with exactly the plan's identifiers — the change block's own
+///    fetch is the submission of record,
+/// 7. post-mutation verification: a committed change moved exactly its submitted identifiers
+///    to Recently Deleted; a follow-up library read must still succeed, but its per-asset
+///    results are deliberately not used for counting (see `execute`).
 struct PhotoDeletionService: PhotoDeleting {
     private let backing: any PhotoMutationBacking
 
@@ -75,25 +88,33 @@ struct PhotoDeletionService: PhotoDeleting {
         guard missing.isEmpty else { return .stale([.assetsMissing(missing)]) }
         // ── Validation complete: the live set is exactly the reviewed set. ─────────────────
 
+        let submission: DeletedAssetSubmission
         do {
-            try await backing.deleteAssets(localIdentifiers: planIDs)
+            submission = try await backing.deleteAssets(localIdentifiers: planIDs)
         } catch is CancellationError {
             return .cancelled
         } catch {
             return .mutationFailed(error.localizedDescription)
         }
 
-        // Verify against the library rather than trusting that the request "returning" means
-        // every intended asset is gone.
-        let presentAfter: Set<String>
+        // Post-mutation verification. PhotoKit keeps a trashed asset (one in Recently
+        // Deleted) fetchable by its local identifier, so re-fetching the planned IDs after
+        // the commit cannot distinguish "moved to Recently Deleted" from "still in the
+        // library" — counting that fetch would report every successful deletion as a
+        // phantom partial failure with zero confirmed removals, which in turn would prune
+        // nothing and suppress the Space Freed Summary. The committed change block's own
+        // fetch is the submission of record: an identifier is confirmed removed exactly when
+        // it entered the committed change. The follow-up library read below is a
+        // corroboration that the library is still readable; its per-asset results are
+        // deliberately ignored for counting.
         do {
-            presentAfter = try await backing.existingIdentifiers(planIDs)
+            _ = try await backing.existingIdentifiers(planIDs)
         } catch {
             return .verificationFailed(
                 "The deletion was requested, but the result could not be verified. Check Recently Deleted."
             )
         }
-        let remaining = planIDs.filter { presentAfter.contains($0) }
+        let remaining = planIDs.filter { !submission.submittedIDs.contains($0) }
         return .succeeded(DeletionSuccess(
             plannedCount: plan.count,
             verifiedRemovedCount: plan.count - remaining.count,
@@ -136,15 +157,43 @@ struct PhotoKitMutationBacking: PhotoMutationBacking {
         return found
     }
 
-    func deleteAssets(localIdentifiers: [String]) async throws {
-        guard !localIdentifiers.isEmpty else { return }
+    func deleteAssets(localIdentifiers: [String]) async throws -> DeletedAssetSubmission {
+        guard !localIdentifiers.isEmpty else { return DeletedAssetSubmission(submittedIDs: []) }
         let ids = localIdentifiers
+        let collector = SubmissionCollector()
         try await PHPhotoLibrary.shared().performChanges {
             let options = PHFetchOptions()
             options.fetchLimit = ids.count
             let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: options)
             guard assets.count > 0 else { return }
+            var submitted = Set<String>()
+            submitted.reserveCapacity(assets.count)
+            for index in 0..<assets.count {
+                submitted.insert(assets.object(at: index).localIdentifier)
+            }
+            collector.record(submitted)
             PHAssetChangeRequest.deleteAssets(assets)
         }
+        return DeletedAssetSubmission(submittedIDs: collector.submitted)
+    }
+}
+
+/// Crosses the `performChanges` boundary: the change block runs on a Photos-owned queue
+/// and records exactly which identifiers it fetched and submitted; the awaiting caller
+/// reads that submission after the commit. Lock-guarded for the cross-queue handoff.
+private final class SubmissionCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ids = Set<String>()
+
+    func record(_ submitted: Set<String>) {
+        lock.lock()
+        defer { lock.unlock() }
+        ids = submitted
+    }
+
+    var submitted: Set<String> {
+        lock.lock()
+        defer { lock.unlock() }
+        return ids
     }
 }

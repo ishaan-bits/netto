@@ -27,7 +27,10 @@ is no backend, no cloud processing, and no third-party analytics.
   scan (read-only) → review candidates and adjust the selection → an explicit
   confirmation dialog stating the exact count → only then does anything happen.
   Photos deletions go through a single service that revalidates authorization and asset
-  existence immediately before mutating, and removed photos land in Recently Deleted.
+  existence immediately before mutating; what the Photos change block actually submitted
+  is the record of what was removed (PhotoKit keeps Recently Deleted assets fetchable, so
+  a post-delete re-fetch cannot be trusted for counting), and removed photos land in
+  Recently Deleted.
   Contact merges/deletions go through the app's only contacts writer; a plan must be
   confirmed, and stale plans are discarded instead of executed. Review screens never
   mutate anything. Details in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -63,8 +66,12 @@ Beyond the core cleanup loop:
 - **Home screen widget** — a WidgetKit extension renders the shared scan summary from
   the App Group; it reads only that summary and never links PhotoKit, Vision, or the
   deletion path.
-- **Space-freed confirmation** — a completed deletion shows how much space the confirmed
-  removal actually reclaimed, computed from measured sizes and verified removals.
+- **Space-freed summary** — after a confirmed deletion whose committed Photos change
+  is verified, a dedicated summary screen shows the count of confirmed removed assets
+  and the estimated bytes freed (computed from the plan's measured sizes, always
+  labeled as estimates; an unmeasurable item never fabricates a figure), discloses any
+  partial removals honestly, and is gated so it can never appear before the deletion
+  finishes, without explicit confirmation, or for a zero-removal outcome.
 
 ## Architecture & technologies
 
@@ -207,6 +214,34 @@ deletion safety net rather than adding a second one:
   losses, and vanished assets report honestly through the same outcome states as
   everywhere else. Swipe Review itself still never deletes anything.
 
+### Space Freed Summary verification (Phase E)
+
+The summary screen existed but never appeared after a real cleanup: PhotoKit keeps a
+trashed asset (one moved to Recently Deleted) fetchable by its local identifier until it
+purges it ~30 days later, so the service's post-delete re-fetch reported every planned
+asset as "still present". A successful deletion therefore degraded into a phantom
+partial failure with zero confirmed removals — nothing was pruned from the scan
+results, and the summary (gated on at least one confirmed removal) was suppressed.
+
+- **The change block is the submission of record** — the Photos change block fetches
+  exactly the plan's identifiers and hands them to `deleteAssets`; which identifiers
+  that in-block fetch actually returned is returned to the service as the committed
+  submission. An identifier counts as confirmed removed exactly when it entered the
+  committed change; one the block could not see (an external change mid-flight) is
+  reported as still present, never as removed.
+- **The post-commit library read is corroboration, not counting** — the service still
+  re-reads the library after the commit and refuses to claim success if that read
+  fails, but its per-asset results are deliberately ignored: they cannot distinguish
+  "moved to Recently Deleted" from "still active", and counting them is exactly what
+  suppressed the summary.
+- **Unchanged safety path** — the pre-mutation gates (non-empty plan, fresh
+  authorization, selection/session/dataset/authorization staleness, live existence
+  revalidation) are untouched; the summary is still built only after the outcome is
+  applied, the results are pruned, and storage is refreshed; an empty in-block fetch
+  commits nothing and reports zero removals (no summary, honest review state); the
+  system delete-confirmation dialog Photos presents per deletion remains the user's
+  second, independent confirmation.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -270,7 +305,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 761 Swift Testing cases across 76 suites covering the pure
+- **Unit suite** — 46 files, 765 Swift Testing cases across 76 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -327,12 +362,25 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   unchecking or unmarking after the plan was built stale-ing it before any mutation,
   another source's plan left alone by cleanup toggles, partial failures reported as
   `needsReview`, and a catalog-missing candidate never entering the plan).
+- **Space-freed summary coverage (Phase E)** — the summary presentation tests (accurate
+  confirmed counts and measured bytes with the "Estimated space freed" label, partial
+  success counting only confirmed removals with its disclosure, failed/cancelled
+  deletions never showing success, zero-confirmed removals suppressed by the builder
+  itself, unknown sizes shown as a bare count with no fabricated figure, duplicate plan
+  entries never double-counted, dismissal returning to the dashboard without touching
+  results, recreation never repeating a deletion or the success event, scan-snapshot
+  persistence intact alongside the summary, a second cleanup presenting a fresh summary
+  over the dismissed one) plus the device-shaped pipeline: a `DeviceShapedBacking` that
+  keeps deleted assets fetchable by identifier (PhotoKit's Recently Deleted semantics)
+  driven through the real `PhotoDeletionService` proves a committed change verifies as
+  full success — the submission-of-record accounting, not the ambiguous re-fetch,
+  decides what was removed — with an in-block gap still reported as a partial honestly.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification** — full suites green on the Phase D worktree: the unit run
-  reports "761 tests in 76 suites passed", plus 5/5 UI cases, and a clean
-  `build-for-testing` with 0 errors and 251 warnings, all inside the pre-existing
-  UI-test-target baseline (the unit/app targets are warning-free). One case,
+- **Recent verification** — full suites green on the Phase E worktree: the unit run
+  reports "765 tests in 76 suites passed", plus 5/5 UI cases, and a clean
+  `build-for-testing` with 0 errors (the pre-existing 251-warning UI-test-target
+  baseline is unchanged; the unit/app targets are warning-free). One case,
   `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests`, is cancelled when run inside the full suite but
   passes in isolation; this is a pre-existing Swift Testing suite-context quirk,
@@ -400,6 +448,16 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   changes are reconciled on restore (deleted photos leave the deck), but newly formed
   groups are not injected mid-session. The session file holds one session — entering
   Swipe Review over a different deck replaces it.
+- **Deletion verification semantics (Phase E)** — what the Photos change block submitted
+  is the record of what moved to Recently Deleted; if the Photos framework committed a
+  change yet silently dropped a submitted asset (without failing the commit or the
+  follow-up library read), that asset would be counted as removed. Photos' documented
+  failure modes are a thrown error or a completion that never fires (an OS-level hang
+  that leaves the app in its deleting state), neither of which this accounting can
+  mask. A system delete-confirmation dialog also appears per Photos deletion, after
+  Netto's own confirmation. Real-device validation of the end-to-end deletion flow
+  (including this summary) has not been performed — see the device-matrix limitation
+  above.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the
