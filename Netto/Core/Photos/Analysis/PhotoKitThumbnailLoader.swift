@@ -98,8 +98,12 @@ extension PhotoThumbnailLoading {
 /// - **Permission revocation** is re-checked on every miss; on a hit the image request itself
 ///   fails with the access error, which maps to `.permissionDenied`.
 /// - **Bounds**: capacity-capped with LRU eviction, so memory never tracks library size.
-///   `hitCount`/`missCount` are the observable reuse statistics tests and validation runs
-///   report (a miss equals one `PHAsset.fetchAssets` round trip that did not happen before).
+///   The default (2048) comfortably covers a full-library pass's working set at phone
+///   scale — a 34k-photo blur run missed entirely at the old 512, paying a
+///   `PHAsset.fetchAssets` round trip per photo even after earlier passes had resolved
+///   the same identifiers. `hitCount`/`missCount` are the observable reuse statistics
+///   tests and validation runs report (a miss equals one `PHAsset.fetchAssets` round
+///   trip that did not happen before).
 ///
 /// `@unchecked Sendable`: every access goes through `lock`; `PHAsset` is an immutable
 /// identifier wrapper PhotoKit returns to callers from arbitrary threads.
@@ -115,7 +119,7 @@ final class PhotoAssetReferenceCache: @unchecked Sendable {
     private var misses = 0
     private let capacity: Int
 
-    init(capacity: Int = 512) {
+    init(capacity: Int = 2048) {
         self.capacity = max(1, capacity)
     }
 
@@ -191,6 +195,43 @@ final class PhotoAssetReferenceCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return misses
+    }
+}
+
+/// Process-wide positive memo of granted Photos access (see `PhotoKitThumbnailLoader.fetchAsset`).
+///
+/// Every asset-reference cache *miss* used to pay `PHPhotoLibrary.authorizationStatus(for:)` —
+/// an XPC round trip to the Photos daemon — even mid-pass, where a 34k-library blur run makes
+/// tens of thousands of misses. The memo is only ever set on `.authorized`/`.limited`, so a
+/// revoked permission still surfaces honestly: the image request itself fails with the access
+/// error (mapped to `.permissionDenied`), and an empty fetch re-checks the live status before
+/// reporting an asset gone.
+///
+/// `@unchecked Sendable`: every access goes through `lock`.
+final class PhotoAccessMemo: @unchecked Sendable {
+    static let shared = PhotoAccessMemo()
+
+    private let lock = NSLock()
+    private var granted = false
+
+    var isGranted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return granted
+    }
+
+    func noteGranted() {
+        lock.lock()
+        defer { lock.unlock() }
+        granted = true
+    }
+
+    /// Drops the memo — after an empty fetch (revocation can surface as "not found") and in
+    /// tests that need a clean slate.
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        granted = false
     }
 }
 
@@ -367,10 +408,36 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
                 contentMode: contentMode,
                 options: options
             ) { image, info in
-                resolve(Self.result(image: image, info: info))
+                // PhotoKit delivers this handler on the main queue. The classification and
+                // orientation re-render inside `result` are real work — and at library
+                // scale (34k+ photos) the constant main-queue traffic alone starves the
+                // UI, even though the heavy measurement runs elsewhere. Hop to a utility
+                // queue first: the handler itself costs one dispatch, and the awaiting
+                // worker resumes wherever the continuation lands.
+                let payload = AnalysisCallbackPayload(image: image, info: info)
+                Self.analysisCallbackQueue.async {
+                    resolve(Self.result(image: payload.image, info: payload.info))
+                }
             }
             return { PHImageManager.default().cancelImageRequest(requestID) }
         }
+    }
+
+    /// Where analysis PhotoKit callbacks do their classification and orientation work.
+    /// (The preview path stays on the main queue on purpose: its interim frames exist to
+    /// be shown, one user-facing request at a time.)
+    static let analysisCallbackQueue = DispatchQueue(
+        label: "netto.photo.thumbnail.analysis-callback",
+        qos: .userInitiated
+    )
+
+    /// Moves one analysis callback's non-Sendable payload across threads for the hop above.
+    /// Safe by construction: `UIImage` is only read (orientation, then either `cgImage` or a
+    /// draw) and the info dictionary is only subscripted for PhotoKit's documented keys —
+    /// neither is mutated after PhotoKit hands it over, and nothing escapes this hop.
+    private struct AnalysisCallbackPayload: @unchecked Sendable {
+        let image: UIImage?
+        let info: [AnyHashable: Any]?
     }
 
     /// The production preview path: one large, user-requested rendition that may use the
@@ -605,18 +672,34 @@ struct PhotoKitThumbnailLoader: PhotoThumbnailLoading {
     /// Status *read* only — never a permission request. With access missing, a fetch would
     /// silently come back empty and every asset would be misreported as "not found"; checking
     /// first keeps "Photos access is off" distinguishable from "this photo was deleted".
+    /// The check is memoized on the positive side only (`PhotoAccessMemo`): once access is
+    /// known good, the per-asset XPC status read disappears, and a revocation still fails
+    /// honestly through the paths documented there.
     static func fetchAsset(_ assetID: String) throws -> PHAsset {
-        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        switch status {
-        case .authorized, .limited:
-            break
-        default:
-            throw PhotoContentError.permissionDenied
+        let memo = PhotoAccessMemo.shared
+        if !memo.isGranted {
+            switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
+            case .authorized, .limited:
+                memo.noteGranted()
+            default:
+                throw PhotoContentError.permissionDenied
+            }
         }
         let options = PHFetchOptions()
         options.fetchLimit = 1
         let result = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: options)
-        guard let asset = result.firstObject else { throw PhotoContentError.assetNotFound }
+        guard let asset = result.firstObject else {
+            // An empty fetch usually means the identifier is gone — but a revocation can
+            // also surface as empty. Re-check once (dropping the memo) so "Photos access
+            // is off" is never misreported as "this photo was deleted".
+            memo.reset()
+            switch PHPhotoLibrary.authorizationStatus(for: .readWrite) {
+            case .authorized, .limited:
+                throw PhotoContentError.assetNotFound
+            default:
+                throw PhotoContentError.permissionDenied
+            }
+        }
         return asset
     }
 

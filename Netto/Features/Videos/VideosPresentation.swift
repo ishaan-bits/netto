@@ -22,8 +22,10 @@ enum VideosPhase: Sendable, Equatable {
     /// The catalog is complete and contains no videos.
     case empty
     /// Sizes are being measured (or measurement has not started yet). `measured` only counts
-    /// videos whose size the provider actually resolved — unknowns are never counted as zero.
-    case measuringVideos(measured: Int, total: Int)
+    /// videos whose size the provider actually resolved — unknowns are never counted as zero;
+    /// `unavailable` counts the ones the provider *attempted* and could not measure (iCloud-
+    /// only, unreadable), so a library of failures still shows work happening honestly.
+    case measuringVideos(measured: Int, total: Int, unavailable: Int)
     /// The video dataset, sorted largest first, with measured sizes embedded per record
     /// (`sizeInBytes == nil` = size unknown, never zero).
     case results([PhotoAssetRecord])
@@ -32,10 +34,18 @@ enum VideosPhase: Sendable, Equatable {
 enum VideosPresentation {
     /// The single permission → catalog → size-resolution → phase mapping. Analysis state never
     /// participates: an analysis running or failed in the background changes nothing here.
+    ///
+    /// `datasetSignature` is the current catalog's video fingerprint — passed in (the
+    /// environment caches it) because recomputing it is O(videos log videos) and this runs on
+    /// every dashboard and screen render. `settledRecords` is the environment's cached
+    /// resolved + largest-first list for the same reason; `nil` computes it here (tests and
+    /// previews), matching the pre-cache behaviour exactly.
     static func phase(
         permission: PermissionState,
         catalog: CatalogScanState,
-        resolution: VideoSizeResolution
+        resolution: VideoSizeResolution,
+        datasetSignature: String,
+        settledRecords: [PhotoAssetRecord]? = nil
     ) -> VideosPhase {
         switch permission {
         case .notDetermined:
@@ -58,25 +68,28 @@ enum VideosPresentation {
         case .completed(let result):
             let videos = VideoDataset.records(in: result)
             guard !videos.isEmpty else { return .empty }
+            let total = videos.count
 
             // A measurement from another dataset is treated as idle — bytes are never mixed
             // across catalogs, and the screen re-measures on appear.
-            let signature = VideoDataset.signature(in: result)
-            guard resolution.isCurrent(for: signature) else {
-                return .measuringVideos(measured: 0, total: videos.count)
+            guard resolution.isCurrent(for: datasetSignature), !datasetSignature.isEmpty else {
+                return .measuringVideos(measured: 0, total: total, unavailable: 0)
             }
 
             switch resolution {
             case .idle:
-                return .measuringVideos(measured: 0, total: videos.count)
+                return .measuringVideos(measured: 0, total: total, unavailable: 0)
             case .measuring(let measurement):
                 return .measuringVideos(
                     measured: measurement.measuredCount,
-                    total: max(measurement.total, measurement.measuredCount)
+                    total: max(measurement.total, measurement.measuredCount),
+                    unavailable: measurement.unavailableCount
                 )
             case .settled(let measurement):
-                let resolved = VideoDataset.resolved(videos, with: measurement.bytes)
-                return .results(VideoDataset.sorted(resolved))
+                let records = settledRecords ?? VideoDataset.sorted(
+                    VideoDataset.resolved(videos, with: measurement.bytes)
+                )
+                return .results(records)
             }
         }
     }
@@ -93,9 +106,17 @@ enum VideosPresentation {
     static func statusText(
         permission: PermissionState,
         catalog: CatalogScanState,
-        resolution: VideoSizeResolution
+        resolution: VideoSizeResolution,
+        datasetSignature: String,
+        settledRecords: [PhotoAssetRecord]? = nil
     ) -> String {
-        switch phase(permission: permission, catalog: catalog, resolution: resolution) {
+        switch phase(
+            permission: permission,
+            catalog: catalog,
+            resolution: resolution,
+            datasetSignature: datasetSignature,
+            settledRecords: settledRecords
+        ) {
         case .permissionRequired:
             return "Photos access needed"
         case .permissionDenied:
@@ -112,11 +133,15 @@ enum VideosPresentation {
             return message
         case .empty:
             return "No videos found"
-        case .measuringVideos(let measured, let total):
+        case .measuringVideos(let measured, let total, let unavailable):
             if case .idle = resolution {
                 return "\(total) videos · sizes not measured yet"
             }
-            return "Measuring sizes · \(measured) of \(total) videos…"
+            var text = "Measuring sizes · \(measured) of \(total) videos…"
+            if unavailable > 0 {
+                text += " · \(unavailable) unavailable"
+            }
+            return text
         case .results(let records):
             guard let measurement = resolution.measurement else {
                 return "\(records.count) videos ready to review"
@@ -136,6 +161,30 @@ enum VideosPresentation {
             }
             return "\(countText) · \(sizeText) · \(pendingText)"
         }
+    }
+
+    /// The measuring screen's progress message. An idle state has started nothing, so it
+    /// never claims "0 of N done" — it says what is about to happen. An active run names
+    /// its honest progress, and surfaces sizes the provider could not measure (they are
+    /// real outcomes of real work, never folded into the measured count).
+    static func measuringMessage(
+        measured: Int,
+        total: Int,
+        unavailable: Int,
+        isActive: Bool
+    ) -> String {
+        guard isActive else {
+            return total > 0
+                ? "Preparing to measure \(total) videos…"
+                : "Preparing to measure video sizes…"
+        }
+        var message = total > 0
+            ? "Measuring video sizes… \(measured) of \(total) done"
+            : "Measuring video sizes…"
+        if unavailable > 0 {
+            message += " (\(unavailable) unavailable)"
+        }
+        return message
     }
 
     /// `0:14` / `1:03` / `1:02:05` — playback time, from the duration already in the catalog.

@@ -81,9 +81,76 @@ struct NettoWidgetProviderTests {
         #expect(entry.model.figure == .none)
     }
 
+    // MARK: Watchdog: a completion must always arrive
+
+    @Test func aHangingStoreLoadStillDeliversABrandedEntryViaTheWatchdog() async {
+        // The blank-widget failure mode this guards: WidgetKit shows the skeleton when
+        // the extension never calls the completion. A store read that never returns
+        // (the pathological case) must still produce branded empty-state content,
+        // bounded by the watchdog — never silence.
+        let provider = NettoWidgetProvider(
+            store: HangingWidgetSummaryStore(),
+            loadTimeoutNanos: 50_000_000 // 50 ms — test speed, same code path
+        )
+        let now = Date()
+        let started = ContinuousClock.now
+        let entry = await withCheckedContinuation { continuation in
+            provider.loadEntry(now: now) { entry in
+                continuation.resume(returning: entry)
+            }
+        }
+
+        // Delivered by the watchdog, not by the store (which never answers): the entry
+        // is the branded empty state, and it arrived promptly.
+        #expect(entry.model == WidgetSummaryPresentation.model(for: nil, now: entry.date))
+        #expect(entry.model.figure == .none)
+        let elapsed = ContinuousClock.now - started
+        #expect(elapsed < .seconds(2), "watchdog took \(elapsed) — far past its 50 ms budget")
+    }
+
+    @Test func aResponsiveStoreStillWinsTheRaceAgainstTheWatchdog() async throws {
+        // The normal path through the same race: a store that answers immediately must
+        // deliver its real summary — the watchdog never overrides live data.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("netto-widget-race-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = FileWidgetSummaryStore(directoryOverride: directory, onReload: {})
+        let updatedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.save(try #require(WidgetSummary(
+            schemaVersion: WidgetSummary.currentSchemaVersion,
+            status: .lastCleanup,
+            estimateBytes: 2_500_000_000,
+            isEstimated: true,
+            updatedAt: updatedAt
+        )))
+
+        let provider = NettoWidgetProvider(store: store, loadTimeoutNanos: 5_000_000_000)
+        let entry = await withCheckedContinuation { continuation in
+            provider.loadEntry(now: updatedAt) { entry in
+                continuation.resume(returning: entry)
+            }
+        }
+
+        #expect(entry.model.figure == .bytes(2_500_000_000))
+        #expect(entry.model.caption == "Estimated space cleaned")
+    }
+
     private func containsAnyDigit(_ text: String) -> Bool {
         text.contains { $0.isNumber }
     }
+}
+
+/// A store whose load never returns — the failure the watchdog exists for. The
+/// suspension is unstructured on purpose: nothing in the test ever resumes it, and
+/// the provider's watchdog is what must produce the entry.
+private struct HangingWidgetSummaryStore: WidgetSummaryStoring {
+    func load() async -> WidgetSummary? {
+        await withCheckedContinuation { (_: CheckedContinuation<WidgetSummary?, Never>) in }
+    }
+
+    func save(_ summary: WidgetSummary) async throws {}
+
+    func requestWidgetReload() {}
 }
 
 // MARK: - Rendering: the real entry view must put real pixels on screen, in every state

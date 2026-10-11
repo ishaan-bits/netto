@@ -119,7 +119,10 @@ final class AppEnvironment {
     var contactsPermissionState: PermissionState = .notDetermined
     var storageSnapshot: StorageSnapshot?
     var catalogState: CatalogScanState = .notStarted {
-        didSet { blurDatasetGeneration &+= 1 }
+        didSet {
+            blurDatasetGeneration &+= 1
+            videoSignatureGeneration &+= 1
+        }
     }
     var analysisState: PhotoAnalysisState = .notStarted
     /// When the current completed result reached its terminal state — from the restored
@@ -326,6 +329,17 @@ final class AppEnvironment {
     /// read that misses, and mutating observed state inside a view update would re-invalidate
     /// the very reader that is asking.
     @ObservationIgnored private var builtBlurDatasetRecords: [PhotoAssetRecord] = []
+    /// Bumped by `catalogState`'s `didSet` — the video signature's only input.
+    @ObservationIgnored private var videoSignatureGeneration: UInt64 = 0
+    /// What `videoSignatureGeneration` the cached signature below reflects.
+    @ObservationIgnored private var builtVideoSignatureGeneration: UInt64 = .max
+    /// The cached video-dataset fingerprint (see `videoDatasetSignature`).
+    @ObservationIgnored private var builtVideoSignature: String = ""
+    /// What `videoSignatureGeneration` + resolution the cached settled records reflect.
+    @ObservationIgnored private var builtSettledVideosGeneration: UInt64 = .max
+    @ObservationIgnored private var builtSettledVideosResolution: VideoSizeResolution?
+    /// The cached resolved, largest-first video records (see `settledVideoRecords`).
+    @ObservationIgnored private var builtSettledVideosRecords: [PhotoAssetRecord] = []
 
     // MARK: Interrupted-run state (Phase C)
 
@@ -428,6 +442,61 @@ final class AppEnvironment {
             builtBlurDatasetGeneration = blurDatasetGeneration
         }
         return builtBlurDatasetRecords
+    }
+
+    /// The current video dataset's fingerprint, cached across renders.
+    ///
+    /// `VideoDataset.signature` is O(videos log videos) with a large joined-string build —
+    /// it used to run inside every Videos screen and dashboard render (and once more per
+    /// size-measurement tick, which for a 7k-video library is a multi-hundred-KB string
+    /// built on the main actor). The fingerprint only changes when the catalog does, so
+    /// it is built once per catalog and reused; observation still tracks `catalogState`
+    /// directly (read first below), so a rebuild re-renders exactly the readers that ask.
+    var videoDatasetSignature: String {
+        guard case .completed(let result) = catalogState else {
+            builtVideoSignature = ""
+            builtVideoSignatureGeneration = videoSignatureGeneration
+            return ""
+        }
+        if builtVideoSignatureGeneration != videoSignatureGeneration {
+            builtVideoSignature = VideoDataset.signature(in: result)
+            builtVideoSignatureGeneration = videoSignatureGeneration
+        }
+        return builtVideoSignature
+    }
+
+    /// Resolved, largest-first video records for the settled measurement — cached across
+    /// renders the same way.
+    ///
+    /// The resolve + sort is O(videos log videos) and used to run in every Videos screen
+    /// render while results were on screen (every selection toggle, every thumbnail state
+    /// change, every progress tick). It now rebuilds only when the catalog, the dataset
+    /// signature, or the measurement itself changes — settled measurements change once
+    /// per run, so a screen full of selection toggles costs no sorts at all.
+    var settledVideoRecords: [PhotoAssetRecord] {
+        let resolution = videoSizeResolution
+        let signature = videoDatasetSignature // reads + registers catalogState
+        guard case .completed(let catalog) = catalogState,
+              case .settled(let measurement) = resolution,
+              !signature.isEmpty,
+              measurement.datasetSignature == signature
+        else {
+            builtSettledVideosRecords = []
+            builtSettledVideosGeneration = videoSignatureGeneration
+            builtSettledVideosResolution = resolution
+            return []
+        }
+        if builtSettledVideosGeneration == videoSignatureGeneration,
+           builtSettledVideosResolution == resolution {
+            return builtSettledVideosRecords
+        }
+        let records = VideoDataset.sorted(
+            VideoDataset.resolved(VideoDataset.records(in: catalog), with: measurement.bytes)
+        )
+        builtSettledVideosRecords = records
+        builtSettledVideosGeneration = videoSignatureGeneration
+        builtSettledVideosResolution = resolution
+        return records
     }
 
     func bootstrap() async {
@@ -1176,14 +1245,22 @@ final class AppEnvironment {
         // Verdicts the interrupted run already earned, reconciled against the fresh
         // catalog (deleted or re-exported assets re-measure) — nil when the calibration
         // differs, which the engine also refuses, so a mismatch is always a full pass.
-        let seed = Self.blurSeed(
-            from: checkpoint,
-            records: records,
-            thresholds: configuration.thresholds
-        )
+        // Built off the main actor inside the task: the seed walks every catalog record
+        // and every saved verdict, work that used to stall the tap-to-start path on a
+        // large library before the first thumbnail was even requested.
+        let seedCheckpoint = checkpoint
+        let seedRecords = records
+        let seedThresholds = configuration.thresholds
 
         blurAnalysisTask = Task { [weak self] in
             guard let self else { return }
+            let seed = await Task.detached(priority: .userInitiated) {
+                Self.blurSeed(
+                    from: seedCheckpoint,
+                    records: seedRecords,
+                    thresholds: seedThresholds
+                )
+            }.value
             var sawCompletion = false
             do {
                 for try await event in engine.makeAnalysisStream(
@@ -1901,7 +1978,7 @@ final class AppEnvironment {
         switch catalogState {
         case .completed(let result):
             videoSelection.reconcile(with: VideoDataset.identifiers(in: result))
-            let signature = VideoDataset.signature(in: result)
+            let signature = videoDatasetSignature
             if !videoSizeResolution.isCurrent(for: signature) {
                 // Bytes measured against another dataset are dropped, never mixed in.
                 cancelVideoSizeResolution()
@@ -2021,12 +2098,12 @@ final class AppEnvironment {
             return
         }
 
-        let signature = VideoDataset.signature(in: catalog)
-        var bytes: [String: Int64]
+        let signature = videoDatasetSignature
+        var measuredBytes: [String: Int64]
         if videoSizeResolution.isCurrent(for: signature) {
-            bytes = videoSizeResolution.bytes // resume: keep what this dataset already measured
+            measuredBytes = videoSizeResolution.bytes // resume: keep what this dataset already measured
         } else {
-            bytes = [:] // another dataset's bytes are never mixed into this one
+            measuredBytes = [:] // another dataset's bytes are never mixed into this one
         }
         // Sizes an interrupted run already measured, validated against this catalog: only
         // an asset that still exists with the exact recorded modification date
@@ -2040,21 +2117,21 @@ final class AppEnvironment {
                 index[record.localIdentifier] = record
             }
             for entry in checkpoint.videoSizes {
-                guard bytes[entry.assetID] == nil,
+                guard measuredBytes[entry.assetID] == nil,
                       let record = index[entry.assetID],
                       record.modificationDate == entry.modified
                 else { continue }
-                bytes[entry.assetID] = entry.bytes
+                measuredBytes[entry.assetID] = entry.bytes
             }
         }
         let total = videos.count
-        let targets = videos.lazy.map(\.localIdentifier).filter { bytes[$0] == nil }
+        let targets = videos.lazy.map(\.localIdentifier).filter { measuredBytes[$0] == nil }
 
         guard !targets.isEmpty else {
             videoSizeResolution = .settled(
                 VideoSizeResolution.Measurement(
                     datasetSignature: signature,
-                    bytes: bytes,
+                    bytes: measuredBytes,
                     total: total
                 )
             )
@@ -2070,7 +2147,7 @@ final class AppEnvironment {
         videoSizeResolution = .measuring(
             VideoSizeResolution.Measurement(
                 datasetSignature: signature,
-                bytes: bytes,
+                bytes: measuredBytes,
                 total: total
             )
         )
@@ -2080,19 +2157,33 @@ final class AppEnvironment {
             guard let self else { return }
             let batchSize = VideoSizeResolution.measurementBatchSize
             var pending = Array(targets)
+            var unavailableCount = 0
             while !pending.isEmpty {
                 let batch = Array(pending.prefix(batchSize))
                 pending.removeFirst(batch.count)
-                let landed = await provider.sizes(for: batch)
+                // Outcomes, not bare sizes: a batch the provider could not measure
+                // (iCloud-only, unreadable) still resolves every identifier — the
+                // on-screen progress advances through failures instead of sitting at
+                // "0 of N" while real work is happening.
+                let outcomes = await provider.outcomes(for: batch)
                 // Each batch re-checks the generation, so a cancelled run's remaining batches
                 // are discarding no-ops — they can never overwrite newer state.
                 guard self.videoSizeGeneration == generation else { return }
-                bytes.merge(landed) { _, new in new }
+                for identifier in batch {
+                    switch outcomes[identifier] {
+                    case .measured(let size):
+                        measuredBytes[identifier] = size
+                    case .unavailable, nil:
+                        // Never counted as measured, never zero — only as attempted.
+                        unavailableCount += 1
+                    }
+                }
                 self.videoSizeResolution = .measuring(
                     VideoSizeResolution.Measurement(
                         datasetSignature: signature,
-                        bytes: bytes,
-                        total: total
+                        bytes: measuredBytes,
+                        total: total,
+                        unavailableCount: unavailableCount
                     )
                 )
             }
@@ -2100,8 +2191,9 @@ final class AppEnvironment {
             self.videoSizeResolution = .settled(
                 VideoSizeResolution.Measurement(
                     datasetSignature: signature,
-                    bytes: bytes,
-                    total: total
+                    bytes: measuredBytes,
+                    total: total,
+                    unavailableCount: unavailableCount
                 )
             )
             self.videoSizeTask = nil
@@ -2450,7 +2542,9 @@ final class AppEnvironment {
     /// the one this run will classify with — otherwise the seed is refused outright (the
     /// engine refuses it too; both checks exist so no path can mix calibrations). A
     /// candidate without its score cannot explain itself in review, so it re-measures.
-    private static func blurSeed(
+    /// `nonisolated` so the walk over every catalog record and saved verdict runs off the
+    /// main actor (see `startBlurAnalysis`).
+    nonisolated private static func blurSeed(
         from checkpoint: ScanCheckpoint?,
         records: [PhotoAssetRecord],
         thresholds: BlurThresholds

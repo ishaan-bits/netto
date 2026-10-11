@@ -1,4 +1,5 @@
 import Foundation
+import os
 import WidgetKit
 #if NETTO_WIDGET_TESTS
 @testable import Netto
@@ -26,10 +27,23 @@ struct NettoWidgetProvider: TimelineProvider {
     /// labelling the content, never by polling.
     static let reloadInterval: TimeInterval = 60 * 60
 
-    private let store: any WidgetSummaryStoring
+    /// Watchdog for one store read. The read is a local file open in the App Group
+    /// container — anything that has not answered within this window is a broken
+    /// extension process, not a slow disk. WidgetKit's contract is that never calling
+    /// the completion leaves the system rendering the blank skeleton, so a bounded
+    /// fallback is the one mechanism that *guarantees* branded content appears even
+    /// when the store read hangs.
+    static let defaultLoadTimeoutNanos: UInt64 = 2_000_000_000
 
-    init(store: any WidgetSummaryStoring = FileWidgetSummaryStore()) {
+    private let store: any WidgetSummaryStoring
+    private let loadTimeoutNanos: UInt64
+
+    init(
+        store: any WidgetSummaryStoring = FileWidgetSummaryStore(),
+        loadTimeoutNanos: UInt64 = NettoWidgetProvider.defaultLoadTimeoutNanos
+    ) {
         self.store = store
+        self.loadTimeoutNanos = loadTimeoutNanos
     }
 
     /// The single mapping from a shared summary (or its absence) to a rendered moment —
@@ -97,15 +111,50 @@ struct NettoWidgetProvider: TimelineProvider {
     }
 
     /// The store read is `async` (off the main actor by contract), so the completion is
-    /// delivered from a task rather than blocking WidgetKit's calling thread.
-    private func loadEntry(
+    /// delivered from a task rather than blocking WidgetKit's calling thread. The read
+    /// races a watchdog: whichever settles first delivers exactly once, and a hung read
+    /// falls back to the empty-state entry — branded content the system can always
+    /// render — instead of the blank skeleton WidgetKit shows when a completion never
+    /// arrives. Each outcome is logged by category (never content) so a physical-device
+    /// blank widget can be diagnosed from `log stream`.
+    func loadEntry(
         now: Date = Date(),
         completion: @escaping @Sendable (NettoWidgetEntry) -> Void
     ) {
         let store = self.store
+        let gate = EntryDeliveryGate()
         Task {
             let summary = await store.load()
+            guard gate.deliver() else { return }
+            Logger.widget.info("entry delivered status=\(summary?.status.rawValue ?? "none", privacy: .public)")
             completion(Self.entry(for: summary, now: now))
         }
+        Task {
+            do {
+                try await Task.sleep(nanoseconds: loadTimeoutNanos)
+            } catch {
+                return // watchdog cancelled by process teardown — nothing to deliver
+            }
+            guard gate.deliver() else { return }
+            Logger.widget.error("store read timed out; delivering empty-state entry")
+            completion(Self.entry(for: nil, now: now))
+        }
+    }
+}
+
+/// Exactly-once delivery for one widget load: the store read and the watchdog race,
+/// whichever settles first wins, and the loser is a no-op — WidgetKit must never see
+/// two completions (or none).
+private final class EntryDeliveryGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var delivered = false
+
+    /// Returns `true` exactly once; `false` means someone else already delivered.
+    func deliver() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !delivered else { return false }
+        delivered = true
+        return true
     }
 }

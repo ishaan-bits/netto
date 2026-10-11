@@ -229,17 +229,22 @@ struct VideoDatasetTests {
 
     // MARK: Phase mapping + presentation
 
+    /// The fixture catalog's fingerprint — what the environment's cache would supply.
+    private var fixtureSignature: String {
+        VideoDataset.signature(in: VideosFixture.completed)
+    }
+
     @Test func phaseFollowsPermissionBeforeCatalog() {
         #expect(
             VideosPresentation.phase(
                 permission: .notDetermined, catalog: .completed(VideosFixture.completed),
-                resolution: .idle
+                resolution: .idle, datasetSignature: fixtureSignature
             ) == .permissionRequired
         )
         #expect(
             VideosPresentation.phase(
                 permission: .denied, catalog: .completed(VideosFixture.completed),
-                resolution: .idle
+                resolution: .idle, datasetSignature: fixtureSignature
             ) == .permissionDenied
         )
     }
@@ -247,12 +252,14 @@ struct VideoDatasetTests {
     @Test func phaseIsScanRequiredWithoutCompletedCatalog() {
         #expect(
             VideosPresentation.phase(
-                permission: .authorized, catalog: .notStarted, resolution: .idle
+                permission: .authorized, catalog: .notStarted, resolution: .idle,
+                datasetSignature: ""
             ) == .scanRequired
         )
         #expect(
             VideosPresentation.phase(
-                permission: .authorized, catalog: .cancelled, resolution: .idle
+                permission: .authorized, catalog: .cancelled, resolution: .idle,
+                datasetSignature: ""
             ) == .scanRequired
         )
     }
@@ -261,7 +268,8 @@ struct VideoDatasetTests {
         #expect(
             VideosPresentation.phase(
                 permission: .authorized, catalog: .completed(VideosFixture.noVideosResult),
-                resolution: .idle
+                resolution: .idle,
+                datasetSignature: VideoDataset.signature(in: VideosFixture.noVideosResult)
             ) == .empty
         )
     }
@@ -272,28 +280,49 @@ struct VideoDatasetTests {
 
         #expect(
             VideosPresentation.phase(
-                permission: .authorized, catalog: catalog, resolution: .idle
-            ) == .measuringVideos(measured: 0, total: videoCount)
+                permission: .authorized, catalog: catalog, resolution: .idle,
+                datasetSignature: fixtureSignature
+            ) == .measuringVideos(measured: 0, total: videoCount, unavailable: 0)
         )
         #expect(
             VideosPresentation.phase(
                 permission: .authorized, catalog: catalog,
                 resolution: .measuring(
                     VideoSizeResolution.Measurement(
-                        datasetSignature: VideoDataset.signature(in: VideosFixture.completed),
+                        datasetSignature: fixtureSignature,
                         bytes: ["video-01": 1],
                         total: videoCount
                     )
-                )
-            ) == .measuringVideos(measured: 1, total: videoCount)
+                ),
+                datasetSignature: fixtureSignature
+            ) == .measuringVideos(measured: 1, total: videoCount, unavailable: 0)
         )
+    }
+
+    @Test func measuringSurfacesUnavailableSizesAsTheirOwnFigure() {
+        // Attempted-but-unmeasurable videos advance progress honestly: they show as
+        // `unavailable`, never folded into `measured` (and never zero).
+        let measurement = VideoSizeResolution.Measurement(
+            datasetSignature: fixtureSignature,
+            bytes: ["video-01": 1],
+            total: 6,
+            unavailableCount: 2
+        )
+        let phase = VideosPresentation.phase(
+            permission: .authorized,
+            catalog: .completed(VideosFixture.completed),
+            resolution: .measuring(measurement),
+            datasetSignature: fixtureSignature
+        )
+        #expect(phase == .measuringVideos(measured: 1, total: 6, unavailable: 2))
     }
 
     @Test func resultsAreSortedWithMeasuredSizesEmbedded() {
         let phase = VideosPresentation.phase(
             permission: .authorized,
             catalog: .completed(VideosFixture.completed),
-            resolution: VideosFixture.settledPartial
+            resolution: VideosFixture.settledPartial,
+            datasetSignature: fixtureSignature
         )
         guard case .results(let records) = phase else {
             Issue.record("expected results, got \(phase)")
@@ -308,6 +337,22 @@ struct VideoDatasetTests {
         #expect(bytes == bytes.sorted(by: >))
     }
 
+    @Test func aCallerSuppliedSettledRecordsListIsUsedVerbatim() {
+        // The environment passes its cached resolved+sorted list; the pure function must
+        // render exactly that (no second sort), and it must match what nil computes.
+        let records = VideoDataset.sorted(
+            VideoDataset.resolved(VideosFixture.videos, with: VideosFixture.measuredBytes)
+        )
+        let phase = VideosPresentation.phase(
+            permission: .authorized,
+            catalog: .completed(VideosFixture.completed),
+            resolution: VideosFixture.settledPartial,
+            datasetSignature: fixtureSignature,
+            settledRecords: records
+        )
+        #expect(phase == .results(records))
+    }
+
     @Test func aMeasurementFromAnotherDatasetIsTreatedAsIdle() {
         let stale = VideoSizeResolution.settled(
             VideoSizeResolution.Measurement(
@@ -319,9 +364,14 @@ struct VideoDatasetTests {
         let phase = VideosPresentation.phase(
             permission: .authorized,
             catalog: .completed(VideosFixture.completed),
-            resolution: stale
+            resolution: stale,
+            datasetSignature: fixtureSignature
         )
-        #expect(phase == .measuringVideos(measured: 0, total: VideosFixture.videos.count))
+        #expect(
+            phase == .measuringVideos(
+                measured: 0, total: VideosFixture.videos.count, unavailable: 0
+            )
+        )
     }
 
     // MARK: Dashboard status honesty
@@ -331,11 +381,13 @@ struct VideoDatasetTests {
 
         #expect(
             VideosPresentation.statusText(
-                permission: .authorized, catalog: catalog, resolution: .idle
+                permission: .authorized, catalog: catalog, resolution: .idle,
+                datasetSignature: fixtureSignature
             ) == "6 videos · sizes not measured yet"
         )
         let partialText = VideosPresentation.statusText(
-            permission: .authorized, catalog: catalog, resolution: VideosFixture.settledPartial
+            permission: .authorized, catalog: catalog, resolution: VideosFixture.settledPartial,
+            datasetSignature: fixtureSignature
         )
         #expect(partialText.hasPrefix("6 videos · measured "))
         #expect(partialText.hasSuffix("1 size pending"))
@@ -343,13 +395,14 @@ struct VideoDatasetTests {
         allSix["video-06"] = 50_000_000
         let full = VideoSizeResolution.settled(
             VideoSizeResolution.Measurement(
-                datasetSignature: VideoDataset.signature(in: VideosFixture.completed),
+                datasetSignature: fixtureSignature,
                 bytes: allSix,
                 total: VideosFixture.videos.count
             )
         )
         let fullText = VideosPresentation.statusText(
-            permission: .authorized, catalog: catalog, resolution: full
+            permission: .authorized, catalog: catalog, resolution: full,
+            datasetSignature: fixtureSignature
         )
         #expect(fullText.hasPrefix("6 videos · measured "))
         #expect(!fullText.contains("pending"))
@@ -361,39 +414,81 @@ struct VideoDatasetTests {
         // naming a zero total would claim a measurement that never happened.
         let nothingMeasured = VideoSizeResolution.settled(
             VideoSizeResolution.Measurement(
-                datasetSignature: VideoDataset.signature(in: VideosFixture.completed),
+                datasetSignature: fixtureSignature,
                 bytes: [:],
                 total: VideosFixture.videos.count
             )
         )
         let text = VideosPresentation.statusText(
-            permission: .authorized, catalog: catalog, resolution: nothingMeasured
+            permission: .authorized, catalog: catalog, resolution: nothingMeasured,
+            datasetSignature: fixtureSignature
         )
         #expect(text == "6 videos · 6 sizes pending")
         #expect(!text.contains("measured"))
     }
 
+    @Test func statusTextNamesUnavailableSizesDuringMeasurement() {
+        let catalog = CatalogScanState.completed(VideosFixture.completed)
+        let measuring = VideoSizeResolution.measuring(
+            VideoSizeResolution.Measurement(
+                datasetSignature: fixtureSignature,
+                bytes: ["video-01": 1],
+                total: 6,
+                unavailableCount: 2
+            )
+        )
+        let text = VideosPresentation.statusText(
+            permission: .authorized, catalog: catalog, resolution: measuring,
+            datasetSignature: fixtureSignature
+        )
+        #expect(text == "Measuring sizes · 1 of 6 videos… · 2 unavailable")
+    }
+
     @Test func statusTextCoversEmptyPermissionAndScanStates() {
         #expect(
             VideosPresentation.statusText(
-                permission: .notDetermined, catalog: .notStarted, resolution: .idle
+                permission: .notDetermined, catalog: .notStarted, resolution: .idle,
+                datasetSignature: ""
             ) == "Photos access needed"
         )
         #expect(
             VideosPresentation.statusText(
-                permission: .denied, catalog: .notStarted, resolution: .idle
+                permission: .denied, catalog: .notStarted, resolution: .idle,
+                datasetSignature: ""
             ) == "Photos access is off"
         )
         #expect(
             VideosPresentation.statusText(
-                permission: .authorized, catalog: .notStarted, resolution: .idle
+                permission: .authorized, catalog: .notStarted, resolution: .idle,
+                datasetSignature: ""
             ) == "Not scanned yet"
         )
         #expect(
             VideosPresentation.statusText(
                 permission: .authorized, catalog: .completed(VideosFixture.noVideosResult),
-                resolution: .idle
+                resolution: .idle,
+                datasetSignature: VideoDataset.signature(in: VideosFixture.noVideosResult)
             ) == "No videos found"
+        )
+    }
+
+    @Test func measuringMessageNeverClaimsProgressBeforeARunIsActive() {
+        // Idle: nothing has started — say what is about to happen, never "0 of N done".
+        #expect(
+            VideosPresentation.measuringMessage(
+                measured: 0, total: 6, unavailable: 0, isActive: false
+            ) == "Preparing to measure 6 videos…"
+        )
+        // Active: honest progress, with unmeasurable sizes surfaced as their own figure.
+        #expect(
+            VideosPresentation.measuringMessage(
+                measured: 2, total: 6, unavailable: 3, isActive: true
+            ) == "Measuring video sizes… 2 of 6 done (3 unavailable)"
+        )
+        #expect(
+            VideosPresentation.measuringMessage(
+                measured: 0, total: 0, unavailable: 0, isActive: true
+            ) == "Measuring video sizes…"
         )
     }
 

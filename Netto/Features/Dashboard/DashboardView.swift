@@ -173,7 +173,9 @@ struct DashboardView: View {
                     status: VideosPresentation.statusText(
                         permission: env.photoPermissionState,
                         catalog: env.catalogState,
-                        resolution: env.videoSizeResolution
+                        resolution: env.videoSizeResolution,
+                        datasetSignature: env.videoDatasetSignature,
+                        settledRecords: env.settledVideoRecords
                     ),
                     assetID: videosAssetID,
                     initials: nil,
@@ -306,7 +308,9 @@ struct DashboardView: View {
         guard case .results(let records) = VideosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            resolution: env.videoSizeResolution
+            resolution: env.videoSizeResolution,
+            datasetSignature: env.videoDatasetSignature,
+            settledRecords: env.settledVideoRecords
         ) else { return nil }
         return records.first?.localIdentifier
     }

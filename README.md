@@ -249,6 +249,64 @@ results, and the summary (gated on at least one confirmed removal) was suppresse
   system delete-confirmation dialog Photos presents per deletion remains the user's
   second, independent confirmation.
 
+### Device responsiveness & widget reliability (M8)
+
+Reported on a physical iPhone 17 Pro: the home-screen widget showed only the blank
+skeleton; the Videos screen sat at "0 of 7,061" for seconds and crawled; a full-library
+blur analysis over ~34 000 photos streamed "Preparing…" for a long time; the whole app
+was choppy. The video stall and blur choppiness were confirmed in code; the widget
+failure's *mechanism* still needs device logs to confirm (see Known limitations).
+
+- **Widget: a bounded watchdog guarantees branded content** — the extension's only
+  rendering path was `await store.load()` then deliver; a hung read (broken extension
+  process, App Group container miss on a debug install) never calls WidgetKit's
+  completion, and WidgetKit's contract for that is the blank skeleton. The load now
+  races a 2-second watchdog (`NettoWidgetProvider.loadEntry`): whichever settles first
+  delivers exactly once, and a timeout delivers the designed empty-state entry — branded
+  pixels instead of silence. Proven by tests: a store whose `load` never returns still
+  produces a branded entry within the watchdog budget; a responsive store still wins the
+  race.
+- **Widget: the store pipeline is diagnosable from the device** —
+  `FileWidgetSummaryStore` and the provider log every load/save outcome to
+  `Logger(subsystem: "com.ishaanparimal.netto", category: "widget")` (container
+  missing, file absent, corrupt file, delivered status, watchdog timeout) — category
+  and status names only, never photo data. Capture steps are under Known limitations.
+- **Video sizes: progress advances through failures** — the size provider returned a
+  bare size map, so a batch of iCloud-only or unreadable videos contributed nothing:
+  the counter sat at "0 of N" for seconds (one full 32-asset pass) and then stalled for
+  the whole library if nothing was downloadable. The provider now resolves every
+  requested identifier to `.measured` or `.unavailable` (`VideoSizeOutcome`), the
+  measurement loop counts attempts, and the UI surfaces unavailable sizes as their own
+  figure ("2 unavailable", with a "download in iCloud Photos" hint in the
+  partial-results banner) — never folded into measured, never zero.
+- **Video sizes: the first increment lands in about a second** — the sequential batch
+  size dropped from 32 to 8 (two waves at the provider's default width of 4), so the
+  counter moves within about a second of starting instead of after a full 32-asset pass.
+- **Videos screen: the signature and the sorted list are cached** —
+  `VideoDataset.signature` (O(videos log videos), a large joined string) and the
+  resolved largest-first record list used to recompute on every Videos/dashboard render
+  and once per measurement tick; on a 7k-video library that was main-actor work per
+  selection toggle. The environment now caches both (`videoDatasetSignature`,
+  `settledVideoRecords`), invalidated exactly when the catalog or measurement changes.
+- **Blur analysis: PhotoKit callbacks leave the main queue** — the analysis thumbnail
+  handler (classification + orientation re-render) ran on the main queue PhotoKit
+  delivers to; at 34k photos that constant traffic starved the UI even though the heavy
+  measurement ran elsewhere. The handler now hops to a utility queue before resolving.
+  The preview path is unchanged on purpose (its frames exist to be shown).
+- **Blur analysis: per-asset XPC status reads and cache misses stop paying** — every
+  asset-reference cache miss re-read `PHPhotoLibrary.authorizationStatus` (an XPC round
+  trip to the Photos daemon); a positive-only memo removes that per-asset cost, and an
+  empty fetch still re-checks live status so a revocation is never misreported as "this
+  photo was deleted". The shared `PHAsset` reference cache grew from 512 to 2 048
+  entries — the working set of a full-library pass at phone scale (a 34k run missed
+  entirely at 512, paying a `PHAsset.fetchAssets` round trip per photo).
+- **Checkpoint flushes and the blur seed leave the caller** — the O(n log n) identifier
+  sorts over every accumulated evidence entry used to run inside `setProgress` (the
+  main actor, every ~3 s) and engine-worker threads; they now run in the detached flush
+  task, leaving only an O(1) copy-on-write state handoff on the caller. The
+  tap-to-start blur seed walk (every catalog record against every saved verdict)
+  similarly moved off the main actor.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -312,7 +370,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 773 Swift Testing cases across 78 suites covering the pure
+- **Unit suite** — 46 files, 780 Swift Testing cases across 78 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -394,12 +452,12 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification (home-screen widget)** — focused runs green: the 8 new
-  provider/rendering tests plus the 35 pre-existing widget summary/store/presentation/
-  deep-link tests (43 tests across 7 suites), with a clean build of the app, the
-  widget extension, and the test target. The last full-suite run (Phase E worktree)
-  reported "765 tests in 76 suites passed"; this widget work adds the 8 tests above
-  and touches no app-target sources. One case,
+- **Recent verification (M8)** — focused runs green for the new coverage (the 2
+  watchdog tests in `NettoWidgetProviderTests`; the video presentation tests over
+  unavailable figures, the verbatim settled-records list, and the measuring message;
+  the flow tests over outcome accounting and an all-unavailable batch), then one
+  full-suite run: **780 tests in 78 suites passed** (previous: 773), and one clean
+  build of the app, widget extension, and test target. One case,
   `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests`, is cancelled when run inside the full suite but
   passes in isolation; this is a pre-existing Swift Testing suite-context quirk,
@@ -437,9 +495,18 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   writing the shared summary to the App Group container), timeline policy, and pixel
   rendering (every state, both families) are verified in Simulator and unit tests; the
   widget has not been installed and visually confirmed on a physical iPhone from this
-  build. Debug-build widget extensions on device occasionally render blank until the
-  widget is removed and re-added (a WidgetKit/dyld-install quirk outside the app's
-  control) — a Release/App Store build is the meaningful device check.
+  build. **The root cause of a device-only blank widget is not confirmed** — the code
+  paths are unit-covered, and the M8 watchdog guarantees branded empty-state content
+  even when the store read hangs, but confirming *why* a device renders the skeleton
+  requires the device's own logs: attach the iPhone, open Console.app (or run
+  `xcrun devicectl list devices` and then `log stream` against the device) with the
+  predicate `subsystem == "com.ishaanparimal.netto"`, filter on the `widget` category,
+  and look for `shared container unavailable` (missing App Group entitlement on the
+  debug install), `summary absent` (the app never wrote), `summary rejected` (corrupt
+  or incompatible file), or `store read timed out` (the watchdog fired). Debug-build
+  widget extensions on device occasionally render blank until the widget is removed
+  and re-added (a WidgetKit/dyld-install quirk outside the app's control) — a
+  Release/App Store build is the meaningful device check.
 - **Blur verdicts are calibrated on a procedural synthetic corpus, not on labelled
   real-device photographs** — accuracy on real libraries is unverified until a device
   corpus re-validates the thresholds. Known behaviours: very smooth content (blank
@@ -448,7 +515,8 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
    result is in-memory for the session only. The classifier never acts on its own —
    candidates are for explicit human review.
 - **Scan-runtime tradeoffs (Phase B)** — the asset-reference LRU is session-scoped
-  (512 entries): it bounds memory and lookup cost but does not persist across launches.
+  (2 048 entries since M8): it bounds memory and lookup cost but does not persist
+  across launches.
   Thermal scaling reacts to the reported thermal state, not to per-request latency; at
   critical pressure the scan deliberately slows instead of failing. Video-size
   measurement yields to a similarity or sharpness pass and resumes only when a pass's

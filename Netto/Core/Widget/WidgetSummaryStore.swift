@@ -1,5 +1,15 @@
 import Foundation
+import os
 import WidgetKit
+
+/// Widget-pipeline diagnostics, shared by the app-side writer and the extension-side
+/// reader. Content is category-only — status names, error names, counts — never photo
+/// data, filenames, byte figures, or any other private content. On a physical device
+/// these lines are what turn "the widget is blank" from a guess into a diagnosis
+/// (`log stream --predicate 'subsystem == "com.ishaanparimal.netto"'`).
+extension Logger {
+    static let widget = Logger(subsystem: "com.ishaanparimal.netto", category: "widget")
+}
 
 /// Failures of the file-backed widget store. `noSharedContainer` only happens when the
 /// App Group container cannot be resolved (missing entitlement or provisioning) — the
@@ -54,21 +64,44 @@ struct FileWidgetSummaryStore: WidgetSummaryStoring {
     }
 
     /// Missing file, unreadable file, corrupt JSON, or a rejected schema all load as
-    /// `nil` — the widget's empty state, never a crash and never partial content.
+    /// `nil` — the widget's empty state, never a crash and never partial content. Each
+    /// outcome is logged by category (never content) so a device-side blank widget can
+    /// be told apart from "the app never wrote".
     func load() async -> WidgetSummary? {
-        guard let url = try? fileURL() else { return nil }
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(WidgetSummary.self, from: data)
+        guard let url = try? fileURL() else {
+            // The distinguishing line for a device-only blank widget: without the App
+            // Group entitlement (or its provisioning), the extension can never see
+            // what the app wrote.
+            Logger.widget.error("summary load failed: shared container unavailable (check App Group entitlement)")
+            return nil
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            Logger.widget.debug("summary absent: no file in shared container yet")
+            return nil
+        }
+        guard let summary = try? JSONDecoder().decode(WidgetSummary.self, from: data) else {
+            Logger.widget.error("summary rejected: corrupt or incompatible file")
+            return nil
+        }
+        Logger.widget.info("summary loaded status=\(summary.status.rawValue, privacy: .public)")
+        return summary
     }
 
     /// Atomic replace: a crash mid-write can leave the old file or the new file, never a
     /// truncated one, so the widget never decodes a half-written summary.
     func save(_ summary: WidgetSummary) async throws {
-        let url = try fileURL()
+        let url: URL
+        do {
+            url = try fileURL()
+        } catch {
+            Logger.widget.error("summary save failed: shared container unavailable (check App Group entitlement)")
+            throw error
+        }
         let data = try JSONEncoder().encode(summary)
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try data.write(to: url, options: .atomic)
+        Logger.widget.info("summary saved status=\(summary.status.rawValue, privacy: .public)")
     }
 
     func requestWidgetReload() {

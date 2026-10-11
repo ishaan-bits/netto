@@ -415,8 +415,10 @@ struct VideosFlowTests {
     // MARK: Size measurement (bounded, cancellable, read-only)
 
     @Test func measurementRunsInBoundedSequentialBatchesAndSettlesComplete() async {
-        // 70 videos → three sequential batches of at most `measurementBatchSize` — never one
-        // unbounded fan-out, and every identifier is measured exactly once.
+        // 70 videos → nine sequential batches of at most `measurementBatchSize` — never one
+        // unbounded fan-out, and every identifier is measured exactly once. The batch size
+        // is 8 (two waves at the provider's default width of 4), so the first on-screen
+        // increment lands within about a second instead of after a full 32-asset pass.
         let catalog = makeCatalog(videoRecords(count: 70))
         let provider = RecordingSizeProvider(sizes: syntheticSizes(count: 70))
         let env = makeVideoEnv(catalog: catalog, sizeProvider: provider).env
@@ -431,8 +433,8 @@ struct VideosFlowTests {
         #expect(measurement.total == 70)
         #expect(measurement.measuredCount == 70)
         #expect(!measurement.isPartial)
-        #expect(provider.callCount == 3)
-        #expect(provider.batches.map(\.count) == [32, 32, 6])
+        #expect(provider.callCount == 9)
+        #expect(provider.batches.map(\.count) == [8, 8, 8, 8, 8, 8, 8, 8, 6])
         let served = provider.batches.flatMap { $0 }
         #expect(Set(served).count == 70) // each id exactly once
         // Measurement is read-only: it never touched the selection or the deletion machine.
@@ -454,6 +456,33 @@ struct VideosFlowTests {
         #expect(measurement.total == 6)
         #expect(measurement.isPartial)
         #expect(measurement.bytes["video-06"] == nil) // unknown, never zero
+        // The unmeasurable one was *attempted* — counted as unavailable, never as measured.
+        #expect(measurement.unavailableCount == 1)
+        #expect(measurement.resolvedCount == 6)
+    }
+
+    @Test func aBatchOfUnmeasurableVideosStillAdvancesProgressHonestly() async {
+        // The iCloud-only library: the provider resolves nothing. Progress must still
+        // resolve every identifier as unavailable — the screen never sits at "0 of N"
+        // while real work is happening — and the settled state must say exactly that,
+        // with zero measured and nothing fabricated.
+        let catalog = makeCatalog(videoRecords(count: 12))
+        let provider = RecordingSizeProvider(sizes: [:]) // knows nothing
+        let env = makeVideoEnv(catalog: catalog, sizeProvider: provider).env
+
+        env.startVideoSizeResolution()
+        await waitForSettled(env)
+
+        guard case .settled(let measurement) = env.videoSizeResolution else {
+            Issue.record("expected settled, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(measurement.total == 12)
+        #expect(measurement.measuredCount == 0)
+        #expect(measurement.unavailableCount == 12)
+        #expect(measurement.resolvedCount == 12)
+        #expect(measurement.isPartial) // nothing was *measured*
+        #expect(measurement.bytes.isEmpty) // unknown, never zero
     }
 
     @Test func cancelKeepsWhatWasMeasuredAndLateBatchesCannotOverwrite() async {

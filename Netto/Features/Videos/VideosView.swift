@@ -20,7 +20,9 @@ struct VideosView: View {
         VideosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            resolution: env.videoSizeResolution
+            resolution: env.videoSizeResolution,
+            datasetSignature: env.videoDatasetSignature,
+            settledRecords: env.settledVideoRecords
         )
     }
 
@@ -152,12 +154,18 @@ struct VideosView: View {
                 }
             }
 
-        case .measuringVideos(let measured, let total):
+        case .measuringVideos(let measured, let total, let unavailable):
+            // An idle resolution has started nothing — say what is about to happen
+            // instead of claiming a progress that is not running.
+            let isActive = !env.videoSizeResolution.isIdle
             progressState(
-                message: total > 0
-                    ? "Measuring video sizes… \(measured) of \(total) done"
-                    : "Measuring video sizes…",
-                fraction: total > 0 ? Double(measured) / Double(total) : nil,
+                message: VideosPresentation.measuringMessage(
+                    measured: measured,
+                    total: total,
+                    unavailable: unavailable,
+                    isActive: isActive
+                ),
+                fraction: isActive && total > 0 ? Double(measured) / Double(total) : nil,
                 cancel: { env.cancelVideoSizeResolution() }
             )
 
@@ -197,6 +205,13 @@ struct VideosView: View {
                         )
                         .font(.caption)
                         .foregroundStyle(NettoColor.warning)
+                        if measurement.unavailableCount > 0 {
+                            // Attempted but not measurable (iCloud-only, unreadable) —
+                            // named as its own figure, never folded into "measured".
+                            Text("\(measurement.unavailableCount) of these could not be measured — download them in iCloud Photos, then measure again.")
+                                .font(.caption)
+                                .foregroundStyle(NettoColor.textSecondary)
+                        }
                         Button("Measure Sizes") {
                             env.resumeVideoSizeMeasurement()
                         }

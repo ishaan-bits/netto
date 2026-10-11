@@ -60,6 +60,33 @@ protocol AssetSizeProviding: Sendable {
     func sizes(for localIdentifiers: [String]) async -> [String: Int64]
 }
 
+/// One asset's sizing outcome — measured bytes, or an honest "could not measure".
+///
+/// Distinct from a bare `[String: Int64]` so a batch of failures still advances progress:
+/// the video-size pass can count attempts that resolved to unavailable without ever folding
+/// them into the measured total (an unavailable size is never a completed measurement, and
+/// it is never zero).
+enum VideoSizeOutcome: Sendable, Equatable {
+    case measured(Int64)
+    case unavailable
+}
+
+extension AssetSizeProviding {
+    /// Per-asset outcomes for the video-size pass. The default derives outcomes from
+    /// `sizes(for:)` — every requested identifier the provider did not answer is
+    /// unavailable (the documented "absent means unknown" contract). Providers that can
+    /// classify natively override this; fixtures and test doubles need no change.
+    func outcomes(for localIdentifiers: [String]) async -> [String: VideoSizeOutcome] {
+        let sizes = await sizes(for: localIdentifiers)
+        var outcomes: [String: VideoSizeOutcome] = [:]
+        outcomes.reserveCapacity(localIdentifiers.count)
+        for identifier in localIdentifiers {
+            outcomes[identifier] = sizes[identifier].map(VideoSizeOutcome.measured) ?? .unavailable
+        }
+        return outcomes
+    }
+}
+
 extension Array where Element == PhotoAssetRecord {
     /// Fills in `sizeInBytes` for records whose size is still unknown.
     ///
@@ -102,15 +129,40 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     var maxConcurrentResolutions: Int = 4
 
     func sizes(for localIdentifiers: [String]) async -> [String: Int64] {
+        let outcomes = await outcomes(for: localIdentifiers)
+        var sizes: [String: Int64] = [:]
+        for (identifier, outcome) in outcomes {
+            if case .measured(let bytes) = outcome {
+                sizes[identifier] = bytes
+            }
+        }
+        return sizes
+    }
+
+    /// The native outcome pass: every requested asset resolves to `.measured` or
+    /// `.unavailable` — never a silently dropped identifier — so the caller's progress
+    /// reflects the work that actually happened even when a whole batch fails (an
+    /// iCloud-only library used to leave the screen pinned at "0 of N" through every
+    /// failed batch).
+    func outcomes(for localIdentifiers: [String]) async -> [String: VideoSizeOutcome] {
         guard !localIdentifiers.isEmpty else { return [:] }
 
         let fetchOptions = PHFetchOptions()
         fetchOptions.fetchLimit = localIdentifiers.count
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: localIdentifiers, options: fetchOptions)
-        guard assets.count > 0 else { return [:] }
+        guard assets.count > 0 else {
+            // Nothing resolved — every requested identifier is unavailable, honestly.
+            var outcomes: [String: VideoSizeOutcome] = [:]
+            outcomes.reserveCapacity(localIdentifiers.count)
+            for identifier in localIdentifiers {
+                outcomes[identifier] = .unavailable
+            }
+            return outcomes
+        }
 
         let policy = ScanConcurrencyPolicy()
-        var results: [String: Int64] = [:]
+        var outcomes: [String: VideoSizeOutcome] = [:]
+        outcomes.reserveCapacity(localIdentifiers.count)
 
         var index = 0
         while index < assets.count {
@@ -118,7 +170,7 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             // long video-size scan take effect; a critical state pauses between batches
             // (non-throwing API: cancellation exits early with what has been measured).
             while policy.isCriticallyPressed {
-                if Task.isCancelled { return results }
+                if Task.isCancelled { return outcomes }
                 try? await Task.sleep(for: .milliseconds(250))
             }
             let width = policy.width(base: maxConcurrentResolutions)
@@ -126,34 +178,42 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             let batch = (index..<end).map { assets.object(at: $0) }
             index = end
 
-            let measured = await withTaskGroup(
-                of: SizeMeasurement?.self,
+            let resolved = await withTaskGroup(
+                of: SizeMeasurement.self,
                 returning: [SizeMeasurement].self
             ) { group in
                 for asset in batch {
                     group.addTask {
-                        guard let bytes = await Self.contentBytes(for: asset) else { return nil }
-                        return SizeMeasurement(localIdentifier: asset.localIdentifier, bytes: bytes)
+                        let bytes = await Self.contentBytes(for: asset)
+                        return SizeMeasurement(
+                            localIdentifier: asset.localIdentifier,
+                            outcome: bytes.map(VideoSizeOutcome.measured) ?? .unavailable
+                        )
                     }
                 }
                 var collected: [SizeMeasurement] = []
                 for await value in group {
-                    if let value { collected.append(value) }
+                    collected.append(value)
                 }
                 return collected
             }
 
-            for measurement in measured {
-                results[measurement.localIdentifier] = measurement.bytes
+            for measurement in resolved {
+                outcomes[measurement.localIdentifier] = measurement.outcome
             }
         }
 
-        return results
+        // Identifiers the fetch never resolved (deleted mid-run, outside limited access)
+        // are unavailable, not missing — the caller's counts stay honest either way.
+        for identifier in localIdentifiers where outcomes[identifier] == nil {
+            outcomes[identifier] = .unavailable
+        }
+        return outcomes
     }
 
     private struct SizeMeasurement: Sendable {
         let localIdentifier: String
-        let bytes: Int64
+        let outcome: VideoSizeOutcome
     }
 
     private static func contentBytes(for asset: PHAsset) async -> Int64? {

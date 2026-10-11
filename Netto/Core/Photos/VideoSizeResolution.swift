@@ -25,16 +25,27 @@ enum VideoSizeResolution: Sendable, Equatable {
         let bytes: [String: Int64]
         /// Videos in the dataset when this measurement started.
         let total: Int
+        /// Videos this run attempted but could not measure (iCloud-only, unreadable,
+        /// deleted mid-run). Never counted as measured — shown as its own figure so a
+        /// batch of failures still advances on-screen progress honestly, instead of
+        /// leaving the counter pinned at zero.
+        var unavailableCount: Int = 0
 
         var measuredCount: Int { bytes.count }
+        /// Videos this run has finished *attempting* — measured plus honestly-unavailable.
+        /// Progress that includes both never stalls while real work is happening.
+        var resolvedCount: Int { measuredCount + unavailableCount }
         /// Some videos in this dataset were never measured (cancelled, or content unreadable).
         var isPartial: Bool { measuredCount < total }
     }
 
     /// Sequential batch size for resolution: at most this many identifiers are handed to the
-    /// (internally 4-wide) size provider at once, so a large video list produces bounded,
-    /// cancellable progress instead of one unbounded fan-out.
-    static let measurementBatchSize = 32
+    /// (internally thermal-width) size provider at once, so a large video list produces bounded,
+    /// cancellable progress instead of one unbounded fan-out. Kept small — two waves at the
+    /// provider's default width of 4 — so the first on-screen increment lands within about a
+    /// second of measurement starting, instead of after a full 32-asset pass (which left the
+    /// screen pinned at "0 of N" for several seconds on a large library).
+    static let measurementBatchSize = 8
 
     /// Measured bytes in any state (`[:]` while idle).
     var bytes: [String: Int64] {
@@ -53,6 +64,12 @@ enum VideoSizeResolution: Sendable, Equatable {
 
     var isMeasuring: Bool {
         if case .measuring = self { return true }
+        return false
+    }
+
+    /// No measurement has run (or a rebuilt dataset dropped the previous one).
+    var isIdle: Bool {
+        if case .idle = self { return true }
         return false
     }
 

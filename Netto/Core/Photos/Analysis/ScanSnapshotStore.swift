@@ -514,15 +514,17 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
         }
         entriesSinceFlush = 0
         lastFlushAt = now()
-        guard let snapshot = snapshotLocked() else {
+        guard let state = flushStateLocked() else {
             lock.unlock()
             return
         }
         lock.unlock()
-        // Detached: JSON encoding + atomic file write of a potentially megabyte-sized
-        // payload never touches a worker thread or the main actor. The writer's
-        // (sequence, updatedAt) ordering makes concurrent flushes safe.
-        Task.detached(priority: .utility) { [writer] in writer.write(snapshot) }
+        // Detached: the identifier sorts (O(n log n) over every accumulated entry) and the
+        // JSON write both leave the caller — engine workers, and the main actor through
+        // `setProgress`, where a full-library sort every 3 s was a visible hitch.
+        Task.detached(priority: .utility) { [writer] in
+            writer.write(Self.checkpoint(from: state))
+        }
     }
 
     /// Progress for the active run, tagged with its kind so a chained catalog rebuild
@@ -547,7 +549,7 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
         totalUnits = total
         dirty = true
         guard now().timeIntervalSince(lastFlushAt) >= batchInterval,
-              let snapshot = snapshotLocked()
+              let state = flushStateLocked()
         else {
             lock.unlock()
             return
@@ -555,7 +557,11 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
         entriesSinceFlush = 0
         lastFlushAt = now()
         lock.unlock()
-        Task.detached(priority: .utility) { [writer] in writer.write(snapshot) }
+        // Detached, same as `record`: this call runs on the main actor (every coalesced
+        // progress write), so the O(evidence) identifier sort must not land there.
+        Task.detached(priority: .utility) { [writer] in
+            writer.write(Self.checkpoint(from: state))
+        }
     }
 
     /// Stamps the calibration the blur run is classifying with, so an interruption
@@ -571,8 +577,12 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
     /// Best-effort snapshot of what is accumulated right now; nil when no run is active.
     func snapshot() -> ScanCheckpoint? {
         lock.lock()
-        defer { lock.unlock() }
-        return snapshotLocked()
+        guard let state = flushStateLocked() else {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
+        return Self.checkpoint(from: state)
     }
 
     /// Writes any pending state synchronously and returns whether it wrote. Used at
@@ -580,7 +590,7 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
     @discardableResult
     func flushNowSync() -> Bool {
         lock.lock()
-        guard dirty, let snapshot = snapshotLocked() else {
+        guard dirty, let state = flushStateLocked() else {
             lock.unlock()
             return false
         }
@@ -588,13 +598,15 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
         entriesSinceFlush = 0
         lastFlushAt = now()
         lock.unlock()
-        writer.write(snapshot)
+        writer.write(Self.checkpoint(from: state))
         return true
     }
 
-    private func snapshotLocked() -> ScanCheckpoint? {
+    /// Immutable copy of the accumulated state, taken under the lock (so `updatedAt` orders
+    /// against exactly the payload it stamps); nil when no writable run is active.
+    private func flushStateLocked() -> FlushState? {
         guard let kind, kind != .videoSizes else { return nil }
-        return ScanCheckpoint(
+        return FlushState(
             runSequence: runSequence,
             kind: kind,
             startedAt: startedAt,
@@ -602,12 +614,47 @@ final class ScanCheckpointAccumulator: @unchecked Sendable {
             stage: stage,
             completedUnits: completedUnits,
             totalUnits: totalUnits,
-            // Sorted by identifier so a snapshot of the same evidence is byte-identical
-            // regardless of worker completion order — determinism for tests and diffs.
-            perceptualHashes: perceptualHashes.sorted { $0.assetID < $1.assetID },
-            byteKeys: byteKeys.sorted { $0.assetID < $1.assetID },
-            blurVerdicts: blurVerdicts.sorted { $0.assetID < $1.assetID },
+            perceptualHashes: perceptualHashes,
+            byteKeys: byteKeys,
+            blurVerdicts: blurVerdicts,
             blurThresholds: blurThresholds
         )
+    }
+
+    /// The sort-and-build step, extracted so the flush paths can run it *off* the caller
+    /// (the identifier sorts are O(n log n) over every accumulated entry — engine-worker
+    /// threads, and the main actor through `setProgress`). Ordering by identifier keeps a
+    /// snapshot of the same evidence byte-identical regardless of worker completion order —
+    /// determinism for tests and diffs, unchanged from the previous under-lock sort.
+    private static func checkpoint(from state: FlushState) -> ScanCheckpoint {
+        ScanCheckpoint(
+            runSequence: state.runSequence,
+            kind: state.kind,
+            startedAt: state.startedAt,
+            updatedAt: state.updatedAt,
+            stage: state.stage,
+            completedUnits: state.completedUnits,
+            totalUnits: state.totalUnits,
+            perceptualHashes: state.perceptualHashes.sorted { $0.assetID < $1.assetID },
+            byteKeys: state.byteKeys.sorted { $0.assetID < $1.assetID },
+            blurVerdicts: state.blurVerdicts.sorted { $0.assetID < $1.assetID },
+            blurThresholds: state.blurThresholds
+        )
+    }
+
+    /// Immutable snapshot inputs (arrays shared via copy-on-write — taking this is O(1)
+    /// apart from the array headers, never a per-entry copy).
+    private struct FlushState: Sendable {
+        let runSequence: Int
+        let kind: ScanCheckpoint.Kind
+        let startedAt: Date
+        let updatedAt: Date
+        let stage: String
+        let completedUnits: Int
+        let totalUnits: Int
+        let perceptualHashes: [PerceptualHashEntry]
+        let byteKeys: [ContentByteKeyEntry]
+        let blurVerdicts: [BlurVerdictEntry]
+        let blurThresholds: BlurThresholds?
     }
 }
