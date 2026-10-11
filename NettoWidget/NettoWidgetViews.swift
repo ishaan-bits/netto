@@ -1,5 +1,8 @@
 import SwiftUI
 import WidgetKit
+#if NETTO_WIDGET_TESTS
+@testable import Netto
+#endif
 
 /// Renders one `WidgetDisplayModel` in the small and medium families. Everything it
 /// draws comes from the model — no dates, no formatting decisions, no raw bytes logic
@@ -19,8 +22,15 @@ struct NettoWidgetEntryView: View {
 
     let entry: NettoWidgetEntry
 
-    @ViewBuilder
     var body: some View {
+        content(for: family)
+    }
+
+    /// The family-resolved layout. Extracted from `body` so the unit tests can render a
+    /// specific family's pixels directly — the `widgetFamily` environment value is
+    /// read-only in the SDK, so it cannot be injected into the view from a test.
+    @ViewBuilder
+    func content(for family: WidgetFamily) -> some View {
         switch family {
         case .systemMedium:
             medium

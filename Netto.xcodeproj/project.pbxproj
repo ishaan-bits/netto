@@ -16,6 +16,9 @@
 		4D5FA11C000000000000001E /* WidgetSummaryPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C000000000000001F /* WidgetSummaryPresentationTests.swift */; };
 		4D5FA11C0000000000000020 /* WidgetDeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000021 /* WidgetDeepLinkTests.swift */; };
 		4D5FA11C0000000000000022 /* AppEnvironmentWidgetSummaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000023 /* AppEnvironmentWidgetSummaryTests.swift */; };
+		4D5FA11C0000000000000041 /* NettoWidgetProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000004 /* NettoWidgetProvider.swift */; };
+		4D5FA11C0000000000000042 /* NettoWidgetViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000005 /* NettoWidgetViews.swift */; };
+		4D5FA11C0000000000000044 /* NettoWidgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000043 /* NettoWidgetTests.swift */; };
 		4D5FA11C0000000000000024 /* WidgetSummary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000013 /* WidgetSummary.swift */; };
 		4D5FA11C0000000000000025 /* WidgetSummaryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000015 /* WidgetSummaryStore.swift */; };
 		4D5FA11C0000000000000026 /* WidgetSummaryPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D5FA11C0000000000000017 /* WidgetSummaryPresentation.swift */; };
@@ -240,6 +243,7 @@
 		4D5FA11C000000000000001F /* WidgetSummaryPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetSummaryPresentationTests.swift; sourceTree = "<group>"; };
 		4D5FA11C0000000000000021 /* WidgetDeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetDeepLinkTests.swift; sourceTree = "<group>"; };
 		4D5FA11C0000000000000023 /* AppEnvironmentWidgetSummaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppEnvironmentWidgetSummaryTests.swift; sourceTree = "<group>"; };
+		4D5FA11C0000000000000043 /* NettoWidgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NettoWidgetTests.swift; sourceTree = "<group>"; };
 		4D5FA11A0000000000000001 /* SpaceFreedSummary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummary.swift; sourceTree = "<group>"; };
 		4D5FA11A0000000000000003 /* SpaceFreedSummaryPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummaryPresentation.swift; sourceTree = "<group>"; };
 		4D5FA11A0000000000000005 /* SpaceFreedSummaryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpaceFreedSummaryView.swift; sourceTree = "<group>"; };
@@ -667,6 +671,7 @@
 				4D5FA11C000000000000001F /* WidgetSummaryPresentationTests.swift */,
 				4D5FA11C0000000000000021 /* WidgetDeepLinkTests.swift */,
 				4D5FA11C0000000000000023 /* AppEnvironmentWidgetSummaryTests.swift */,
+				4D5FA11C0000000000000043 /* NettoWidgetTests.swift */,
 			);
 			path = NettoTests;
 			sourceTree = "<group>";
@@ -1016,6 +1021,9 @@
 				4D5FA11C000000000000001E /* WidgetSummaryPresentationTests.swift in Sources */,
 				4D5FA11C0000000000000020 /* WidgetDeepLinkTests.swift in Sources */,
 				4D5FA11C0000000000000022 /* AppEnvironmentWidgetSummaryTests.swift in Sources */,
+				4D5FA11C0000000000000041 /* NettoWidgetProvider.swift in Sources */,
+				4D5FA11C0000000000000042 /* NettoWidgetViews.swift in Sources */,
+				4D5FA11C0000000000000044 /* NettoWidgetTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1197,6 +1205,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.tests;
 				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "NETTO_WIDGET_TESTS $(inherited)";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Netto.app/Netto";
 			};
@@ -1231,6 +1240,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.ishaanparimal.netto.tests;
 				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "NETTO_WIDGET_TESTS $(inherited)";
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Netto.app/Netto";
 			};

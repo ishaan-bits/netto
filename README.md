@@ -63,9 +63,16 @@ Beyond the core cleanup loop:
   the engine's recommended selection exactly as presented.
 - **Scan ETA** — a rolling-throughput estimate of remaining scan time shown alongside
   progress.
-- **Home screen widget** — a WidgetKit extension renders the shared scan summary from
-  the App Group; it reads only that summary and never links PhotoKit, Vision, or the
-  deletion path.
+- **Home screen widget** — a WidgetKit extension (small and medium) renders the shared
+  widget summary from the App Group: the last confirmed cleanup's estimated bytes
+  (labelled as an estimate) with its day, or "Ready to clean" with the last scan's day,
+  or a designed empty state that prompts back into the app — every state real content,
+  never a fabricated number and never a blank box. It re-reads whatever the app last
+  wrote (the app writes on launch, scan completion, and confirmed cleanup, then asks
+  WidgetKit for a reload), refreshes on a one-hour timeline budget with staleness
+  handled by labelling rather than polling, and tapping anywhere opens the app at the
+  dashboard through the `netto://` deep link. It reads only that shared summary —
+  never PhotoKit, Vision, or the deletion path.
 - **Space-freed summary** — after a confirmed deletion whose committed Photos change
   is verified, a dedicated summary screen shows the count of confirmed removed assets
   and the estimated bytes freed (computed from the plan's measured sizes, always
@@ -305,7 +312,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 46 files, 765 Swift Testing cases across 76 suites covering the pure
+- **Unit suite** — 46 files, 773 Swift Testing cases across 78 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -375,12 +382,24 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   driven through the real `PhotoDeletionService` proves a committed change verifies as
   full success — the submission-of-record accounting, not the ambiguous re-fetch,
   decides what was removed — with an in-block gap still reported as a partial honestly.
+- **Home-screen widget coverage** — 8 cases over the extension's two untested layers:
+  the provider's context-free mapping (the placeholder is a real `.scanReady` status
+  with no figure and no digit in its headline; an entry carries exactly its summary and
+  date; the timeline asks for one refresh an hour later and carries exactly its entry;
+  a summary saved through the real file store arrives as the labelled-estimate entry;
+  a missing file arrives as the designed empty state) and rendered-pixel proof that
+  `NettoWidgetEntryView` is never a blank box: `ImageRenderer` snapshots of the real
+  view in both families across the empty, scan-ready, last-cleanup, and stale variants
+  all draw real ink, and the pixels change with the model rather than rendering
+  something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification** — full suites green on the Phase E worktree: the unit run
-  reports "765 tests in 76 suites passed", plus 5/5 UI cases, and a clean
-  `build-for-testing` with 0 errors (the pre-existing 251-warning UI-test-target
-  baseline is unchanged; the unit/app targets are warning-free). One case,
+- **Recent verification (home-screen widget)** — focused runs green: the 8 new
+  provider/rendering tests plus the 35 pre-existing widget summary/store/presentation/
+  deep-link tests (43 tests across 7 suites), with a clean build of the app, the
+  widget extension, and the test target. The last full-suite run (Phase E worktree)
+  reported "765 tests in 76 suites passed"; this widget work adds the 8 tests above
+  and touches no app-target sources. One case,
   `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests`, is cancelled when run inside the full suite but
   passes in isolation; this is a pre-existing Swift Testing suite-context quirk,
@@ -414,6 +433,13 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   `simctl addmedia` can additionally surface as cloud-only placeholders.
 - Simulated validation against the fixture data above covers flow and logic, but not
   real-world library scale or hardware performance.
+- **Home-screen widget on a physical device** — the widget's data pipeline (the app
+  writing the shared summary to the App Group container), timeline policy, and pixel
+  rendering (every state, both families) are verified in Simulator and unit tests; the
+  widget has not been installed and visually confirmed on a physical iPhone from this
+  build. Debug-build widget extensions on device occasionally render blank until the
+  widget is removed and re-added (a WidgetKit/dyld-install quirk outside the app's
+  control) — a Release/App Store build is the meaningful device check.
 - **Blur verdicts are calibrated on a procedural synthetic corpus, not on labelled
   real-device photographs** — accuracy on real libraries is unverified until a device
   corpus re-validates the thresholds. Known behaviours: very smooth content (blank
