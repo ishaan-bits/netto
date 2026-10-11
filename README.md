@@ -753,6 +753,15 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   Settings → Privacy & Security → Analytics → Crash Logs would confirm the first
   suspect). Removing and re-adding the widget from the gallery after a fresh install is
   also worth doing to rule out the stale-configuration suspect.
+- **Scan-core animation performance is unmeasured on a physical device (M12)** — the
+  animation's frame rate, battery draw, and thermal behaviour were not profiled on a real
+  iPhone; validation is Simulator runs and code inspection only. The core is a single
+  48 px view whose repeating motion is gated on an in-flight run, an active scene, and
+  Reduce Motion being off (it is removed from the hierarchy the moment a scan pauses,
+  finishes, fails, is cancelled, or the app backgrounds), with no timers and no per-asset
+  tasks — a reasoned basis for expecting it to be cheap, but not a measurement. Real-device
+  validation of the scan animation, like the rest of the device matrix, has not been
+  performed.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the
