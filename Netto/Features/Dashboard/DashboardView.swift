@@ -1,21 +1,16 @@
 import SwiftUI
 
 /// The dashboard: identity, one honest headline, the storage hero, one scan surface, and the
-/// "Clean up" grid.
+/// five primary cleanup sections.
 ///
 /// Composition runs top to bottom in a single vertical stack with one spacing token, so every
 /// block is laid out by normal container rules — no offsets, no fixed coordinates, no layer
-/// drawn over another. Every value on screen comes from `DashboardPresentation`,
-/// `StorageSnapshot`, or the phase enums of the four categories.
+/// drawn over another. Every status line comes from `DashboardCleanupPresentation`, which
+/// derives it from the same state machines the destination screens use.
 struct DashboardView: View {
     @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var showPhotoPrePrompt = false
     @Namespace private var cardNamespace
-
-    private let categoryColumns = [
-        GridItem(.flexible(), spacing: NettoLayout.Spacing.md),
-        GridItem(.flexible(), spacing: NettoLayout.Spacing.md)
-    ]
 
     private var scanStatus: DashboardPresentation.ScanStatus {
         DashboardPresentation.scanStatus(
@@ -44,7 +39,7 @@ struct DashboardView: View {
                         scanStatusCard
                     }
                     .nettoEntrance(step: 3)
-                    categorySection
+                    cleanupSection
                 }
                 .padding(NettoLayout.Spacing.lg)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -127,9 +122,12 @@ struct DashboardView: View {
         }
     }
 
-    // MARK: CLEANUP grid
+    // MARK: CLEANUP — the five primary sections
 
-    private var categorySection: some View {
+    /// The five primary cleanup sections. Each row reports only what the app's current state
+    /// can honestly back (a real count, real progress, or a real blocking reason) and routes
+    /// into exactly one hub or feature screen. Nothing here starts an analysis on appear.
+    private var cleanupSection: some View {
         VStack(alignment: .leading, spacing: NettoLayout.Spacing.md) {
             Text("Clean up")
                 .font(NettoType.sectionTitle)
@@ -137,287 +135,53 @@ struct DashboardView: View {
                 .accessibilityIdentifier("cleanupSectionTitle")
                 .nettoEntrance(step: 4)
 
-            LazyVGrid(columns: categoryColumns, spacing: NettoLayout.Spacing.md) {
-                categoryLink(
-                    id: "similarPhotos",
-                    identifier: "similarPhotosCard",
-                    title: "Similar Photos",
-                    icon: "photo.on.rectangle.angled",
-                    status: similarPhotosStatusText,
-                    assetID: similarPhotosResult.flatMap { Self.firstAssetID(in: $0) },
-                    initials: nil,
-                    step: 5,
-                    destination: { SimilarPhotosView() }
-                )
-
-                categoryLink(
-                    id: "screenshots",
-                    identifier: "screenshotsCard",
-                    title: "Screenshots",
-                    icon: "rectangle.on.rectangle",
-                    status: ScreenshotsPresentation.statusText(
-                        permission: env.photoPermissionState,
-                        catalog: env.catalogState
-                    ),
-                    assetID: screenshotsAssetID,
-                    initials: nil,
-                    step: 6,
-                    destination: { ScreenshotsView() }
-                )
-
-                categoryLink(
-                    id: "largeVideos",
-                    identifier: "largeVideosCard",
-                    title: "Large Videos",
-                    icon: "video",
-                    status: VideosPresentation.statusText(
-                        permission: env.photoPermissionState,
-                        catalog: env.catalogState,
-                        resolution: env.videoSizeResolution,
-                        datasetSignature: env.videoDatasetSignature,
-                        settledRecords: env.videoRecordsForDisplay
-                    ),
-                    assetID: videosAssetID,
-                    initials: nil,
-                    step: 7,
-                    destination: { VideosView() }
-                )
-
-                categoryLink(
-                    id: "duplicateContacts",
-                    identifier: "duplicateContactsRow",
-                    title: "Duplicate Contacts",
-                    icon: "person.2",
-                    status: ContactsPresentation.statusText(
-                        permission: env.contactsPermissionState,
-                        scan: env.contactScanState
-                    ),
-                    assetID: nil,
-                    initials: contactsInitials,
-                    step: 8,
-                    destination: { DuplicateContactsView() }
-                )
-
-                // Top-level Swipe Review — a sibling of the photo features above, opening
-                // the swipe session directly (no Similar Photos detour). Its deck is the
-                // scanned catalog itself, so it needs analysis results only for the shared
-                // review handoff, never to open or run.
-                categoryLink(
-                    id: "swipeReview",
-                    identifier: SwipeReviewPresentation.entryAccessibilityID,
-                    title: SwipeReviewPresentation.entryLabel,
-                    icon: "arrow.left.and.right",
-                    status: swipeReviewStatusText,
-                    assetID: swipeReviewAssetID,
-                    initials: nil,
-                    step: 9,
-                    destination: { SwipeReviewView() }
-                )
-
-                // The on-device sharpness pass (milestone 5B): its own analysis over the
-                // completed catalog, its own grid, the same shared review handoff.
-                categoryLink(
-                    id: "potentiallyBlurry",
-                    identifier: "potentiallyBlurryCard",
-                    title: "Potentially Blurry",
-                    icon: "camera.metering.unknown",
-                    status: PotentiallyBlurryPresentation.statusText(
-                        permission: env.photoPermissionState,
-                        catalog: env.catalogState,
-                        blur: env.blurAnalysisState
-                    ),
-                    assetID: potentiallyBlurryAssetID,
-                    initials: nil,
-                    step: 10,
-                    destination: { PotentiallyBlurryView() }
-                )
+            VStack(spacing: NettoLayout.Spacing.md) {
+                ForEach(DashboardCleanupSection.allCases, id: \.self) { section in
+                    sectionLink(section)
+                        .nettoEntrance(step: 5 + DashboardCleanupSection.allCases.firstIndex(of: section)!)
+                }
             }
         }
     }
 
-    private func categoryLink<Destination: View>(
-        id: String,
-        identifier: String,
-        title: String,
-        icon: String,
-        status: String,
-        assetID: String?,
-        initials: String?,
-        step: Int,
-        @ViewBuilder destination: () -> Destination
-    ) -> some View {
-        NavigationLink {
-            destination()
-                .nettoZoomDestination(id, in: cardNamespace)
-        } label: {
-            DashboardCategoryCard(
-                title: title,
-                icon: icon,
-                status: status,
-                assetID: assetID,
-                initials: initials,
-                store: env.thumbnails
-            )
-        }
-        .buttonStyle(DashboardCardPressStyle())
-        .nettoEntrance(step: step)
-        .nettoZoomSource(id, in: cardNamespace)
-        .accessibilityIdentifier(identifier)
-    }
-
-    // MARK: Real data (never fabricated — nil when there is nothing to show)
-
-    private var similarPhotosResult: PhotoAnalysisResult? {
-        guard case .results(let result) = similarPhotosPhase else { return nil }
-        return result
-    }
-
-    private var similarPhotosPhase: SimilarPhotosPhase {
-        SimilarPhotosPresentation.phase(
-            permission: env.photoPermissionState,
-            catalog: env.catalogState,
-            analysis: env.analysisState,
-            pendingBehindOtherPass: env.pendingAnalysisRequest == .similarity
-        )
-    }
-
-    /// First group member (exact groups first, then similar) — two no-allocation passes
-    /// instead of concatenating both group arrays on every render.
-    private static func firstAssetID(in result: PhotoAnalysisResult) -> String? {
-        for group in result.exactGroups {
-            if let id = group.memberAssetIDs.first {
-                return id
-            }
-        }
-        for group in result.similarGroups {
-            if let id = group.memberAssetIDs.first {
-                return id
-            }
-        }
-        return nil
-    }
-
-    private var screenshotsAssetID: String? {
-        guard case .results(let records) = ScreenshotsPresentation.phase(
-            permission: env.photoPermissionState,
-            catalog: env.catalogState
-        ) else { return nil }
-        return records.first?.localIdentifier
-    }
-
-    private var videosAssetID: String? {
-        guard case .results(let records) = VideosPresentation.phase(
-            permission: env.photoPermissionState,
-            catalog: env.catalogState,
-            resolution: env.videoSizeResolution,
-            datasetSignature: env.videoDatasetSignature,
-            settledRecords: env.videoRecordsForDisplay
-        ) else { return nil }
-        return records.first?.localIdentifier
-    }
-
-    /// First candidate's thumbnail for the Potentially Blurry card; nil when there is
-    /// nothing to show (no candidates, or the pass has not completed).
-    private var potentiallyBlurryAssetID: String? {
-        guard case .results(let result) = PotentiallyBlurryPresentation.phase(
-            permission: env.photoPermissionState,
-            catalog: env.catalogState,
-            blur: env.blurAnalysisState
-        ) else { return nil }
-        return result.candidates.first?.assetID
-    }
-
-    private var contactsInitials: String? {
-        guard case .completed(let dataset) = env.contactScanState,
-              let id = dataset.groups.first?.memberIDs.first,
-              let record = dataset.record(for: id)
-        else { return nil }
-        return Self.initials(for: record)
-    }
-
-    private static func initials(for record: ContactRecord) -> String {
-        let given = record.givenName.trimmingCharacters(in: .whitespaces)
-        let family = record.familyName.trimmingCharacters(in: .whitespaces)
-        let letters = [given.first, family.first].compactMap { $0 }
-        if !letters.isEmpty {
-            return String(letters).uppercased()
-        }
-        let organization = record.organizationName.trimmingCharacters(in: .whitespaces)
-        guard let first = organization.first else { return "?" }
-        return String(first).uppercased()
-    }
-
-    private var similarPhotosStatusText: String {
-        switch similarPhotosPhase {
-        case .permissionRequired:
-            return "Photos access needed"
-        case .permissionDenied:
-            return "Photos access is off"
-        case .idle:
-            return "Not analyzed yet"
-        case .buildingCatalog:
-            return "Reading your library…"
-        case .analyzing(let progress):
-            return SimilarPhotosPresentation.stageMessage(for: progress)
-        case .paused:
-            return "Scan paused"
-        case .queuedBehindBlur:
-            return "Queued — starts after the sharpness check"
-        case .emptyLibrary:
-            return "No photos visible to Netto"
-        case .cancelled:
-            return "Last run cancelled"
-        case .failed(let message):
-            return message
-        case .results(let result):
-            let summary = SimilarPhotosSummary(result: result)
-            if summary.hasNoGroups {
-                return summary.notAnalyzedCount > 0
-                    ? "No duplicates found · \(summary.notAnalyzedCount) not analyzed"
-                    : "Analyzed · no duplicates found"
-            }
-            let groups = summary.exactGroupCount + summary.similarGroupCount
-            return "\(groups) \(groups == 1 ? "group" : "groups") ready to review"
+    @ViewBuilder
+    private func sectionLink(_ section: DashboardCleanupSection) -> some View {
+        CleanupSectionCard(
+            title: section.title,
+            subtitle: section.subtitle,
+            icon: section.icon,
+            status: DashboardCleanupPresentation.status(
+                for: section,
+                permission: env.photoPermissionState,
+                contactsPermission: env.contactsPermissionState,
+                catalog: env.catalogState,
+                analysis: env.analysisState,
+                blur: env.blurAnalysisState,
+                pendingBehindOtherPass: env.pendingAnalysisRequest == .similarity,
+                resolution: env.videoSizeResolution,
+                videoSignature: env.videoDatasetSignature,
+                videoRecords: env.videoRecordsForDisplay,
+                recordedVideos: env.recordedVideosForDisplay,
+                downloadedVideos: env.downloadedVideosForDisplay,
+                otherVideoCount: env.otherVideosCount,
+                contactScan: env.contactScanState
+            ),
+            accessibilityIdentifier: section.accessibilityIdentifier
+        ) {
+            destination(for: section)
+                .nettoZoomDestination(section.title, in: cardNamespace)
         }
     }
 
-    // MARK: Swipe Review (standalone)
-
-    /// Swipe Review's card status — catalog-driven, because the feature reviews the scanned
-    /// library itself, not the analysis. It only reflects Photos access and scan progress.
-    private var swipeReviewStatusText: String {
-        switch env.photoPermissionState {
-        case .notDetermined:
-            return "Photos access needed"
-        case .denied, .restricted:
-            return "Photos access is off"
-        case .authorized, .limited:
-            break
+    @ViewBuilder
+    private func destination(for section: DashboardCleanupSection) -> some View {
+        switch section {
+        case .imageCleanup: ImageCleanupView()
+        case .videoCleanup: VideoCleanupView()
+        case .largeFiles: LargeFilesView()
+        case .duplicateContacts: DuplicateContactsView()
+        case .swipeCleanup: SwipeReviewView()
         }
-        switch env.catalogState {
-        case .notStarted:
-            return "Not scanned yet"
-        case .running:
-            return "Reading your library…"
-        case .paused:
-            return "Scan paused"
-        case .cancelled:
-            return "Last run cancelled"
-        case .failed(let failure):
-            return failure.userMessage
-        case .completed(let catalog):
-            let images = catalog.imageCount
-            return images == 0
-                ? "No photos visible to Netto"
-                : "\(images.formatted()) photos"
-        }
-    }
-
-    /// Thumbnail asset for the card: the library's first image; nil until a scan completes.
-    /// Resolved once by the catalog itself — never a per-render scan of the record list.
-    private var swipeReviewAssetID: String? {
-        guard case .completed(let catalog) = env.catalogState else { return nil }
-        return catalog.firstImageAssetID
     }
 }
 

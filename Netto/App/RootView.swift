@@ -378,6 +378,13 @@ final class AppEnvironment {
     @ObservationIgnored private var builtVideoRecordsResolution: VideoSizeResolution?
     /// The cached, resolved, largest-first video inventory (see `videoRecordsForDisplay`).
     @ObservationIgnored private var builtVideoRecords: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtVideoSourceGeneration: UInt64 = .max
+    @ObservationIgnored private var builtRecordedVideos: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtDownloadedVideos: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtOtherVideosCount: Int = 0
+    @ObservationIgnored private var builtOldScreenshotGeneration: UInt64 = .max
+    @ObservationIgnored private var builtOldScreenshotRecords: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtOldScreenshotUnknownDateCount: Int = 0
 
     // MARK: Interrupted-run state (Phase C)
 
@@ -546,6 +553,75 @@ final class AppEnvironment {
         builtVideoRecordsGeneration = videoSignatureGeneration
         builtVideoRecordsResolution = resolution
         return records
+    }
+
+    /// The source-classified video inventories, cached across renders. Rebuilds only when the
+    /// catalog changes (classification depends on `sourceType`, not on measured sizes), so a
+    /// screen full of selection toggles costs no re-classification.
+    var recordedVideosForDisplay: [PhotoAssetRecord] {
+        ensureVideoSourceSplit()
+        return builtRecordedVideos
+    }
+
+    var downloadedVideosForDisplay: [PhotoAssetRecord] {
+        ensureVideoSourceSplit()
+        return builtDownloadedVideos
+    }
+
+    /// Videos whose source evidence is neither a synced import nor a plain library asset
+    /// (e.g. shared). Never folded into either bucket — reported as its own count.
+    var otherVideosCount: Int {
+        ensureVideoSourceSplit()
+        return builtOtherVideosCount
+    }
+
+    private func ensureVideoSourceSplit() {
+        guard builtVideoSourceGeneration != videoSignatureGeneration else { return }
+        var recorded: [PhotoAssetRecord] = []
+        var downloaded: [PhotoAssetRecord] = []
+        var other = 0
+        for record in videoRecordsForDisplay {
+            switch VideoSourceClassification.of(record) {
+            case .recorded: recorded.append(record)
+            case .downloaded: downloaded.append(record)
+            case .other: other += 1
+            }
+        }
+        builtRecordedVideos = recorded
+        builtDownloadedVideos = downloaded
+        builtOtherVideosCount = other
+        builtVideoSourceGeneration = videoSignatureGeneration
+    }
+
+    /// The age-thresholded screenshots (oldest first) for the Old Screenshots screen —
+    /// cached; rebuilds only when the catalog changes.
+    var oldScreenshotRecords: [PhotoAssetRecord] {
+        ensureOldScreenshotCache()
+        return builtOldScreenshotRecords
+    }
+
+    /// Screenshots excluded from the eligible list only because their creation date is
+    /// unknown — reported honestly, never guessed to be old or young.
+    var oldScreenshotUnknownDateCount: Int {
+        ensureOldScreenshotCache()
+        return builtOldScreenshotUnknownDateCount
+    }
+
+    private func ensureOldScreenshotCache() {
+        guard builtOldScreenshotGeneration != videoSignatureGeneration else { return }
+        guard case .completed(let catalog) = catalogState else {
+            builtOldScreenshotRecords = []
+            builtOldScreenshotUnknownDateCount = 0
+            builtOldScreenshotGeneration = videoSignatureGeneration
+            return
+        }
+        builtOldScreenshotRecords = OldScreenshotsPresentation.eligibleRecords(
+            in: catalog,
+            now: Date()
+        )
+        builtOldScreenshotUnknownDateCount = OldScreenshotsPresentation
+            .unknownDateRecords(in: catalog).count
+        builtOldScreenshotGeneration = videoSignatureGeneration
     }
 
     func bootstrap() async {

@@ -25,12 +25,22 @@ final class DashboardLayoutQATests: XCTestCase {
         "scanStatusCard"
     ]
 
+    // The five primary cleanup sections, in their fixed display order (a vertical list).
+    private let sectionIDs = [
+        "imageCleanupSection",
+        "videoCleanupSection",
+        "largeFilesSection",
+        "duplicateContactsSection",
+        "swipeCleanupSection"
+    ]
+
     private let gridIDs = [
         "cleanupSectionTitle",
-        "similarPhotosCard",
-        "screenshotsCard",
-        "largeVideosCard",
-        "duplicateContactsRow"
+        "imageCleanupSection",
+        "videoCleanupSection",
+        "largeFilesSection",
+        "duplicateContactsSection",
+        "swipeCleanupSection"
     ]
 
     override func setUpWithError() throws {
@@ -62,21 +72,15 @@ final class DashboardLayoutQATests: XCTestCase {
         log += "ring → stats gap: \(value(gap: "storageRing", "storageStats")) pt\n"
         shot("01-top")
 
-        // Grid: scroll the "Clean up" section into view, then measure it.
+        // Cleanup list: scroll the "Clean up" section into view, then measure it. The five
+        // sections are a vertical list, so the contract is: no overlap, and each section
+        // sits strictly below the previous one (fixed display order, top to bottom).
         scrollToGrid()
         settle()
         log += frameLines(gridIDs)
-        log += noOverlap([
-            "cleanupSectionTitle",
-            "similarPhotosCard",
-            "screenshotsCard",
-            "largeVideosCard",
-            "duplicateContactsRow"
-        ])
-        log += rowAligned("similarPhotosCard", "screenshotsCard")
-        log += rowAligned("largeVideosCard", "duplicateContactsRow")
-        log += equalHeight("similarPhotosCard", "screenshotsCard", "largeVideosCard", "duplicateContactsRow")
-        shot("02-cleanup-grid")
+        log += noOverlap(gridIDs)
+        log += verticalOrder(sectionIDs)
+        shot("02-cleanup-list")
 
         // Back to the top: the screen must survive a scroll round-trip untouched.
         app.swipeDown()
@@ -103,9 +107,8 @@ final class DashboardLayoutQATests: XCTestCase {
         scrollToGrid()
         settle()
         log += frameLines(gridIDs)
-        log += textSection("[grid]", containers: topIDs + gridIDs)
-        log += rowAligned("similarPhotosCard", "screenshotsCard")
-        log += rowAligned("largeVideosCard", "duplicateContactsRow")
+        log += textSection("[cleanup]", containers: topIDs + gridIDs)
+        log += verticalOrder(sectionIDs)
 
         attach(log, name: "dashboard-text-qa")
     }
@@ -227,8 +230,7 @@ final class DashboardLayoutQATests: XCTestCase {
         let title = app.descendants(matching: .any).matching(
             NSPredicate(format: "identifier == %@", "cleanupSectionTitle")
         ).firstMatch
-        let cards = ["similarPhotosCard", "screenshotsCard", "largeVideosCard", "duplicateContactsRow"]
-            .map { element($0) }
+        let cards = sectionIDs.map { element($0) }
 
         var swipes = 0
         while swipes < maxSwipes, !(title.exists && cards.allSatisfy { $0.exists }) {
@@ -239,7 +241,7 @@ final class DashboardLayoutQATests: XCTestCase {
         for (index, card) in cards.enumerated() {
             XCTAssertTrue(
                 card.waitForExistence(timeout: 10),
-                "grid card \(index) not built after scrolling"
+                "cleanup section \(index) not built after scrolling"
             )
         }
     }
@@ -353,22 +355,26 @@ final class DashboardLayoutQATests: XCTestCase {
         return log
     }
 
-    private func rowAligned(_ a: String, _ b: String) -> String {
-        guard let ra = rect(a), let rb = rect(b) else { return "FAIL missing row: \(a) \(b)\n" }
-        let aligned = abs(ra.minY - rb.minY) < 1 && abs(ra.height - rb.height) < 1
-        XCTAssertTrue(aligned, "row not aligned: \(a) \(ra) × \(b) \(rb)")
-        return aligned ? "OK row aligned: \(a) × \(b)\n" : "FAIL row aligned: \(a) × \(b)\n"
-    }
-
-    private func equalHeight(_ ids: String...) -> String {
+    private func verticalOrder(_ ids: [String]) -> String {
         var log = ""
-        let heights = ids.compactMap { rect($0)?.height }
-        guard heights.count == ids.count else { return "FAIL missing card frame\n" }
-        let uniform = heights.max()! - heights.min()! < 1
-        XCTAssertTrue(uniform, "card heights differ: \(heights)")
-        log += uniform
-            ? "OK cards equal height: \(heights)\n"
-            : "FAIL cards equal height: \(heights)\n"
+        var previous: (id: String, frame: CGRect)?
+        for id in ids {
+            guard let frame = rect(id) else {
+                log += "FAIL missing section frame: \(id)\n"
+                continue
+            }
+            if let prev = previous {
+                // Strictly below the previous section (no vertical overlap, top increases).
+                XCTAssertTrue(
+                    frame.minY >= prev.frame.maxY - 1,
+                    "sections out of order: \(id) starts at y=\(frame.minY) before \(prev.id) ends at y=\(prev.frame.maxY)"
+                )
+                log += frame.minY >= prev.frame.maxY - 1
+                    ? "OK order: \(prev.id) → \(id)\n"
+                    : "FAIL order: \(prev.id) → \(id)\n"
+            }
+            previous = (id, frame)
+        }
         return log
     }
 

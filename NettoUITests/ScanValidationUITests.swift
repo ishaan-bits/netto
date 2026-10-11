@@ -266,22 +266,28 @@ final class ScanValidationUITests: XCTestCase {
             "no extraction/compare progress shown and no later stage observed to prove it ran"
         )
 
-        // Result reached the dashboard: the Similar Photos card must carry group counts.
+        // Result reached the dashboard: the Image Cleanup section must report the analysis
+        // result on its rows, and the Similar Images destination must open the review flow.
         scrollToGrid()
-        let card = element("similarPhotosCard")
-        let cardText = card.exists ? labelTree(of: card) : ""
-        print("VALIDATE similar-photos card: \(cardText)")
-        attach("similar photos card: \(cardText)", name: "results-card")
+        let section = element("imageCleanupSection")
+        let sectionText = section.exists ? labelTree(of: section) : ""
+        print("VALIDATE image-cleanup section: \(sectionText)")
+        attach("image cleanup section: \(sectionText)", name: "results-card")
         XCTAssertTrue(
-            cardText.lowercased().contains("ready to review")
-                || cardText.lowercased().contains("no duplicates")
-                || cardText.lowercased().contains("not analyzed"),
-            "results did not reach the dashboard card: \(cardText)"
+            sectionText.lowercased().contains("ready to review")
+                || sectionText.lowercased().contains("no duplicate")
+                || sectionText.lowercased().contains("no groups")
+                || sectionText.lowercased().contains("not analyzed"),
+            "results did not reach the image cleanup section: \(sectionText)"
         )
 
-        // And the Similar Photos flow must open with the results.
-        XCTAssertTrue(card.isHittable, "similar photos card not hittable: \(card.frame)")
-        card.tap()
+        // And the Similar Photos flow must open from its Image Cleanup destination row.
+        XCTAssertTrue(section.isHittable, "image cleanup section not hittable: \(section.frame)")
+        section.tap()
+        let similarRow = element("similarImagesRow")
+        XCTAssertTrue(similarRow.waitForExistence(timeout: 20), "image cleanup destinations did not open")
+        XCTAssertTrue(similarRow.isHittable, "similar images row not hittable: \(similarRow.frame)")
+        similarRow.tap()
         let similarLoaded = app.navigationBars["Similar Photos"].waitForExistence(timeout: 30)
             || app.staticTexts.matching(
                 NSPredicate(format: "label == %@", "Similar Photos")

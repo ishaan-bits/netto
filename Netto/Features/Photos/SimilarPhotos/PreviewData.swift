@@ -174,7 +174,8 @@ enum PreviewData {
         permission: PermissionState = .authorized,
         catalog: CatalogScanState = .notStarted,
         analysis: PhotoAnalysisState = .notStarted,
-        blur: BlurAnalysisState = .notStarted
+        blur: BlurAnalysisState = .notStarted,
+        videoResolution: VideoSizeResolution = .idle
     ) -> AppEnvironment {
         let env = AppEnvironment(
             makePhotoLibrary: { () throws -> any PhotoLibraryReading in
@@ -186,6 +187,7 @@ enum PreviewData {
         env.catalogState = catalog
         env.analysisState = analysis
         env.blurAnalysisState = blur
+        env.videoSizeResolution = videoResolution
         if case .completed(let completed) = analysis {
             env.selection = PhotoSelectionModel(result: completed)
         }

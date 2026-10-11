@@ -7,8 +7,16 @@ is no backend, no cloud processing, and no third-party analytics.
 
 ## Core features
 
-- **Storage dashboard** — storage and permission status up front; the entry point for
-  every cleanup section, with live scan progress.
+- **Storage dashboard** — storage and permission status up front, then five primary
+  cleanup sections (**Image Cleanup**, **Video Cleanup**, **Large Files**,
+  **Duplicate Contacts**, **Swipe Cleanup**), each with live scan progress and a status
+  line derived from real app state. Image Cleanup groups the four photo destinations
+  (duplicates, similar shots, blurry, old screenshots) behind one row; Old Screenshots
+  lists screenshots at least **90 days** old (oldest first, unknown dates never counted
+  as old). Video Cleanup splits the library into **Recorded**, **Downloaded**, and a
+  reported **other/unknown** count that is never guessed into a source. Large Files
+  shows the biggest measured assets, largest first, never ranking an unknown size as
+  zero.
 - **Similar / duplicate photo detection** — exact duplicates and near-duplicate shots
   found through content fingerprints, perceptual hashes, and Vision features, presented
   as reviewable groups.
@@ -387,6 +395,34 @@ watchdog.
   declare the store's exact App Group, so provisioning drift fails the suite instead
   of the home screen.
 
+### Dashboard IA: five primary sections (M11)
+
+The dashboard previously showed a flat grid of cards, one per destination. It is now
+organised around the five things a person actually does — Image Cleanup, Video
+Cleanup, Large Files, Duplicate Contacts, Swipe Cleanup — with the photo destinations
+grouped behind the Image Cleanup row.
+
+- **Every status is derived, never stored** — `DashboardCleanupPresentation.status(for:)`
+  is the single pure mapping from app state (permission, catalog, analysis, blur,
+  contacts, video measurement) to the one-line status each section shows. A section
+  reports a real count, real progress, or the real blocking reason — never a
+  placeholder, and never a confident `0` while something harder (permission, scan,
+  failure) stands in the way (`worstStatus` ranks blockers above counts).
+- **Old Screenshots, defined transparently** — the 90-day threshold lives in pure
+  presentation code (`OldScreenshotsPresentation`), computed against the completed
+  catalog; a screenshot with no known creation date is reported as an honest unknown
+  count rather than being guessed old or young, and eligible items are ordered oldest
+  first. The threshold is stated in the UI, not just the code.
+- **Video sources are classified, not guessed** — `VideoSourceClassification` maps each
+  video's PhotoKit source evidence to Recorded, Downloaded, or other/unknown; the
+  other/unknown bucket is surfaced as its own count rather than folded into a guess.
+  Large Files shows measured sizes largest-first and never ranks an unknown size as
+  zero (measurement state is shared with the video inventory, keyed to the catalog
+  generation so a rebuild invalidates it).
+- **No analysis starts on open** — the new sections and hubs read existing state only;
+  requesting a pass is still an explicit user action through the M10 coordinator, whose
+  one-slot queue, checkpoint safety, and deletion-confirmation contract are unchanged.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -532,6 +568,17 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M11)** — after the dashboard-IA restructuring, a full-suite
+  run reported **836 tests: 835 passed, 0 failed, 1 skipped** (the skip is the
+  pre-existing `cancellationPropagatesOutOfTheLoader` suite-context quirk, unchanged),
+  plus one clean build of the app with no warnings. The 26 new unit cases
+  (`CleanupSectionsTests`) pin the five-section contract (all five present, in order),
+  the worst-blocker ranking, the Old Screenshots rule (90-day default, oldest-first,
+  unknown-date never old, custom threshold), the Large Files phase/sorting honesty
+  (unknown sizes last, never zero), and the video-source classification (never a
+  guess); the 5 UI cases were updated to the new section identifiers and assert the
+  five sections in fixed vertical order with no overlap, plus the end-to-end scan
+  reaching the Image Cleanup destinations.
 - **Recent verification (M10)** — after the coordination + widget work, a full-suite
   run reported **"805 tests in 79 suites passed"** (14 new: the queue's start-once /
   cancel / failure / replace / paused / deletion contracts in both directions, the
