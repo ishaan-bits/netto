@@ -10,12 +10,12 @@ is no backend, no cloud processing, and no third-party analytics.
 - **Storage dashboard** — storage and permission status up front, then four primary
   cleanup sections (**Image Cleanup**, **Video Cleanup**, **Duplicate Contacts**,
   **Swipe Cleanup**), each with live scan progress and a status line derived from real
-  app state. Image Cleanup groups the four photo destinations (duplicates, similar
-  shots, blurry, old screenshots) behind one row; Old Screenshots lists screenshots at
-  least **90 days** old (oldest first, unknown dates never counted as old). Video
-  Cleanup splits the library into **Recorded**, **Downloaded**, and a reported
-  **other/unknown** count that is never guessed into a source, with the biggest measured
-  videos reviewed first.
+  app state. Image Cleanup groups the three photo destinations (**Duplicate & Similar
+  Photos**, **blurry**, **old screenshots**) behind one row; Old Screenshots lists
+  screenshots at least **90 days** old (oldest first, unknown dates never counted as
+  old). Video Cleanup opens one immediate, local-first inventory of **every** video —
+  known sizes first (largest to smallest), the size-unavailable group below — never split
+  by source.
 - **Premium scan animation** — the dashboard's scan core is a native SwiftUI visual: a
   luminous green centre, concentric rings, and a slow sweep that runs **only** while a
   scan is actually in flight and settles the moment it is paused, cancelled, failed, or
@@ -24,7 +24,10 @@ is no backend, no cloud processing, and no third-party analytics.
   or completion.
 - **Similar / duplicate photo detection** — exact duplicates and near-duplicate shots
   found through content fingerprints, perceptual hashes, and Vision features, presented
-  as reviewable groups.
+  as reviewable groups. One destination (**Duplicate & Similar Photos**, M14) reviews
+  both group kinds over the single shared result set, with an in-screen **All / Exact /
+  Similar** filter that narrows the listing — it never re-runs analysis or forks the
+  selection.
 - **Potentially Blurry detection** — an on-device sharpness pass scores every scanned
   photo on a small local thumbnail and flags candidates for review in three tabs
   (All Flagged / Likely Blurry / Borderline, with live counts). Classification uses
@@ -32,8 +35,10 @@ is no backend, no cloud processing, and no third-party analytics.
   thresholds calibrated against a labelled synthetic corpus; every candidate is a
   suggestion for human review — nothing is preselected and nothing is auto-deleted.
 - **Screenshot cleanup** — every screenshot in the library, selectable in bulk.
-- **Large video cleanup** — videos ordered largest-first with measured sizes, so the
-  biggest wins are reviewed first.
+- **Video cleanup** — one immediate inventory of every video the scan found: known sizes
+  first (largest to smallest), size-unavailable videos below in a separate group, with
+  measurement running automatically in the background (never a blocking step, and no
+  separate "Measure Sizes" button).
 - **Duplicate contact detection** — contacts that look like duplicates (shared phone,
   email, or name + organization), merged with kept fields or deleted.
 - **Safe Review → Confirm → Delete flow** — every section follows the same shape:
@@ -64,7 +69,11 @@ Beyond the core cleanup loop:
 - **Swipe Keep/Delete review mode** — a Tinder-style swipe session over the photo
   library (similarity deck or the whole library from the dashboard card): swipe to keep
   or mark for cleanup, with Undo and a persistent bottom bar showing the session's live
-  Delete-mark count and a **Review Cleanup** handoff. Shuffle re-orders only the photos
+  Delete-mark count and a **Review Cleanup** handoff. Each card opens instantly on a
+  prefetched lightweight thumbnail (M14: a bounded window of ~20 local-only thumbnails
+  warmed ahead of the cursor through the shared bounded cache) while the large preview
+  loads and crossfades in — never full-resolution prefetching, never pixels in the
+  persisted session. Shuffle re-orders only the photos
   you have not reviewed yet (no repeats within a pass; **Start New Pass** on the
   completion screen resets position and keeps every decision), the session itself —
   deck order, position, undo history, and the decision log — persists through
@@ -344,10 +353,11 @@ never left "0 of N". Even when the callback arrived, it was slow enough that a
 - **Enumerate first; measure second** — the Videos screen renders the full inventory as
   soon as the catalog is complete: every video listed immediately, sizes filling in as
   they measure, a summary of the real counts (`N videos total` / `Y sizes unavailable —
-  stored in iCloud or unavailable locally` / `Z videos sorted by known size`), and a
-  compact progress panel with cancel while measurement runs. An idle screen offers
-  "Measure Sizes" instead of blocking. Unknown sizes stay after every measured one —
-  never ranked, never zero — and rows say so.
+  not measured locally` / `Z videos sorted by known size`), and a compact progress panel
+  with cancel while measurement runs. Unknown sizes stay after every measured one —
+  never ranked, never zero — and rows say so. (M14 later removed the idle "Measure
+  Sizes" button entirely: measurement now starts automatically when the unified video
+  inventory appears, and resumes when a heavy pass finishes.)
 - **Cached inventory, coalesced updates** — `AppEnvironment.videoRecordsForDisplay`
   (replacing the settled-only cache) serves the resolved, largest-first list and
   rebuilds only when the catalog or measurement changes, never per render; measurement
@@ -355,6 +365,12 @@ never left "0 of N". Even when the callback arrived, it was slow enough that a
   fast pass over thousands of cloud-only videos cannot storm the main actor.
 
 ### Analysis coordination & widget delivery (M10)
+
+> **Superseded by M14:** the one-slot queue and its "queued" UI described below were
+> removed entirely. Both passes now admit **concurrently** over one catalog — neither
+> queues behind, cancels, or blocks the other. The widget-delivery work below is
+> unchanged and current. See [Concurrent independent scans & unified
+> destinations](#concurrent-independent-scans--unified-destinations-m14).
 
 Two failures from a fresh iPhone 17 Pro recording: the Similar Photos screen's
 "Analyze Photo Library" button did nothing while a sharpness pass was running (2 731 /
@@ -422,14 +438,16 @@ measurement pipeline.)
   count rather than being guessed old or young, and eligible items are ordered oldest
   first. The threshold is stated in the UI, not just the code.
 - **Video sources are classified, not guessed** — `VideoSourceClassification` maps each
-  video's PhotoKit source evidence to Recorded, Downloaded, or other/unknown; the
-  other/unknown bucket is surfaced as its own count rather than folded into a guess.
-  Video Cleanup orders the biggest measured videos first and never ranks an unknown
-  size as zero (measurement state is shared with the video inventory, keyed to the
-  catalog generation so a rebuild invalidates it).
+  video's PhotoKit source evidence to Recorded, Downloaded, or other/unknown without
+  ever inferring origin from a missing signal. (M14: the classification no longer splits
+  the UI — Video Cleanup is one unified inventory — but the evidence mapping remains as
+  tested, honest logic.) The inventory orders the biggest measured videos first and
+  never ranks an unknown size as zero (measurement state is shared with the video
+  inventory, keyed to the catalog generation so a rebuild invalidates it).
 - **No analysis starts on open** — the sections and hubs read existing state only;
-  requesting a pass is still an explicit user action through the M10 coordinator, whose
-  one-slot queue, checkpoint safety, and deletion-confirmation contract are unchanged.
+  requesting a pass is still an explicit user action. (M14: the pass starts immediately
+  and concurrently with any other running pass — the M10 queue it used to go through is
+  gone; checkpoint safety and the deletion-confirmation contract are unchanged.)
 
 ### Premium scan animation (M12)
 
@@ -470,8 +488,9 @@ runs that queued behind each other, so a scan only ever advanced one of them.
   enumerates the library **once**, then launches the similarity and sharpness passes
   **concurrently** over the same snapshot. With exactly one pipeline still running (the
   other failed or was cancelled mid-session) it starts only the idle one through that
-  pipeline's own entry point, which queues it behind the running pass rather than racing
-  it. Repeated taps are idempotent for the active session.
+  pipeline's own entry point — which since M14 admits it **concurrently over the running
+  pass's catalog** (no queue, no cancel, no second enumeration). Repeated taps are
+  idempotent for the active session.
 - **The shared read outlives a single cancel** — the one `PHAsset.fetchAssets`
   enumeration lives in `catalogTask`, not either pipeline's task, so cancelling one
   pipeline's *work* leaves the read standing for the other. The read is only abandoned
@@ -494,7 +513,7 @@ runs that queued behind each other, so a scan only ever advanced one of them.
   is kept and the pass never reports a just-deleted asset as removed. Only a standalone
   catalog read is still abandoned (it would complete with pre-mutation records). The
   dashboard's cancel stops **both** pipelines — cancelling only similarity would orphan
-  the sharpness pass, and the next Analyze would queue behind that orphan.
+  the sharpness pass.
 - **Performance is honest, not claimed** — because the primary scan now includes the
   sharpness pass, it fully settles noticeably longer on a large library than the old
   similarity-only scan (the scan card reaches "Finished" once similarity completes, while
@@ -530,6 +549,58 @@ re-analysis is ever forced, and unaffected groups are never discarded.
   pipeline, the fresh-authorization read, the pure staleness validation, and the honest
   planned/verified/remaining counts are exactly as before; nothing was relaxed to make the
   review reusable.
+
+### Concurrent independent scans & unified destinations (M14)
+
+A fresh-device recording reproduced two stuck-scan symptoms (Similar Photos' Analyze
+appearing to do nothing while the sharpness pass ran, and the mirror case) and the
+Potentially Blurry screen failing outright with "Your library scan has not finished"
+while similarity was mid-enumeration. Root cause, confirmed in code: M10's one-slot
+queue serialized the two passes — exactly one heavy pass could be admitted at a time,
+and a request for the other was queued behind it (or cancelled-and-switched through its
+"Start Now" button, which surfaced as "Scan cancelled"). M14 removes that coordinator
+entirely and restores genuinely concurrent, independent scans.
+
+- **Both passes run concurrently — no queue, no cancel-and-switch** — `pendingAnalysisRequest`,
+  `drivePendingAnalysis`, `startPendingAnalysisNow`, the queued phases, and the "Start Now
+  (Cancels …)" / "Remove from Queue" UI are gone. Requesting the idle pass while the other
+  runs starts it **immediately**, over the same completed catalog snapshot the running pass
+  stands on — one library enumeration, never a second read, never a cancelled sibling. If
+  the sharpness pass is requested while similarity is still enumerating, it is admitted
+  into a **bounded wait** (a short poll of the catalog state) and starts the moment the
+  read lands; if no catalog ever lands, it fails honestly ("Your library scan has not
+  finished") instead of hanging. The shared `AnalysisConcurrencyBudget` and
+  `ScanConcurrencyPolicy.sharedWidth` still split the thermal-scaled worker width between
+  the two passes, so concurrent runs never exceed one pass's footprint.
+- **One destination for one pass** — Image Cleanup's separate "Duplicate Images" and
+  "Similar Images" rows are merged into a single **Duplicate & Similar Photos**
+  destination: one analysis pass produces both exact-duplicate and similar groups, and
+  one screen reviews both over the shared result set with an in-screen **All / Exact /
+  Similar** filter that only narrows the listing (never re-runs analysis, never forks the
+  selection). Classification evidence stays distinct internally.
+- **Video Cleanup is one immediate inventory** — the Recorded / Downloaded hub rows are
+  gone. Tapping Video Cleanup opens the unified inventory directly: every video the
+  catalog holds in one list, measured sizes first (largest to smallest), the
+  size-unavailable group below, and measurement starting automatically on appear (no
+  separate "Measure Sizes" button). Unknown sizes are labelled "not measured locally" —
+  never a guessed zero, and never a claim (like iCloud residency) this screen cannot
+  evidence. The summary's total comes from enumeration and never depends on measurement.
+- **Swipe Cleanup opens instantly on prefetched thumbnails** — each swipe card shows a
+  lightweight, local-only thumbnail the moment it appears (M14 prefetches a bounded
+  window of ~20 thumbnails ahead of the cursor, current photo first, through the shared
+  bounded `ThumbnailStore` — the same size and options the card displays, so a warmed
+  key is a cache hit) and the large preview crossfades over it when it arrives. The
+  prefetch is local-only and never full-resolution; Shuffle / Start New Pass re-walk the
+  window, deletion invalidates the store as before, and no pixels ever enter the
+  persisted session snapshot. (Before M14 every swipe waited on one uncached large
+  preview request — the per-card latency this removes.)
+- **Deletion reconciliation survives concurrent admission** — starting the second pass
+  over a running pass's catalog never clears that pass's recorded mid-run removals
+  (`deletionsDuringRunningPasses` is only reset when *no* other pass is running), so a
+  deletion landing while both passes run is reconciled out of **both** completed results.
+- **Honesty unchanged** — no fabricated counts, no forced downloads, no private APIs;
+  the Simulator-only validation caveat stands (see Testing & verification and Known
+  limitations).
 
 ## Privacy
 
@@ -594,7 +665,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 49 files, 838 Swift Testing cases across 83 suites covering the pure
+- **Unit suite** — 863 Swift Testing cases across 86 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -676,6 +747,22 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M14)** — after restoring concurrent scans and unifying the
+  destinations, a full-suite run reported **863 unit tests in 86 suites + 5 UI tests:
+  867 passed, 0 failed** (the pre-existing `cancellationPropagatesOutOfTheLoader`
+  suite-context skip is unchanged), plus one clean app build with **no warnings**. The
+  M10 queue tests were rewritten into concurrency-overlap proofs: a Similar Photos
+  request starts immediately over the sharpness pass's standing catalog (and vice versa,
+  including the bounded wait for a mid-enumeration catalog), the unified Analyze entry
+  admits the idle pipeline concurrently instead of queueing it, adoption never
+  re-enumerates the library, cancelling or failing one pass leaves the other running,
+  repeated taps are idempotent, the bounded wait fails honestly when no catalog lands,
+  and a deletion landing while both passes run reconciles out of both completed results.
+  Further new cases pin the unified Duplicate & Similar Photos destination (one row,
+  combined count, filter semantics, hub copy), the unified video inventory (one count
+  regardless of source, measurement-independent totals, honest summary wording), and the
+  swipe prefetch window (current-first order, bounded size, supersession on shuffle,
+  cache-hit display, no full-resolution requests).
 - **Recent verification (M13)** — after unifying the Image Cleanup session, the full unit
   suite reported **843 tests in 83 suites, 0 failures** (the pre-existing
   `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged), plus one clean
@@ -862,6 +949,18 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   claimed for a physical device; the Simulator timing above is not representative, and
   device-profiled timing of the unified session (Time Profiler + thermal + hitches) has not
   been performed.
+- **Swipe-prefetch performance is unmeasured on a physical device (M14)** — the
+  instant-frame window (20 local-only thumbnails at 480 px, warmed through the shared
+  bounded cache ahead of the cursor) is validated by unit tests (bounded, current-first,
+  superseded on shuffle, cache-hit display, never full-resolution) and Simulator
+  interaction only. Perceived swipe latency on a real device was not profiled; no
+  wall-clock improvement figure is claimed.
+- **Repository note (M14)** — `Netto.xcodeproj/project.pbxproj` carried an unrelated,
+  pre-existing regeneration diff at the start of this work and was deliberately left
+  unstaged/uncommitted alongside these changes. No source files were added or removed in
+  M14 (every change lives in existing files), so the project file needs no update and the
+  uncommitted diff is inert — but it is still sitting in the working tree and should be
+  reconciled separately.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the

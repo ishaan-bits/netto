@@ -311,4 +311,29 @@ enum SwipeReviewPresentation {
         }
         return items
     }
+
+    // MARK: Thumbnail prefetch (M14)
+
+    /// The swipe card's instant frame: a lightweight, local-only thumbnail warmed ahead of
+    /// the swipe and shown the moment a card appears, while the large preview loads and
+    /// then crossfades over it. 480 px on the longest side — the card is ~350 pt wide, so
+    /// this is a crisp first frame — and never full-resolution pixels.
+    static let swipeThumbnailPixelSize = 480
+
+    /// How many upcoming photos to warm: the current one plus the forward window. 20 keeps
+    /// the window's pixels (~18 MB at 480 px) inside the shared `ThumbnailStore` budget
+    /// (48 MB) alongside the strip's other entries, while covering the next several swipes.
+    static let swipePrefetchWindowCount = 20
+
+    /// The warm-up order for a swipe at `index`: the current photo first (it is on screen
+    /// *now*), then up to `swipePrefetchWindowCount - 1` photos ahead. Never backward —
+    /// reviewed photos sit behind the cursor and only Undo returns there, and the store's
+    /// LRU keeps recently shown frames anyway. Clamps at both ends; an empty deck is an
+    /// empty order.
+    static func prefetchOrder(around index: Int, in assetIDs: [String]) -> [String] {
+        guard !assetIDs.isEmpty, index >= 0 else { return [] }
+        let start = min(index, assetIDs.count - 1)
+        let end = min(start + swipePrefetchWindowCount, assetIDs.count)
+        return Array(assetIDs[start..<end])
+    }
 }

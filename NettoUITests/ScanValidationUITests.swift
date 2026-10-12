@@ -290,18 +290,19 @@ final class ScanValidationUITests: XCTestCase {
             "results did not reach the image cleanup section: \(sectionText)"
         )
 
-        // And the Similar Photos flow must open from its Image Cleanup destination row.
+        // And the unified Duplicate & Similar Photos flow must open from its Image Cleanup
+        // destination row (M14: exact duplicates and similar shots are one destination).
         XCTAssertTrue(section.isHittable, "image cleanup section not hittable: \(section.frame)")
         section.tap()
-        let similarRow = element("similarImagesRow")
+        let similarRow = element("duplicateSimilarPhotosRow")
         XCTAssertTrue(similarRow.waitForExistence(timeout: 20), "image cleanup destinations did not open")
-        XCTAssertTrue(similarRow.isHittable, "similar images row not hittable: \(similarRow.frame)")
+        XCTAssertTrue(similarRow.isHittable, "duplicate & similar photos row not hittable: \(similarRow.frame)")
         similarRow.tap()
-        let similarLoaded = app.navigationBars["Similar Photos"].waitForExistence(timeout: 30)
+        let similarLoaded = app.navigationBars["Duplicate & Similar Photos"].waitForExistence(timeout: 30)
             || app.staticTexts.matching(
-                NSPredicate(format: "label == %@", "Similar Photos")
+                NSPredicate(format: "label == %@", "Duplicate & Similar Photos")
             ).firstMatch.waitForExistence(timeout: 5)
-        XCTAssertTrue(similarLoaded, "Similar Photos flow did not open")
+        XCTAssertTrue(similarLoaded, "Duplicate & Similar Photos flow did not open")
         print(
             "VALIDATE full-scan total: \(String(format: "%.1f", Date().timeIntervalSince(t0)))s "
                 + "analyzed=\(analyzed) total=\(total)"

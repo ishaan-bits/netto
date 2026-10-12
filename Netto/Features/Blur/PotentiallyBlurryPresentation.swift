@@ -34,10 +34,6 @@ enum PotentiallyBlurryPhase: Sendable, Equatable {
     case noCandidates(BlurAnalysisResult)
     /// The candidate grid — every photo that scored below the sharp threshold.
     case results(BlurAnalysisResult)
-    /// This pass is queued behind the Similar Photos analysis, which currently owns the
-    /// pipeline (M10). Shown instead of the resting state so the tap that queued the run
-    /// is always acknowledged — never a silent no-op.
-    case queuedBehindSimilarity
 }
 
 /// The review tabs over a completed result's candidates. Counts are derived from the
@@ -72,14 +68,10 @@ enum PotentiallyBlurryPresentation {
     /// The single permission → catalog → blur-analysis phase mapping. Similarity analysis
     /// state never participates: a duplicate scan running or failed in the background
     /// changes nothing here.
-    /// - Parameter pendingBehindOtherPass: the coordinator (M10) holds this pass in its
-    ///   one-slot queue — the Similar Photos analysis is running and this pass starts
-    ///   automatically when it finishes.
     static func phase(
         permission: PermissionState,
         catalog: CatalogScanState,
-        blur: BlurAnalysisState,
-        pendingBehindOtherPass: Bool = false
+        blur: BlurAnalysisState
     ) -> PotentiallyBlurryPhase {
         switch permission {
         case .notDetermined:
@@ -99,13 +91,6 @@ enum PotentiallyBlurryPresentation {
                 stage: analyzingMessage(progress),
                 fraction: progress.fraction
             )
-        }
-        // The queue acknowledgement (M10): a request that could not start yet is shown
-        // as queued, never folded back into the resting state the tap came from. A
-        // running pass of this screen's own pass always wins — the flag is only set
-        // while the *other* pass owns the pipeline, but it must never shadow a live run.
-        if pendingBehindOtherPass, !blur.isRunning {
-            return .queuedBehindSimilarity
         }
 
         switch catalog {
@@ -187,11 +172,6 @@ enum PotentiallyBlurryPresentation {
             return analyzingMessage(progress)
         case .paused:
             return "Scan paused"
-        case .queuedBehindSimilarity:
-            // Unreachable through this seam — it is called without the queue flag — but
-            // if that ever changes the dashboard must acknowledge the waiting request,
-            // never show a resting state the tap already left behind.
-            return "Queued behind Similar Photos"
         case .cancelled:
             return "Last run cancelled"
         case .failed(let message):

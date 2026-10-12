@@ -8,8 +8,6 @@ import SwiftUI
 struct ImageCleanupView: View {
     @Environment(AppEnvironment.self) private var env: AppEnvironment
 
-    private var pendingBehindOtherPass: Bool { env.pendingAnalysisRequest == .similarity }
-
     var body: some View {
         CleanupHubScreen(
             title: "Image Cleanup",
@@ -17,8 +15,7 @@ struct ImageCleanupView: View {
                 permission: env.photoPermissionState,
                 catalog: env.catalogState,
                 analysis: env.analysisState,
-                blur: env.blurAnalysisState,
-                pendingBehindOtherPass: pendingBehindOtherPass
+                blur: env.blurAnalysisState
             )
         ) {
             ForEach(ImageCleanupDestination.allCases, id: \.self) { destination in
@@ -31,18 +28,16 @@ struct ImageCleanupView: View {
                         permission: env.photoPermissionState,
                         catalog: env.catalogState,
                         analysis: env.analysisState,
-                        blur: env.blurAnalysisState,
-                        pendingBehindOtherPass: pendingBehindOtherPass
+                        blur: env.blurAnalysisState
                     ),
                     accessibilityIdentifier: destination.accessibilityIdentifier
                 ) {
                     switch destination {
-                    case .duplicateImages:
-                        // Same engine and screen as Similar Images: exact-duplicate groups
-                        // are a first-class section of the Similar Photos result, never a
-                        // renamed stand-in. Opening this destination does not start a run.
-                        SimilarPhotosView(highlightExactDuplicates: true)
-                    case .similarImages:
+                    case .duplicateSimilarPhotos:
+                        // One destination (M14) for both group kinds: the single analysis
+                        // pass produces exact-duplicate and similar groups, and this screen
+                        // reviews both over the same result set with in-screen filters.
+                        // Opening this destination does not start a run.
                         SimilarPhotosView()
                     case .blurryImages:
                         PotentiallyBlurryView()

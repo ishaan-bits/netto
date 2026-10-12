@@ -191,6 +191,82 @@ final class SwipeReviewModel: ObservableObject {
     }
 }
 
+// MARK: - Thumbnail prefetch
+
+/// Warms the shared `ThumbnailStore` with the swipe card's lightweight frames ahead of the
+/// cursor (M14): a bounded forward window — the current photo first — through the same
+/// store the card reads, so the frame on screen is a cache hit the instant the card
+/// appears and swiping never waits on PhotoKit for a first look. Local-only thumbnails at
+/// `SwipeReviewPresentation.swipeThumbnailPixelSize` — never the full-resolution preview
+/// path, and no pixels ever enter the persisted session snapshot.
+///
+/// Every warm-up supersedes the previous one (the window moves with the cursor; Shuffle /
+/// Start New Pass reorder the deck mid-window), so the old walk is cancelled before the
+/// new one starts. A superseded walk's already-issued loads are harmless: the store is
+/// keyed by asset ID, so a completed load is either the right photo's frame or an eviction
+/// candidate — never a stale display.
+@MainActor
+final class SwipeThumbnailPrefetcher: ObservableObject {
+    private var warmTask: Task<Void, Never>?
+
+    /// Warms `order` (already prioritized: the current photo first, then forward). A
+    /// repeated order is absorbed by the store's cache; a new order supersedes the old walk.
+    func warm(order: [String], store: ThumbnailStore) {
+        warmTask?.cancel()
+        guard !order.isEmpty else { return }
+        warmTask = Task {
+            for assetID in order {
+                guard !Task.isCancelled else { return }
+                _ = try? await store.image(
+                    for: assetID,
+                    targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
+                )
+            }
+        }
+    }
+
+    /// Stops the walk (the screen is going away) without touching the store: warmed frames
+    /// stay resident for the next appearance, bounded by the store's own limits.
+    func stop() {
+        warmTask?.cancel()
+        warmTask = nil
+    }
+}
+
+/// The prefetched instant frame for the card now on screen (M14): pulled from the shared
+/// store at `SwipeReviewPresentation.swipeThumbnailPixelSize` — the same size, content
+/// mode, and local-only options the prefetcher warms, so a warmed key is a cache hit
+/// within a frame and PhotoKit is never asked twice. Renders nothing until the thumbnail
+/// lands (the caller keeps its skeleton underneath); `.id(assetID)` at the call site gives
+/// each card fresh state, so one photo's pixels can never flash for another.
+private struct SwipeInstantThumbnail: View {
+    let assetID: String
+    let store: ThumbnailStore
+    @State private var thumbnail: CGImage?
+
+    var body: some View {
+        Group {
+            if let thumbnail {
+                Image(thumbnail, scale: 1, orientation: .up, label: Text("Photo preview"))
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .transition(.opacity)
+                    .accessibilityHidden(true)
+            }
+        }
+        .task(id: assetID) {
+            if let image = try? await store.image(
+                for: assetID,
+                targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
+            ) {
+                withAnimation(.easeInOut(duration: 0.12)) {
+                    thumbnail = image
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Swipe review screen
 
 /// One-at-a-time review of the photo library: swipe right (or tap Keep) to keep a photo,
@@ -208,7 +284,10 @@ final class SwipeReviewModel: ObservableObject {
 ///   rebuilds a plan.
 /// - **One photo loaded at a time.** The preview is the M4J `PhotoPreviewModel` driven by
 ///   the environment's loader (uncached, released on close or on reaching the completion
-///   state) — no second PhotoKit loader, no whole-library prefetch.
+///   state) — no second PhotoKit loader, no whole-library prefetch. Its instant first
+///   frame is a bounded-window prefetch (M14): up to 20 lightweight, local-only
+///   thumbnails warmed through the shared `ThumbnailStore` ahead of the cursor, shown the
+///   moment a card appears and replaced by the large preview when it arrives.
 /// - **Session durability.** Deck order, cursor, undo history, and the decision log persist
 ///   through `env.saveSwipeSession` / `env.restoreSwipeSession` (asset identifiers and
 ///   review state only — never pixels), so leaving the screen, navigating back, or relaunching
@@ -232,6 +311,8 @@ struct SwipeReviewView: View {
     @StateObject private var model: SwipeReviewModel
     /// The M4J preview lifecycle, re-opened per photo; its bitmap is released on close.
     @StateObject private var preview = PhotoPreviewModel()
+    /// Keeps the instant-frame window warm ahead of the cursor (M14).
+    @StateObject private var prefetcher = SwipeThumbnailPrefetcher()
     @State private var dragOffset: CGSize = .zero
     /// Drives the skeleton's shimmer sweep; only ever animated when Reduce Motion is off.
     @State private var shimmerSwept = false
@@ -270,7 +351,10 @@ struct SwipeReviewView: View {
                 }
             }
             .onChange(of: model.currentItem?.assetID) { _, _ in openCurrent() }
-            .onDisappear { preview.close() }
+            .onDisappear {
+                preview.close()
+                prefetcher.stop()
+            }
     }
 
     /// Adopts the persisted session, if any, exactly once per screen instance (the guard on
@@ -347,13 +431,30 @@ struct SwipeReviewView: View {
 
     /// Loads the photo now on screen — one preview request at a time, through the same
     /// loader policy as Photo Details. Re-opening cancels the previous load; reaching the
-    /// completion state closes it entirely and releases the bitmap.
+    /// completion state closes it entirely and releases the bitmap. The instant-frame
+    /// window is kept warm here too: it follows the cursor by construction (M14).
     private func openCurrent() {
         guard let item = model.currentItem else {
             preview.close()
+            prefetcher.stop()
             return
         }
         preview.open(assetID: item.assetID, using: env.thumbnailLoader)
+        warmUpcomingThumbnails()
+    }
+
+    /// Warms the instant-frame window: the current photo first, then the bounded forward
+    /// window (M14). Called on every card change and after Shuffle / Start New Pass, which
+    /// reorder the deck without moving the current photo — so the window must be re-walked
+    /// even though `currentItem` did not change.
+    private func warmUpcomingThumbnails() {
+        prefetcher.warm(
+            order: SwipeReviewPresentation.prefetchOrder(
+                around: model.cursor,
+                in: model.items.map(\.assetID)
+            ),
+            store: env.thumbnails
+        )
     }
 
     // MARK: Review state
@@ -426,7 +527,7 @@ struct SwipeReviewView: View {
     // MARK: Photo card
 
     private func photoCard(_ item: SwipeReviewItem) -> some View {
-        previewStack
+        previewStack(assetID: item.assetID)
             .frame(maxWidth: .infinity)
             .frame(height: SimilarPhotosPresentation.previewBoxHeight)
             .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.card, style: .continuous))
@@ -441,9 +542,12 @@ struct SwipeReviewView: View {
     }
 
     /// The preview box itself: same letterboxed, aspect-fit, rounded presentation as Photo
-    /// Details, including the interim-frame, skeleton, and unavailable states.
+    /// Details, including the interim-frame, skeleton, and unavailable states. While the
+    /// large preview is still loading with no interim frame, the prefetched instant
+    /// thumbnail (M14) stands in over the skeleton — the same photo, never another's,
+    /// keyed by asset ID — and the large frame crossfades over it when it arrives.
     @ViewBuilder
-    private var previewStack: some View {
+    private func previewStack(assetID: String) -> some View {
         ZStack {
             Color.black
 
@@ -455,7 +559,7 @@ struct SwipeReviewView: View {
                 if let image = preview.image {
                     previewImage(image)
                 } else {
-                    skeleton
+                    instantFrame(assetID)
                 }
 
             case .ready:
@@ -470,6 +574,19 @@ struct SwipeReviewView: View {
             }
         }
         .contentShape(Rectangle())
+    }
+
+    /// The instant first frame: the prefetched lightweight thumbnail over the loading
+    /// skeleton. Normally a `ThumbnailStore` cache hit within a frame (the prefetcher
+    /// warmed it ahead of the cursor); if even the thumbnail is not resident yet, the
+    /// skeleton simply shows until it lands. `.id(assetID)` forces fresh state per card,
+    /// so a swipe can never flash the previous photo's frame (M14).
+    private func instantFrame(_ assetID: String) -> some View {
+        ZStack {
+            skeleton
+            SwipeInstantThumbnail(assetID: assetID, store: env.thumbnails)
+                .id(assetID)
+        }
     }
 
     private func previewImage(_ image: CGImage) -> some View {
@@ -658,18 +775,20 @@ struct SwipeReviewView: View {
 
     /// Shuffle: only the unreviewed tail re-orders. Decisions, cursor, and undo history are
     /// untouched by construction, so persisting afterwards captures a session that is still
-    /// exactly where it was — just in a different order.
+    /// exactly where it was — just in a different order. The instant-frame window is
+    /// re-walked: the deck it was warming just changed under it (M14).
     private func shuffleRemaining() {
         var generator = SystemRandomNumberGenerator()
         model.shuffleRemaining(using: &generator)
         persistSession()
+        warmUpcomingThumbnails()
     }
 
     /// Start New Pass: rebuild a library deck from the *current* catalog (so photos added
     /// since the deck was built join this pass, and confirmed removals are gone), reshuffle
     /// everything, and reset position and undo — while every prior decision keeps standing.
     /// A group session keeps its own deck (group membership only exists in the analysis the
-    /// deck came from).
+    /// deck came from). The instant-frame window is re-walked over the fresh deck (M14).
     private func startNewPass() {
         var deck = model.items
         if presetItems == nil, model.items.first?.isLibraryItem == true,
@@ -680,6 +799,7 @@ struct SwipeReviewView: View {
         var generator = SystemRandomNumberGenerator()
         model.shuffleRemaining(using: &generator)
         persistSession()
+        warmUpcomingThumbnails()
     }
 
     /// Persists deck order, cursor, undo history, and the decision log after every mutation.

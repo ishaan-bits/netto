@@ -166,13 +166,9 @@ struct DashboardView: View {
                 catalog: env.catalogState,
                 analysis: env.analysisState,
                 blur: env.blurAnalysisState,
-                pendingBehindOtherPass: env.pendingAnalysisRequest == .similarity,
                 resolution: env.videoSizeResolution,
                 videoSignature: env.videoDatasetSignature,
                 videoRecords: env.videoRecordsForDisplay,
-                recordedVideos: env.recordedVideosForDisplay,
-                downloadedVideos: env.downloadedVideosForDisplay,
-                otherVideoCount: env.otherVideosCount,
                 contactScan: env.contactScanState
             ),
             accessibilityIdentifier: section.accessibilityIdentifier

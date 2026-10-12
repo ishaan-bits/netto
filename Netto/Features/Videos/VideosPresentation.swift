@@ -135,7 +135,7 @@ enum VideosPresentation {
             return "No videos found"
         case .measuringVideos(let measured, let total, let unavailable):
             if case .idle = resolution {
-                return "\(total) videos · sizes not measured yet"
+                return "\(total) \(total == 1 ? "video" : "videos") · sizes not measured yet"
             }
             var text = "Measuring sizes · \(measured) of \(total) videos…"
             if unavailable > 0 {
@@ -191,12 +191,14 @@ enum VideosPresentation {
     /// measurement figures derived from actual data. Illustrative shape:
     ///
     ///     7,061 videos total
-    ///     7,061 sizes unavailable — stored in iCloud or unavailable locally
-    ///     12 videos sorted by known size
+    ///     7,020 sizes unavailable — not measured locally
+    ///     41 videos sorted by known size
     ///
-    /// - `total` is the enumerated inventory — it never waits on measurement.
-    /// - `unavailable` counts attempted-and-unmeasurable sizes (stored in iCloud, unreadable);
-    ///   never folded into measured, never zero.
+    /// - `total` is the enumerated inventory — it never waits on measurement, and never
+    ///   depends on it.
+    /// - `unavailable` counts sizes the measurement could not resolve; never folded into
+    ///   measured, never zero, never given a cause this screen cannot evidence (whether a
+    ///   video lives in iCloud is not something the inventory claims).
     /// - `measured` counts videos actually sorted by a known size; the line is omitted
     ///   while nothing has been measured yet (an idle run says so instead, and an
     ///   all-unavailable library names only its unavailable figure).
@@ -204,7 +206,7 @@ enum VideosPresentation {
         guard total > 0 else { return [] }
         var lines = ["\(total) videos total"]
         if unavailable > 0 {
-            lines.append("\(unavailable) sizes unavailable — stored in iCloud or unavailable locally")
+            lines.append("\(unavailable) sizes unavailable — not measured locally")
         }
         if measured > 0 {
             lines.append("\(measured) videos sorted by known size")

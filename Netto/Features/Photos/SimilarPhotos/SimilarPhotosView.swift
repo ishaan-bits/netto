@@ -1,19 +1,18 @@
 import SwiftUI
 
-/// The SIMILAR PHOTOS review screen: every state the analysis pipeline can be in, and — when a
-/// run completes — the group list, thumbnails, best-photo recommendation, and selection model.
+/// The DUPLICATE & SIMILAR PHOTOS review screen (M14): every state the analysis pipeline
+/// can be in, and — when a run completes — the unified group list (exact duplicates and
+/// similar shots over one result set, narrowed by an in-screen filter), thumbnails,
+/// best-photo recommendation, and selection model.
 ///
 /// All state is derived from `AppEnvironment` through `SimilarPhotosPresentation.phase`; this
-/// view stores nothing itself except the currently open detail sheet. There is no deletion or
-/// mutation API anywhere in this file — the only writes are selection changes.
+/// view stores nothing itself except the currently open detail sheet and the group-kind
+/// filter. There is no deletion or mutation API anywhere in this file — the only writes are
+/// selection changes and the filter.
 struct SimilarPhotosView: View {
-    /// Presentation-only (set by the Duplicate Images destination): drives the nav title and
-    /// a11y ID so the same engine serves both hubs without a renamed duplicate screen. It never
-    /// changes selection, review, or the result — exact groups are first-class in the analysis.
-    var highlightExactDuplicates: Bool = false
-
     @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var detailTarget: DetailTarget?
+    @State private var groupFilter: SimilarPhotosGroupFilter = .all
 
     private struct DetailTarget: Identifiable {
         let group: PhotoSimilarityGroup
@@ -25,15 +24,14 @@ struct SimilarPhotosView: View {
         SimilarPhotosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            analysis: env.analysisState,
-            pendingBehindOtherPass: env.pendingAnalysisRequest == .similarity
+            analysis: env.analysisState
         )
     }
 
     var body: some View {
         content
             .background(NettoColor.background.ignoresSafeArea())
-            .navigationTitle(highlightExactDuplicates ? "Duplicate Images" : "Similar Photos")
+            .navigationTitle("Duplicate & Similar Photos")
             .nettoAppear()
             .nettoStateTransition(phaseID)
             .onAppear { env.refreshPermissions() }
@@ -96,20 +94,6 @@ struct SimilarPhotosView: View {
             // The run was interrupted (backgrounding, termination, lock) and saved its
             // checkpoint; resume continues it from the saved stage — never a fresh start.
             pausedState(stage: stage, fraction: fraction)
-
-        case .queuedBehindBlur:
-            // The tap was never dropped (M10): the run is in the coordinator's queue and
-            // starts automatically. Start Now is the explicit cancel-and-switch; Remove
-            // clears the queue and leaves the running sharpness pass untouched.
-            PhaseMessage(
-                systemImage: "hourglass",
-                title: "Sharpness check running",
-                message: "Your Similar Photos analysis is queued. It starts automatically when the sharpness check finishes — nothing is deleted during either check.",
-                buttonTitle: "Start Now (Cancels Sharpness Check)",
-                buttonAction: { env.startPendingAnalysisNow() },
-                secondaryButtonTitle: "Remove from Queue",
-                secondaryButtonAction: { env.cancelPendingAnalysis() }
-            )
 
         case .cancelled:
             PhaseMessage(
@@ -216,7 +200,22 @@ struct SimilarPhotosView: View {
                 summaryHeader(result, summary: summary)
             }
 
-            if !result.exactGroups.isEmpty {
+            // The in-screen group-kind filter (M14): one result set, narrowed — never
+            // re-analyzed. Shown only when both group kinds exist; with one kind the
+            // filter would only offer a tautology.
+            if !result.exactGroups.isEmpty && !result.similarGroups.isEmpty {
+                Section {
+                    Picker("Filter", selection: $groupFilter) {
+                        ForEach(SimilarPhotosGroupFilter.allCases) { filter in
+                            Text(filter.title).tag(filter)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("groupFilterPicker")
+                }
+            }
+
+            if groupFilter.showsExact, !result.exactGroups.isEmpty {
                 Section("Exact Duplicates") {
                     ForEach(result.exactGroups) { group in
                         groupRow(group)
@@ -224,7 +223,7 @@ struct SimilarPhotosView: View {
                 }
             }
 
-            if !result.similarGroups.isEmpty {
+            if groupFilter.showsSimilar, !result.similarGroups.isEmpty {
                 Section("Similar Photos") {
                     ForEach(result.similarGroups) { group in
                         groupRow(group)
@@ -425,7 +424,6 @@ struct SimilarPhotosView: View {
         case .permissionRequired: return "permissionRequired"
         case .permissionDenied: return "permissionDenied"
         case .idle: return "idle"
-        case .queuedBehindBlur: return "queuedBehindBlur"
         case .buildingCatalog: return "buildingCatalog"
         case .analyzing: return "analyzing"
         case .paused: return "paused"

@@ -508,7 +508,7 @@ struct VideoDatasetTests {
             VideosPresentation.inventorySummary(total: 6, measured: 4, unavailable: 2)
                 == [
                     "6 videos total",
-                    "2 sizes unavailable — stored in iCloud or unavailable locally",
+                    "2 sizes unavailable — not measured locally",
                     "4 videos sorted by known size",
                 ]
         )
@@ -521,7 +521,7 @@ struct VideoDatasetTests {
             VideosPresentation.inventorySummary(total: 7061, measured: 0, unavailable: 7061)
                 == [
                     "7061 videos total",
-                    "7061 sizes unavailable — stored in iCloud or unavailable locally",
+                    "7061 sizes unavailable — not measured locally",
                 ]
         )
     }
