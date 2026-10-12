@@ -191,487 +191,6 @@ final class SwipeReviewModel: ObservableObject {
     }
 }
 
-// MARK: - Thumbnail prefetch
-
-/// Warms the shared `ThumbnailStore` with the swipe card's frames ahead of the cursor
-/// (M14/M15): a bounded forward window — the current photo first — through the same
-/// store the card reads, so the frame on screen is a cache hit the instant the card
-/// appears and swiping never waits on PhotoKit for a first look. Two tiers:
-///
-/// - the **low-resolution** tier (`swipeThumbnailLowResPixelSize`) covers the whole
-///   window — small, fast, the temporary frame while the sharp one prepares;
-/// - the **screen-sized** tier (`swipeThumbnailPixelSize`) covers the current photo and
-///   the next few (`swipeSharpPrefetchCount`) — the final sharp frame, prioritized.
-///
-/// Both are local-only renditions — never the full-resolution preview path, never a
-/// network fetch — and no pixels ever enter the persisted session snapshot. The walk is
-/// sequential in priority order (current first), so request concurrency stays bounded and
-/// the store's own in-flight coalescing deduplicates against the card's own reads.
-///
-/// Every warm-up supersedes the previous one (the window moves with the cursor; Shuffle /
-/// Start New Pass reorder the deck mid-window), so the old walk is cancelled before the
-/// new one starts. A superseded walk's already-issued loads are harmless: the store is
-/// keyed by asset ID, so a completed load is either the right photo's frame or an eviction
-/// candidate — never a stale display — and it is never the *card's* request, which lives
-/// in `SwipeCardFrameModel` and is not cancelled by the walk.
-@MainActor
-final class SwipeThumbnailPrefetcher: ObservableObject {
-    private var warmTask: Task<Void, Never>?
-
-    /// Warms `order` (already prioritized: the current photo first, then forward). A
-    /// repeated order is absorbed by the store's cache; a new order supersedes the old walk.
-    func warm(order: [String], store: ThumbnailStore) {
-        warmTask?.cancel()
-        guard !order.isEmpty else { return }
-        let lowRes = SwipeReviewPresentation.swipeThumbnailLowResPixelSize
-        let sharp = SwipeReviewPresentation.swipeThumbnailPixelSize
-        let sharpCount = SwipeReviewPresentation.swipeSharpPrefetchCount
-        warmTask = Task {
-            for (offset, assetID) in order.enumerated() {
-                guard !Task.isCancelled else { return }
-                // Per asset: the fast low-resolution frame first, then — for the current
-                // photo and the next few — the screen-sized final. Order is priority.
-                _ = try? await store.image(for: assetID, targetPixelSize: lowRes)
-                guard !Task.isCancelled else { return }
-                if offset < sharpCount {
-                    _ = try? await store.image(for: assetID, targetPixelSize: sharp)
-                }
-            }
-        }
-    }
-
-    /// Stops the walk (the screen is going away) without touching the store: warmed frames
-    /// stay resident for the next appearance, bounded by the store's own limits.
-    func stop() {
-        warmTask?.cancel()
-        warmTask = nil
-    }
-}
-
-// MARK: - Card frame
-
-/// The lifecycle of one swipe card's image (M15), backed by the shared `ThumbnailStore`.
-///
-/// The card shows the **screen-sized local thumbnail** — the same rendition the prefetcher
-/// warms, at the same cache key — as its final sharp frame. The low-resolution thumbnail of
-/// the same photo may show as a *temporary* frame while the screen-sized one prepares; it
-/// is never the final image. The slow network-enabled `previewImage` path (Photo Details'
-/// explicit open) is not used here: routine swipes never download originals, and a photo
-/// with no local rendition reports an honest unavailable state instead of hanging on one.
-///
-/// Ownership rules:
-/// - A warm key renders **without a loading state**: `prepare` peeks the store first and
-///   only publishes `.loading` when nothing cached is available, so "Loading photo…" never
-///   covers pixels that are already there.
-/// - Every frame is tagged with its asset ID and every async continuation re-checks the
-///   generation, so a fast swipe, Shuffle, Undo, or session restore can never show one
-///   photo's pixels for another, and a stale callback can never overwrite the current card.
-/// - A failed request is a terminal, honest state for *this card* — the deck itself keeps
-///   working (the next `prepare` is a fresh generation).
-@MainActor
-final class SwipeCardFrameModel: ObservableObject {
-    /// The loading contract (M15-R1) — every state a card can be in, and none of them
-    /// replaces a valid frame with an error while a request that can still succeed is in
-    /// flight.
-    enum Phase: Equatable {
-        case idle
-        /// The local fast path is in flight. `temporary` is the warm low-resolution frame
-        /// of the *same* photo shown while the sharp one prepares (never the final).
-        case preparing(temporary: CGImage?)
-        /// The local rendition is not on device (iCloud-backed) and the permitted
-        /// network-enabled request is in flight — an honest, non-blocking download state.
-        /// Any temporary frame stays visible while it runs.
-        case downloading(temporary: CGImage?)
-        /// The final, screen-sized frame — the sharp image the card keeps.
-        case final(CGImage)
-        /// A transient failure (iCloud download failed, timeout, PhotoKit hiccup): retry is
-        /// meaningful, nothing is poisoned, and `visible` keeps any frame already on screen.
-        case retryable(PhotoContentError, visible: CGImage?)
-        /// A genuine terminal failure for this session: the asset no longer exists, or
-        /// Photos access is off. Shown only after such a failure, never for a transient one.
-        case unavailable(PhotoContentError)
-    }
-
-    @Published private(set) var phase: Phase = .idle
-    private(set) var assetID: String?
-    private var generation = 0
-    private var isRequestInFlight = false
-
-    /// Prepares the frame for `assetID` through the shared store. Idempotent while a
-    /// request for the same card is in flight or a final frame exists; a settled *failure*
-    /// re-attempts on revisit (transient failures must never stick). Safe for a new card
-    /// at any time — the generation guard discards everything the old card started.
-    func prepare(assetID: String, store: ThumbnailStore) {
-        if self.assetID == assetID {
-            if case .final = phase { return }
-            if isRequestInFlight { return }
-        }
-        let changedAsset = self.assetID != assetID
-        let carriedFrame = changedAsset ? nil : phase.visibleFrame
-        generation += 1
-        let generation = generation
-        self.assetID = assetID
-        isRequestInFlight = true
-        // Identity-critical reset: when the card changes, the previous photo's pixels
-        // leave the screen immediately (a frame is never shown for the wrong asset).
-        // A re-attempt of the *same* card drops its stale failure but keeps its own
-        // pixels visible. A fresh card from idle resets nothing — a warm key resolves
-        // before any loading state is published.
-        switch phase {
-        case .retryable, .unavailable:
-            phase = .preparing(temporary: carriedFrame)
-        default:
-            if changedAsset, carriedFrame == nil, self.phase.visibleFrame != nil {
-                phase = .preparing(temporary: nil)
-            } else if changedAsset, case .final = phase {
-                phase = .preparing(temporary: nil)
-            }
-        }
-
-        Task { [weak self] in
-            guard let self else { return }
-            // A warm screen-sized key answers here before any loading state is published.
-            if let sharp = await store.peekCached(
-                assetID: assetID,
-                targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
-            ) {
-                guard self.generation == generation else { return }
-                self.isRequestInFlight = false
-                self.phase = .final(sharp)
-                return
-            }
-            guard self.generation == generation else { return }
-            // The temporary tier: a warm low-resolution frame of the same photo, kept
-            // visible while the sharp one prepares and while any download runs.
-            let temporary = await store.peekCached(
-                assetID: assetID,
-                targetPixelSize: SwipeReviewPresentation.swipeThumbnailLowResPixelSize
-            )
-            guard self.generation == generation else { return }
-            self.phase = .preparing(temporary: temporary)
-
-            do {
-                let sharp = try await Self.loadFinalFrame(
-                    assetID: assetID,
-                    store: store,
-                    onFallback: { [weak self] in
-                        guard let self, self.generation == generation else { return }
-                        self.phase = .downloading(temporary: temporary)
-                    }
-                )
-                guard self.generation == generation else { return }
-                self.isRequestInFlight = false
-                self.phase = .final(sharp)
-            } catch {
-                guard self.generation == generation else { return }
-                self.isRequestInFlight = false
-                if error is CancellationError || Task.isCancelled { return }
-                let contentError = Self.contentError(for: error)
-                if Self.isTerminal(contentError) {
-                    self.phase = .unavailable(contentError)
-                } else {
-                    // Transient: retryable, and any frame already on screen stays.
-                    self.phase = .retryable(contentError, visible: temporary)
-                }
-            }
-        }
-    }
-
-    /// The frame pipeline: local-first, then — only when the local rendition is genuinely
-    /// missing and the failure is the kind a download can fix — the permitted
-    /// network-enabled request. Prefetch never reaches this; it stays local-only.
-    private static func loadFinalFrame(
-        assetID: String,
-        store: ThumbnailStore,
-        onFallback: @escaping @MainActor () -> Void
-    ) async throws -> CGImage {
-        do {
-            return try await store.image(
-                for: assetID,
-                targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize,
-                policy: .localOnly
-            )
-        } catch {
-            if error is CancellationError || Task.isCancelled { throw error }
-            let contentError = contentError(for: error)
-            guard PhotoKitThumbnailLoader.isPreviewFallbackCandidate(contentError) else {
-                throw error
-            }
-            onFallback()
-            return try await store.image(
-                for: assetID,
-                targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize,
-                policy: .allowNetwork
-            )
-        }
-    }
-
-    /// Retries the current card after a transient failure (one fresh request chain; any
-    /// visible frame is kept on screen). No-op for a final frame or an in-flight request.
-    func retry(store: ThumbnailStore) {
-        guard let assetID else { return }
-        if case .final = phase { return }
-        guard !isRequestInFlight else { return }
-        prepare(assetID: assetID, store: store)
-    }
-
-    /// Releases the frame state. Safe to call repeatedly; the store keeps whatever it has.
-    func close() {
-        generation += 1
-        assetID = nil
-        isRequestInFlight = false
-        phase = .idle
-    }
-
-    private static func contentError(for error: any Error) -> PhotoContentError {
-        (error as? PhotoContentError) ?? .unavailable
-    }
-
-    /// Only a genuine terminal failure may claim permanent unavailability: the asset is
-    /// gone, or Photos access is off. Everything else (iCloud, timeout, framework hiccups)
-    /// is transient and retryable — never labelled permanent.
-    static func isTerminal(_ error: PhotoContentError) -> Bool {
-        switch error {
-        case .assetNotFound, .permissionDenied: return true
-        case .onlyInICloud, .unavailable: return false
-        }
-    }
-}
-
-extension SwipeCardFrameModel.Phase {
-    /// A settled outcome (frame or failure) — no request is running for it.
-    var isSettled: Bool {
-        switch self {
-        case .final, .retryable, .unavailable: return true
-        case .idle, .preparing, .downloading: return false
-        }
-    }
-
-    /// A valid frame that must stay on screen while sharper work continues.
-    var visibleFrame: CGImage? {
-        switch self {
-        case .final(let image): return image
-        case .preparing(let temporary), .downloading(let temporary): return temporary
-        case .retryable(_, let visible): return visible
-        case .idle, .unavailable: return nil
-        }
-    }
-}
-
-/// Renders one card's frame state (M15-R1): the screen-sized frame when it exists, the
-/// temporary low-resolution frame while anything sharper prepares or downloads, an honest
-/// non-blocking download state for iCloud-backed photos, and — only after a genuine
-/// terminal failure — the error card. A valid frame is never replaced by an error while a
-/// request that can still succeed is in flight; a transient failure keeps any frame it
-/// already had and offers Retry inline.
-struct SwipeCardFrameView: View {
-    let phase: SwipeCardFrameModel.Phase
-    let onRetry: () -> Void
-
-    var body: some View {
-        ZStack {
-            Color.black
-            switch phase {
-            case .idle:
-                skeleton
-
-            case .preparing(let temporary):
-                if let temporary {
-                    frameImage(temporary)
-                } else {
-                    skeleton
-                }
-
-            case .downloading(let temporary):
-                if let temporary {
-                    frameImage(temporary)
-                        .overlay(alignment: .bottom) { downloadingChip }
-                } else {
-                    downloadingState
-                }
-
-            case .final(let image):
-                frameImage(image)
-
-            case .retryable(_, let visible):
-                if let visible {
-                    // The photo is on screen; the transient failure is a chip, not an
-                    // error card — and never a blank.
-                    frameImage(visible)
-                        .overlay(alignment: .bottom) { retryChip }
-                } else {
-                    retryableState
-                }
-
-            case .unavailable(let error):
-                unavailable(error)
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
-    private func frameImage(_ image: CGImage) -> some View {
-        Image(image, scale: 1, orientation: .up, label: Text("Photo preview"))
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .accessibilityHidden(true)
-    }
-
-    /// Loading skeleton. Under Reduce Motion the shimmer sweep (a repeating motion) is
-    /// replaced by a static placeholder with the loading caption — same information, no motion.
-    private var skeleton: some View {
-        SwipeCardSkeleton(message: SimilarPhotosPresentation.previewLoadingMessage)
-    }
-
-    /// The honest iCloud download state: progress copy, no promise of instant rendering,
-    /// bounded by the request's own timeout (which lands in a retryable state).
-    private var downloadingState: some View {
-        VStack(spacing: Theme.Spacing.md) {
-            Image(systemName: "icloud.and.arrow.down")
-                .font(.system(size: 34))
-                .foregroundStyle(.white.opacity(0.75))
-            Text(SwipeReviewPresentation.downloadMessage)
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.85))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, Theme.Spacing.xl)
-            ProgressView()
-                .tint(.white)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(SwipeReviewPresentation.downloadMessage)
-    }
-
-    /// Non-blocking status over a visible frame while a download runs.
-    private var downloadingChip: some View {
-        statusChip(SwipeReviewPresentation.downloadShortMessage, systemImage: "icloud.and.arrow.down")
-    }
-
-    /// Non-blocking retry over a visible frame after a transient failure.
-    private var retryChip: some View {
-        Button(action: onRetry) {
-            Label(SwipeReviewPresentation.retryChipTitle, systemImage: "arrow.clockwise")
-                .font(.caption.weight(.semibold))
-                .padding(.horizontal, Theme.Spacing.sm)
-                .padding(.vertical, Theme.Spacing.xs)
-                .background(.black.opacity(0.55), in: Capsule())
-                .foregroundStyle(.white)
-        }
-        .buttonStyle(.plain)
-        .padding(Theme.Spacing.sm)
-        .accessibilityLabel("Try loading the photo again")
-    }
-
-    private func statusChip(_ text: String, systemImage: String) -> some View {
-        Label(text, systemImage: systemImage)
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, Theme.Spacing.sm)
-            .padding(.vertical, Theme.Spacing.xs)
-            .background(.black.opacity(0.55), in: Capsule())
-            .foregroundStyle(.white)
-            .padding(Theme.Spacing.sm)
-            .allowsHitTesting(false)
-    }
-
-    /// A transient failure with no frame to keep: the retryable message (never the
-    /// permanent one) with a functional Try Again.
-    private var retryableState: some View {
-        VStack(spacing: Theme.Spacing.md) {
-            Image(systemName: "icloud.slash")
-                .font(.system(size: 34))
-                .foregroundStyle(.white.opacity(0.75))
-            Text(SwipeReviewPresentation.transientFailureMessage)
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.8))
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            retryButton
-        }
-        .padding(Theme.Spacing.lg)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .contain)
-    }
-
-    private func unavailable(_ error: PhotoContentError) -> some View {
-        VStack(spacing: Theme.Spacing.md) {
-            Image(systemName: SimilarPhotosPresentation.previewFailureSymbol(for: error))
-                .font(.system(size: 34))
-                .foregroundStyle(.white.opacity(0.75))
-            Text(SimilarPhotosPresentation.previewUnavailableTitle)
-                .font(.headline)
-                .foregroundStyle(.white)
-            Text(SimilarPhotosPresentation.previewUnavailableMessage(for: error))
-                .font(.subheadline)
-                .foregroundStyle(.white.opacity(0.8))
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            retryButton
-        }
-        .padding(Theme.Spacing.lg)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(SimilarPhotosPresentation.previewUnavailableTitle)
-    }
-
-    private var retryButton: some View {
-        Button {
-            onRetry()
-        } label: {
-            Text("Try Again")
-                .font(.subheadline.weight(.semibold))
-                .padding(.horizontal, Theme.Spacing.lg)
-                .padding(.vertical, Theme.Spacing.sm)
-                .background(.white.opacity(0.16), in: Capsule())
-                .foregroundStyle(.white)
-        }
-        .accessibilityLabel("Try loading the photo again")
-    }
-}
-
-/// The card's loading skeleton (M15): shown only when no frame of the current photo is
-/// available yet. Reduce Motion swaps the shimmer sweep for a static placeholder with the
-/// same caption — same information, no motion.
-struct SwipeCardSkeleton: View {
-    let message: String
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var shimmerSwept = false
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
-                .fill(Color.white.opacity(0.07))
-                .padding(Theme.Spacing.lg)
-
-            if reduceMotion {
-                Text(message)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
-            } else {
-                sweep
-                Text(message)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
-                    .padding(.top, Theme.Spacing.xl)
-            }
-        }
-        .accessibilityElement()
-        .accessibilityLabel(message)
-    }
-
-    private var sweep: some View {
-        RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
-            .fill(Color.white.opacity(0.07))
-            .padding(Theme.Spacing.lg)
-            .scaleEffect(x: shimmerSwept ? 1.4 : 0.6)
-            .opacity(shimmerSwept ? 0 : 0.9)
-            .animation(
-                reduceMotion ? nil : .easeInOut(duration: 1.1).repeatForever(autoreverses: false),
-                value: shimmerSwept
-            )
-            .onAppear { shimmerSwept = true }
-    }
-}
-
 // MARK: - Swipe review screen
 
 /// One-at-a-time review of the photo library: swipe right (or tap Keep) to keep a photo,
@@ -687,13 +206,9 @@ struct SwipeCardSkeleton: View {
 ///   editable list of this session's Delete marks and only *that* flow's confirmation can
 ///   reach the existing deletion pipeline. Nothing on this screen deletes, rescans, or
 ///   rebuilds a plan.
-/// - **One photo loaded at a time.** The card's image is the shared `ThumbnailStore`'s
-///   screen-sized local thumbnail (M15) — the same rendition the bounded window
-///   prefetcher warms ahead of the cursor — with the low-resolution thumbnail of the same
-///   photo only ever as a temporary stand-in while the sharp one prepares. Routine swipes
-///   never use the network-enabled Photo Details preview path and never fetch
-///   full-resolution originals; a photo with no local rendition reports an honest
-///   unavailable state.
+/// - **One photo loaded at a time.** The preview is the M4J `PhotoPreviewModel` driven by
+///   the environment's loader (uncached, released on close or on reaching the completion
+///   state) — no second PhotoKit loader, no whole-library prefetch.
 /// - **Session durability.** Deck order, cursor, undo history, and the decision log persist
 ///   through `env.saveSwipeSession` / `env.restoreSwipeSession` (asset identifiers and
 ///   review state only — never pixels), so leaving the screen, navigating back, or relaunching
@@ -715,12 +230,11 @@ struct SwipeReviewView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @StateObject private var model: SwipeReviewModel
-    /// The card frame lifecycle (M15): the shared store's screen-sized thumbnail is the
-    /// final image; the low-resolution frame is only ever a temporary stand-in.
-    @StateObject private var frameModel = SwipeCardFrameModel()
-    /// Keeps the frame window warm ahead of the cursor (M14/M15).
-    @StateObject private var prefetcher = SwipeThumbnailPrefetcher()
+    /// The M4J preview lifecycle, re-opened per photo; its bitmap is released on close.
+    @StateObject private var preview = PhotoPreviewModel()
     @State private var dragOffset: CGSize = .zero
+    /// Drives the skeleton's shimmer sweep; only ever animated when Reduce Motion is off.
+    @State private var shimmerSwept = false
     /// An explicitly supplied deck (previews). Production passes `nil` and the deck is built
     /// from the completed catalog on appear — the dashboard's card must not construct every
     /// swipe item on each of its own renders.
@@ -756,10 +270,7 @@ struct SwipeReviewView: View {
                 }
             }
             .onChange(of: model.currentItem?.assetID) { _, _ in openCurrent() }
-            .onDisappear {
-                frameModel.close()
-                prefetcher.stop()
-            }
+            .onDisappear { preview.close() }
     }
 
     /// Adopts the persisted session, if any, exactly once per screen instance (the guard on
@@ -834,33 +345,15 @@ struct SwipeReviewView: View {
         }
     }
 
-    /// Prepares the frame for the photo now on screen — through the shared `ThumbnailStore`,
-    /// the same rendition the prefetcher warms (M15). A warm key renders immediately with
-    /// no loading state; a cold key shows the temporary low-resolution frame if one is
-    /// resident, then the screen-sized final. The frame window is kept warm here too: it
-    /// follows the cursor by construction (M14).
+    /// Loads the photo now on screen — one preview request at a time, through the same
+    /// loader policy as Photo Details. Re-opening cancels the previous load; reaching the
+    /// completion state closes it entirely and releases the bitmap.
     private func openCurrent() {
         guard let item = model.currentItem else {
-            frameModel.close()
-            prefetcher.stop()
+            preview.close()
             return
         }
-        frameModel.prepare(assetID: item.assetID, store: env.thumbnails)
-        warmUpcomingThumbnails()
-    }
-
-    /// Warms the instant-frame window: the current photo first, then the bounded forward
-    /// window (M14). Called on every card change and after Shuffle / Start New Pass, which
-    /// reorder the deck without moving the current photo — so the window must be re-walked
-    /// even though `currentItem` did not change.
-    private func warmUpcomingThumbnails() {
-        prefetcher.warm(
-            order: SwipeReviewPresentation.prefetchOrder(
-                around: model.cursor,
-                in: model.items.map(\.assetID)
-            ),
-            store: env.thumbnails
-        )
+        preview.open(assetID: item.assetID, using: env.thumbnailLoader)
     }
 
     // MARK: Review state
@@ -933,7 +426,7 @@ struct SwipeReviewView: View {
     // MARK: Photo card
 
     private func photoCard(_ item: SwipeReviewItem) -> some View {
-        previewStack(assetID: item.assetID)
+        previewStack
             .frame(maxWidth: .infinity)
             .frame(height: SimilarPhotosPresentation.previewBoxHeight)
             .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.card, style: .continuous))
@@ -947,16 +440,127 @@ struct SwipeReviewView: View {
             .simultaneousGesture(swipeGesture)
     }
 
-    /// The preview box itself (M15): the shared-store frame state — the screen-sized local
-    /// thumbnail as the final sharp image, the low-resolution frame as a temporary stand-in
-    /// while it prepares, the skeleton only when nothing is available, and the honest
-    /// unavailable state when no local rendition exists. The slow network-enabled preview
-    /// path (Photo Details' explicit open) is deliberately not used for routine swipes.
-    private func previewStack(assetID: String) -> some View {
-        SwipeCardFrameView(
-            phase: frameModel.phase,
-            onRetry: { frameModel.retry(store: env.thumbnails) }
-        )
+    /// The preview box itself: same letterboxed, aspect-fit, rounded presentation as Photo
+    /// Details, including the interim-frame, skeleton, and unavailable states.
+    @ViewBuilder
+    private var previewStack: some View {
+        ZStack {
+            Color.black
+
+            switch preview.stage {
+            case .idle:
+                Color.black
+
+            case .loading:
+                if let image = preview.image {
+                    previewImage(image)
+                } else {
+                    skeleton
+                }
+
+            case .ready:
+                if let image = preview.image {
+                    previewImage(image)
+                } else {
+                    skeleton
+                }
+
+            case .unavailable(let error):
+                failureState(error)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private func previewImage(_ image: CGImage) -> some View {
+        Image(image, scale: 1, orientation: .up, label: Text("Photo preview"))
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .transition(.opacity)
+            .accessibilityHidden(true)
+    }
+
+    /// Loading skeleton. Under Reduce Motion the shimmer sweep (a repeating motion) is
+    /// replaced by a static placeholder with the loading caption — same information, no motion.
+    private var skeleton: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
+                .fill(Color.white.opacity(0.07))
+                .padding(Theme.Spacing.lg)
+
+            if reduceMotion {
+                Text(SimilarPhotosPresentation.previewLoadingMessage)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+            } else {
+                shimmeringSweep
+                Text(SimilarPhotosPresentation.previewLoadingMessage)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .padding(.top, Theme.Spacing.xl)
+            }
+        }
+        .accessibilityElement()
+        .accessibilityLabel(SimilarPhotosPresentation.previewLoadingMessage)
+    }
+
+    /// One soft highlight sweeping left-to-right over the placeholder. Decoration only —
+    /// never rendered when Reduce Motion is on (the branch above isn't taken then).
+    private var shimmeringSweep: some View {
+        RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
+            .fill(Color.white.opacity(0.07))
+            .padding(Theme.Spacing.lg)
+            .overlay {
+                GeometryReader { geo in
+                    LinearGradient(
+                        colors: [.clear, .white.opacity(0.16), .clear],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: geo.size.width * 0.5)
+                    .offset(x: geo.size.width * (shimmerSwept ? 1.2 : -0.7))
+                    .clipped()
+                }
+                .clipped()
+            }
+            .onAppear {
+                withAnimation(.linear(duration: 1.4).repeatForever(autoreverses: false)) {
+                    shimmerSwept = true
+                }
+            }
+    }
+
+    /// The existing Photo Details unavailable state — same symbol, copy, and uncached retry —
+    /// so a preview that cannot load never degrades into a broken generic image.
+    private func failureState(_ error: PhotoContentError) -> some View {
+        VStack(spacing: Theme.Spacing.md) {
+            Image(systemName: SimilarPhotosPresentation.previewFailureSymbol(for: error))
+                .font(.system(size: 34))
+                .foregroundStyle(.white.opacity(0.75))
+            Text(SimilarPhotosPresentation.previewUnavailableTitle)
+                .font(.headline)
+                .foregroundStyle(.white)
+            Text(SimilarPhotosPresentation.previewUnavailableMessage(for: error))
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.8))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                preview.retry()
+            } label: {
+                Text("Try Again")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, Theme.Spacing.lg)
+                    .padding(.vertical, Theme.Spacing.sm)
+                    .background(.white.opacity(0.16), in: Capsule())
+                    .foregroundStyle(.white)
+            }
+            .accessibilityLabel("Try loading the photo again")
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(SimilarPhotosPresentation.previewUnavailableTitle)
     }
 
     private func recommendedBadge(_ item: SwipeReviewItem) -> some View {
@@ -1054,20 +658,18 @@ struct SwipeReviewView: View {
 
     /// Shuffle: only the unreviewed tail re-orders. Decisions, cursor, and undo history are
     /// untouched by construction, so persisting afterwards captures a session that is still
-    /// exactly where it was — just in a different order. The instant-frame window is
-    /// re-walked: the deck it was warming just changed under it (M14).
+    /// exactly where it was — just in a different order.
     private func shuffleRemaining() {
         var generator = SystemRandomNumberGenerator()
         model.shuffleRemaining(using: &generator)
         persistSession()
-        warmUpcomingThumbnails()
     }
 
     /// Start New Pass: rebuild a library deck from the *current* catalog (so photos added
     /// since the deck was built join this pass, and confirmed removals are gone), reshuffle
     /// everything, and reset position and undo — while every prior decision keeps standing.
     /// A group session keeps its own deck (group membership only exists in the analysis the
-    /// deck came from). The instant-frame window is re-walked over the fresh deck (M14).
+    /// deck came from).
     private func startNewPass() {
         var deck = model.items
         if presetItems == nil, model.items.first?.isLibraryItem == true,
@@ -1078,7 +680,6 @@ struct SwipeReviewView: View {
         var generator = SystemRandomNumberGenerator()
         model.shuffleRemaining(using: &generator)
         persistSession()
-        warmUpcomingThumbnails()
     }
 
     /// Persists deck order, cursor, undo history, and the decision log after every mutation.

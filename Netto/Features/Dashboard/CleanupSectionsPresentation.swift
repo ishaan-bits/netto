@@ -21,6 +21,8 @@ enum CleanupDestinationStatus: Equatable, Sendable {
     case unavailable(reason: String)
     /// A completed pass found nothing eligible.
     case empty(String)
+    /// An explicit pass is waiting on the analysis coordinator (M10 queue).
+    case queued(String)
     /// A failed pass or scan; carries the user-facing message.
     case failed(String)
     /// A paused run; carries the stage line shown to the user.
@@ -40,6 +42,8 @@ enum CleanupDestinationStatus: Equatable, Sendable {
         case .unavailable(let reason):
             return reason
         case .empty(let text):
+            return text
+        case .queued(let text):
             return text
         case .failed(let message):
             return message
@@ -125,12 +129,11 @@ struct VideoSourceSummary: Equatable, Sendable {
 
 // MARK: - Image Cleanup hub
 
-/// The destinations of the Image Cleanup hub, in the order they are shown, with the
-/// status each row reports from real app state. Exact duplicates and similar shots are
-/// one destination (M14): one analysis pass produces both group kinds, and one screen
-/// reviews both over the same result set.
+/// The four destinations of the Image Cleanup hub, in the order they are shown, with the
+/// status each row reports from real app state.
 enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
-    case duplicateSimilarPhotos = "Duplicate & Similar Photos"
+    case duplicateImages = "Duplicate Images"
+    case similarImages = "Similar Images"
     case blurryImages = "Blurry Images"
     case oldScreenshots = "Old Screenshots"
 
@@ -138,7 +141,8 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
 
     var icon: String {
         switch self {
-        case .duplicateSimilarPhotos: return "photo.on.rectangle.angled"
+        case .duplicateImages: return "doc.on.doc"
+        case .similarImages: return "photo.on.rectangle.angled"
         case .blurryImages: return "camera.metering.unknown"
         case .oldScreenshots: return "clock.badge.questionmark"
         }
@@ -146,7 +150,8 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
 
     var accessibilityIdentifier: String {
         switch self {
-        case .duplicateSimilarPhotos: return "duplicateSimilarPhotosRow"
+        case .duplicateImages: return "duplicateImagesRow"
+        case .similarImages: return "similarImagesRow"
         case .blurryImages: return "blurryImagesRow"
         case .oldScreenshots: return "oldScreenshotsRow"
         }
@@ -155,8 +160,10 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
     /// What the destination is for, in one short line shown under its title.
     var subtitle: String {
         switch self {
-        case .duplicateSimilarPhotos:
-            return "Exact copies and visually alike groups"
+        case .duplicateImages:
+            return "Byte-identical copies, found by content hash"
+        case .similarImages:
+            return "Looks-like-the-same-shot groups"
         case .blurryImages:
             return "Photos flagged for soft focus or shake"
         case .oldScreenshots:
@@ -171,33 +178,37 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
         permission: PermissionState,
         catalog: CatalogScanState,
         analysis: PhotoAnalysisState,
-        blur: BlurAnalysisState
+        blur: BlurAnalysisState,
+        pendingBehindOtherPass: Bool
     ) -> String {
         let phase = SimilarPhotosPresentation.phase(
             permission: permission,
             catalog: catalog,
-            analysis: analysis
+            analysis: analysis,
+            pendingBehindOtherPass: pendingBehindOtherPass
         )
         switch phase {
         case .permissionRequired, .permissionDenied:
-            return "Duplicate and similar groups come from one on-device analysis pass, reviewed together: byte-identical copies found by content hash, and visually alike shots. Neither is ever deleted automatically."
+            return "Duplicate and similar groups come from one on-device analysis pass. Duplicate Images are byte-identical copies found by content hash; Similar Images are visually alike shots. Neither is ever deleted automatically."
         case .idle, .cancelled, .failed:
-            return "Duplicate and similar groups come from one on-device analysis pass, run only when you start it. Exact copies and visually alike shots are reviewed together."
+            return "Duplicate and similar groups come from one on-device analysis pass, run only when you start it. Duplicate Images are byte-identical copies found by content hash; Similar Images are visually alike shots."
         case .buildingCatalog:
-            return "Reading your library on this iPhone. Exact copies and visually alike shots will be reviewed together. Nothing is deleted automatically."
+            return "Reading your library on this iPhone. Duplicate Images will list byte-identical copies; Similar Images will list visually alike shots. Nothing is deleted automatically."
         case .analyzing:
             let summary = analysisSummary(analysis)
-            return "Analyzing on this iPhone — \(summary.exactGroupCount) exact \(summary.exactGroupCount == 1 ? "group" : "groups") and \(summary.similarGroupCount) similar \(summary.similarGroupCount == 1 ? "group" : "groups") so far."
+            return "Analyzing on this iPhone — \(summary.exactGroupCount) exact \(summary.exactGroupCount == 1 ? "group" : "groups") and \(summary.similarGroupCount) similar \(summary.similarGroupCount == 1 ? "group" : "groups") so far. Duplicate Images are byte-identical; Similar Images are visually alike."
         case .paused:
-            return "The analysis is paused. Duplicate and similar groups will fill in when it finishes. Nothing is deleted automatically."
+            return "The analysis is paused. Duplicate Images and Similar Images will fill in when it finishes. Nothing is deleted automatically."
+        case .queuedBehindBlur:
+            return "The analysis is queued and starts when the sharpness check finishes. Duplicate Images are byte-identical copies; Similar Images are visually alike shots."
         case .emptyLibrary:
             return "No photos are visible to Netto, so there is nothing to compare."
         case .results:
             let summary = analysisSummary(analysis)
             if summary.exactGroupCount == 0 && summary.similarGroupCount == 0 {
-                return "The analysis finished and found no duplicate or similar groups."
+                return "The analysis finished and found no duplicate or similar groups. Duplicate Images would list byte-identical copies; Similar Images would list visually alike shots."
             }
-            return "Duplicate & Similar Photos lists \(summary.exactGroupCount) exact \(summary.exactGroupCount == 1 ? "group" : "groups") and \(summary.similarGroupCount) visually alike \(summary.similarGroupCount == 1 ? "group" : "groups"). Blurry Images and Old Screenshots are independent of this pass."
+            return "Duplicate Images lists \(summary.exactGroupCount) byte-identical \(summary.exactGroupCount == 1 ? "group" : "groups"); Similar Images lists \(summary.similarGroupCount) visually alike \(summary.similarGroupCount == 1 ? "group" : "groups"). Blurry Images and Old Screenshots are independent of this pass."
         }
     }
 
@@ -209,23 +220,25 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
     }
 
     /// The destination's row status from the real analysis/scan state it reports on.
-    /// Exact duplicates and similar shots are one pass and one destination (M14), so it
-    /// reports one honest phase over both group kinds, never a fabricated count.
+    /// Duplicate Images are part of the same pass as Similar Images — one analysis run,
+    /// two group kinds — so it reports the same honest phase, never a fabricated count.
     static func status(
         for destination: ImageCleanupDestination,
         permission: PermissionState,
         catalog: CatalogScanState,
         analysis: PhotoAnalysisState,
-        blur: BlurAnalysisState
+        blur: BlurAnalysisState,
+        pendingBehindOtherPass: Bool
     ) -> CleanupDestinationStatus {
         let similarPhase = SimilarPhotosPresentation.phase(
             permission: permission,
             catalog: catalog,
-            analysis: analysis
+            analysis: analysis,
+            pendingBehindOtherPass: pendingBehindOtherPass
         )
         switch destination {
-        case .duplicateSimilarPhotos:
-            return similarityStatus(phase: similarPhase)
+        case .duplicateImages, .similarImages:
+            return similarityStatus(phase: similarPhase, destination: destination)
         case .blurryImages:
             return blurStatus(phase: PotentiallyBlurryPresentation.phase(
                 permission: permission,
@@ -241,9 +254,13 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
         }
     }
 
-    /// The similarity pass reports one honest status over the combined group count —
-    /// exact duplicates and similar shots are subsets of the same analysis result.
-    private static func similarityStatus(phase: SimilarPhotosPhase) -> CleanupDestinationStatus {
+    /// The similarity pass reports one honest status for both of its group kinds —
+    /// exact duplicates are a subset of the same analysis result, never a separate run.
+    private static func similarityStatus(
+        phase: SimilarPhotosPhase,
+        destination: ImageCleanupDestination
+    ) -> CleanupDestinationStatus {
+        let noun = destination == .duplicateImages ? "duplicate groups" : "groups"
         switch phase {
         case .permissionRequired:
             return .unavailable(reason: "Allow Photos access to continue.")
@@ -260,6 +277,8 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
             )
         case .paused:
             return .paused("Analysis paused")
+        case .queuedBehindBlur:
+            return .queued("Queued — starts when the sharpness check finishes")
         case .emptyLibrary:
             return .empty("No photos visible to Netto")
         case .cancelled:
@@ -268,9 +287,11 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
             return .failed(message)
         case .results(let result):
             let summary = SimilarPhotosSummary(result: result)
-            let count = summary.exactGroupCount + summary.similarGroupCount
+            let count = destination == .duplicateImages
+                ? summary.exactGroupCount
+                : summary.exactGroupCount + summary.similarGroupCount
             if count == 0 {
-                return .empty("No groups found")
+                return .empty("No \(noun) found")
             }
             return .count(count)
         }
@@ -297,6 +318,8 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
             )
         case .paused:
             return .paused("Scan paused")
+        case .queuedBehindSimilarity:
+            return .queued("Queued — starts when Similar Photos finishes")
         case .cancelled:
             return .unknownCount("Last run cancelled")
         case .failed(let message):
@@ -344,6 +367,88 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
     }
 }
 
+// MARK: - Video Cleanup hub
+
+/// The two source-filtered destinations of the Video Cleanup hub, plus the honest
+/// unclassified count the dashboard shows when origin evidence is incomplete.
+enum VideoCleanupDestination: String, CaseIterable, Sendable, Equatable {
+    case recorded = "Recorded Videos"
+    case downloaded = "Downloaded Videos"
+
+    var title: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .recorded: return "video"
+        case .downloaded: return "icloud.and.arrow.down"
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .recorded: return "recordedVideosRow"
+        case .downloaded: return "downloadedVideosRow"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .recorded:
+            return "Videos from this device's library"
+        case .downloaded:
+            return "Imported via iTunes sync"
+        }
+    }
+
+    var classification: VideoSourceClassification {
+        switch self {
+        case .recorded: return .recorded
+        case .downloaded: return .downloaded
+        }
+    }
+
+    /// The honest one-line intro for the Video Cleanup hub, derived from the real video
+    /// inventory and its size-measurement state. Names the unclassified count whenever any
+    /// video's origin could not be established — never folds it into a bucket.
+    static func hubIntro(
+        permission: PermissionState,
+        catalog: CatalogScanState,
+        resolution: VideoSizeResolution,
+        videoSignature: String,
+        videoRecords: [PhotoAssetRecord],
+        otherVideoCount: Int
+    ) -> String {
+        let phase = VideosPresentation.phase(
+            permission: permission,
+            catalog: catalog,
+            resolution: resolution,
+            datasetSignature: videoSignature,
+            settledRecords: videoRecords
+        )
+        switch phase {
+        case .permissionRequired, .permissionDenied:
+            return "Videos are grouped by origin using the source evidence your library exposes. Recorded and Downloaded never download anything; sizes are measured on this iPhone."
+        case .scanRequired, .failed:
+            return "Videos are grouped by origin using the source evidence your library exposes. Recorded covers this device's library; Downloaded covers iTunes-synced imports. Opening a group never downloads cloud-only videos."
+        case .buildingCatalog:
+            return "Reading your library on this iPhone. Videos will group into Recorded and Downloaded by their source evidence."
+        case .paused:
+            return "The library scan is paused. Video groups fill in when it finishes."
+        case .empty:
+            return "Your library has no videos, so there is nothing to group."
+        case .measuringVideos:
+            return "Sizes are being measured on this iPhone — cloud-only videos are never downloaded. Videos group into Recorded and Downloaded by their source evidence."
+        case .results(let records):
+            let total = records.count
+            var intro = "\(total) \(total == 1 ? "video" : "videos"), grouped by source evidence. Recorded covers this device's library; Downloaded covers iTunes-synced imports."
+            if otherVideoCount > 0 {
+                intro += " \(otherVideoCount) \(otherVideoCount == 1 ? "video has" : "videos have") an unconfirmed source and is shown separately, never guessed."
+            }
+            return intro
+        }
+    }
+}
+
 // MARK: - Dashboard four-section hierarchy
 
 /// The four primary cleanup sections of the dashboard, in their fixed display order.
@@ -380,7 +485,7 @@ enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
         case .imageCleanup:
             return "Duplicates, similar shots, blur, old screenshots"
         case .videoCleanup:
-            return "All your videos, largest first"
+            return "Recorded and downloaded videos, by size"
         case .duplicateContacts:
             return "Likely-duplicate contact entries"
         case .swipeCleanup:
@@ -400,9 +505,13 @@ enum DashboardCleanupPresentation {
         catalog: CatalogScanState,
         analysis: PhotoAnalysisState,
         blur: BlurAnalysisState,
+        pendingBehindOtherPass: Bool,
         resolution: VideoSizeResolution,
         videoSignature: String,
         videoRecords: [PhotoAssetRecord],
+        recordedVideos: [PhotoAssetRecord],
+        downloadedVideos: [PhotoAssetRecord],
+        otherVideoCount: Int,
         contactScan: ContactScanState,
         now: Date = Date()
     ) -> CleanupDestinationStatus {
@@ -414,7 +523,8 @@ enum DashboardCleanupPresentation {
                     permission: permission,
                     catalog: catalog,
                     analysis: analysis,
-                    blur: blur
+                    blur: blur,
+                    pendingBehindOtherPass: pendingBehindOtherPass
                 )
             }
             return worstStatus(from: statuses) ?? .unknownCount("Not scanned yet")
@@ -425,7 +535,10 @@ enum DashboardCleanupPresentation {
                 catalog: catalog,
                 resolution: resolution,
                 videoSignature: videoSignature,
-                videoRecords: videoRecords
+                videoRecords: videoRecords,
+                recordedVideos: recordedVideos,
+                downloadedVideos: downloadedVideos,
+                otherVideoCount: otherVideoCount
             )
 
         case .duplicateContacts:
@@ -445,11 +558,12 @@ enum DashboardCleanupPresentation {
             case .failed: return 0
             case .unavailable: return 1
             case .paused: return 2
-            case .progress: return 3
-            case .unknownCount: return 4
-            case .count: return 5
-            case .empty: return 6
-            case .measurement: return 7
+            case .queued: return 3
+            case .progress: return 4
+            case .unknownCount: return 5
+            case .count: return 6
+            case .empty: return 7
+            case .measurement: return 8
             }
         }
         return statuses.min { lhs, rhs in
@@ -457,14 +571,15 @@ enum DashboardCleanupPresentation {
         }
     }
 
-    /// The unified video inventory's honest section status (M14): one inventory, no source
-    /// split — the count is every video the catalog holds and never depends on measurement.
     private static func videoStatus(
         permission: PermissionState,
         catalog: CatalogScanState,
         resolution: VideoSizeResolution,
         videoSignature: String,
-        videoRecords: [PhotoAssetRecord]
+        videoRecords: [PhotoAssetRecord],
+        recordedVideos: [PhotoAssetRecord],
+        downloadedVideos: [PhotoAssetRecord],
+        otherVideoCount: Int
     ) -> CleanupDestinationStatus {
         let phase = VideosPresentation.phase(
             permission: permission,
@@ -501,7 +616,18 @@ enum DashboardCleanupPresentation {
                 )
             )
         case .results(let records):
-            return .count(records.count)
+            let total = records.count
+            let unclassified = otherVideoCount
+            let line = "\(total) videos"
+            guard unclassified == 0 else {
+                return .unknownCount(line + " · \(unclassified) unknown source")
+            }
+            let recorded = recordedVideos.count
+            let downloaded = downloadedVideos.count
+            if recorded == 0, downloaded == 0 {
+                return .empty("No videos found")
+            }
+            return .count(total)
         }
     }
 

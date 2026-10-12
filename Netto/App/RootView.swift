@@ -82,6 +82,14 @@ final class SystemBackgroundTaskScheduler: BackgroundTaskScheduling {
     }
 }
 
+/// The heavy pass a queued request will start — the coordinator's one-slot queue (M10).
+/// Same-request taps are no-ops; a different request replaces the slot, so the latest
+/// user intent is what runs next.
+enum PendingAnalysisRequest: Equatable, Sendable {
+    case similarity
+    case blur
+}
+
 /// `@Observable` rather than `ObservableObject`: every view tracks only the properties it
 /// actually reads, so a selection toggle no longer invalidates the dashboard (and a progress
 /// tick no longer re-renders screens that never read progress).
@@ -134,6 +142,12 @@ final class AppEnvironment {
             } else if oldValue.isRunning {
                 analysisConcurrencyBudget.end(.similarity)
             }
+            // A running pass releasing the pipeline (completion, failure, or cancel) is
+            // exactly when a queued pass may start (M10). Paused is not running but still
+            // owns the slot — `drivePendingAnalysis` refuses while a pause stands.
+            if oldValue.isRunning, !analysisState.isRunning {
+                drivePendingAnalysis()
+            }
         }
     }
     /// When the current completed result reached its terminal state — from the restored
@@ -158,6 +172,11 @@ final class AppEnvironment {
             } else if oldValue.isRunning {
                 analysisConcurrencyBudget.end(.blur)
             }
+            // Same coordination hook as `analysisState` (M10): a terminal flip may hand
+            // the pipeline to the queued pass.
+            if oldValue.isRunning, !blurAnalysisState.isRunning {
+                drivePendingAnalysis()
+            }
         }
     }
     /// Injected clock stamped into a completed result's `scannedAt`. Production uses the
@@ -172,7 +191,21 @@ final class AppEnvironment {
     /// (they resolve sizes only at review time), so the largest-first ordering can be honest.
     var videoSizeResolution: VideoSizeResolution = .idle
     /// The deletion state machine (§16). Every change goes through `applyDeletion`.
-    var deletionState: DeletionState = .noSelection
+    var deletionState: DeletionState = .noSelection {
+        didSet {
+            // A deletion leaving `.deleting` releases the pipeline the mutation owned;
+            // a pass queued during the mutation starts now (M10). Entering `.deleting`
+            // never drives — `drivePendingAnalysis` refuses while a deletion is in flight.
+            if oldValue.isDeleting, !deletionState.isDeleting {
+                drivePendingAnalysis()
+            }
+        }
+    }
+    /// The one queued heavy-analysis request — the coordinator's single queue slot (M10).
+    /// Set when the user asks for the pass that is not currently running; cleared when
+    /// that pass starts, when the queue is removed, or when an explicit cancel-and-switch
+    /// claims it. In-memory only: an app kill drops the queue with the unstarted request.
+    private(set) var pendingAnalysisRequest: PendingAnalysisRequest?
     /// The space-freed summary for a completed deletion — set exactly once per outcome, in
     /// `handleDeletionOutcome`, together with `flowState == .deletionCompleted`, and only
     /// when at least one item was verified removed. Cleared the moment that result is
@@ -379,6 +412,10 @@ final class AppEnvironment {
     @ObservationIgnored private var builtVideoRecordsResolution: VideoSizeResolution?
     /// The cached, resolved, largest-first video inventory (see `videoRecordsForDisplay`).
     @ObservationIgnored private var builtVideoRecords: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtVideoSourceGeneration: UInt64 = .max
+    @ObservationIgnored private var builtRecordedVideos: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtDownloadedVideos: [PhotoAssetRecord] = []
+    @ObservationIgnored private var builtOtherVideosCount: Int = 0
     @ObservationIgnored private var builtOldScreenshotGeneration: UInt64 = .max
     @ObservationIgnored private var builtOldScreenshotRecords: [PhotoAssetRecord] = []
     @ObservationIgnored private var builtOldScreenshotUnknownDateCount: Int = 0
@@ -547,6 +584,44 @@ final class AppEnvironment {
         builtVideoRecordsGeneration = videoSignatureGeneration
         builtVideoRecordsResolution = resolution
         return records
+    }
+
+    /// The source-classified video inventories, cached across renders. Rebuilds only when the
+    /// catalog changes (classification depends on `sourceType`, not on measured sizes), so a
+    /// screen full of selection toggles costs no re-classification.
+    var recordedVideosForDisplay: [PhotoAssetRecord] {
+        ensureVideoSourceSplit()
+        return builtRecordedVideos
+    }
+
+    var downloadedVideosForDisplay: [PhotoAssetRecord] {
+        ensureVideoSourceSplit()
+        return builtDownloadedVideos
+    }
+
+    /// Videos whose source evidence is neither a synced import nor a plain library asset
+    /// (e.g. shared). Never folded into either bucket — reported as its own count.
+    var otherVideosCount: Int {
+        ensureVideoSourceSplit()
+        return builtOtherVideosCount
+    }
+
+    private func ensureVideoSourceSplit() {
+        guard builtVideoSourceGeneration != videoSignatureGeneration else { return }
+        var recorded: [PhotoAssetRecord] = []
+        var downloaded: [PhotoAssetRecord] = []
+        var other = 0
+        for record in videoRecordsForDisplay {
+            switch VideoSourceClassification.of(record) {
+            case .recorded: recorded.append(record)
+            case .downloaded: downloaded.append(record)
+            case .other: other += 1
+            }
+        }
+        builtRecordedVideos = recorded
+        builtDownloadedVideos = downloaded
+        builtOtherVideosCount = other
+        builtVideoSourceGeneration = videoSignatureGeneration
     }
 
     /// The age-thresholded screenshots (oldest first) for the Old Screenshots screen —
@@ -922,6 +997,52 @@ final class AppEnvironment {
         catalogGeneration == generation
     }
 
+    // MARK: - Analysis coordination (M10)
+
+    /// Starts the queued pass, if any, now that the pipeline is free. Called only from
+    /// terminal transitions — completion, failure, or cancel of a heavy pass (the `didSet`
+    /// observers on `analysisState` / `blurAnalysisState`), or a deletion leaving
+    /// `.deleting` — never while a pause still owns the pipeline: a paused run resumes
+    /// itself and keeps the queue waiting.
+    private func drivePendingAnalysis() {
+        guard let request = pendingAnalysisRequest else { return }
+        // A paused pass still owns the slot (it will resume itself); handing the pipeline
+        // over now would run two passes the moment the app returns to the foreground.
+        if case .paused = analysisState { return }
+        if case .paused = blurAnalysisState { return }
+        guard !analysisState.isRunning, !blurAnalysisState.isRunning else { return }
+        // A deletion in flight keeps the queue; the flip out of `.deleting` drives again
+        // (see `deletionState`'s observer).
+        guard !deletionState.isDeleting else { return }
+        pendingAnalysisRequest = nil
+        switch request {
+        case .similarity: startSimilarityAnalysis()
+        case .blur: startBlurAnalysis()
+        }
+    }
+
+    /// Removes the queued request without touching the running pass. Idempotent.
+    func cancelPendingAnalysis() {
+        pendingAnalysisRequest = nil
+    }
+
+    /// Explicit cancel-and-switch: the running pass is cancelled through its normal
+    /// generation-guarded path and the queued pass starts immediately, without waiting for
+    /// any other transition. The queue slot is claimed first so the cancel's own terminal
+    /// flip cannot also drive it (exactly-once).
+    func startPendingAnalysisNow() {
+        guard let request = pendingAnalysisRequest else { return }
+        pendingAnalysisRequest = nil
+        switch request {
+        case .similarity:
+            cancelBlurAnalysis()
+            startSimilarityAnalysis()
+        case .blur:
+            cancelSimilarityAnalysis()
+            startBlurAnalysis()
+        }
+    }
+
     // MARK: - Similarity analysis
 
     /// Runs the full review pipeline: metadata catalog read, then similarity analysis over it.
@@ -933,15 +1054,10 @@ final class AppEnvironment {
     /// library would only double the work). Starting a new analysis also invalidates any
     /// prepared deletion review: plans are bound to the dataset they were built from.
     ///
-    /// With both pipelines idle this is the single-pass pipeline (its own Stage A read, then
-    /// Stage B). The unified Image Cleanup session — what every Analyze button calls — is
+    /// This is the **standalone, single-pass** entry point (retry, resume, and the legacy
+    /// queue): it keeps its serialized admission so an explicit one-pass request never races
+    /// the other. The unified Image Cleanup session — what every Analyze button calls — is
     /// `startImageAnalysis`, which shares one enumeration across both pipelines.
-    ///
-    /// **Concurrent admission (M14).** While the sharpness pass is running this never queues
-    /// behind it and never cancels it: the pass starts immediately over the completed catalog
-    /// the sharpness pass already stands on — the same snapshot, no second enumeration. A
-    /// sharpness pass always stands on a completed catalog (it refuses to start without one),
-    /// so the standing catalog is the one the running pass is analyzing.
     ///
     /// `resuming` carries an interrupted run's checkpoint: its evidence seeds the cheap
     /// pass (already-hashed and already-keyed assets cost no request) and its progress
@@ -950,41 +1066,19 @@ final class AppEnvironment {
     /// checkpoints deliberately never do.
     func startSimilarityAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !analysisState.isRunning else { return }
-        // Never rebuild datasets underneath an in-flight Photos mutation.
-        guard !deletionState.isDeleting else { return }
-        guard photoPermissionState.isUsable else {
-            analysisState = .failed(.underlying("Photos access is required to read your library."))
+        // Serialized admission for the standalone entry point (M10): one explicit one-pass
+        // request queues — visibly, never a silent drop — and starts when the running pass
+        // releases the pipeline. The unified session bypasses this by owning the catalog.
+        if blurAnalysisState.isRunning {
+            pendingAnalysisRequest = .similarity
             return
         }
-        // Concurrent admission (M14): the running sharpness pass owns the pipeline's catalog.
-        // Adopt it — the same snapshot, one read — instead of queueing behind the pass or
-        // re-enumerating the library a second time.
-        if blurAnalysisState.isRunning {
-            guard case .completed(let catalog) = catalogState else {
-                // A sharpness pass never runs without a completed catalog, so this is a
-                // state that cannot honestly start — say so rather than queue or fabricate.
-                analysisState = .failed(.underlying("Your library scan has not finished. Build your catalog, then try again."))
-                return
-            }
-            prepareSimilarityRun()
-            let generation = analysisGeneration
-            let runSequence = beginCheckpointRun(kind: .similarity, carrying: checkpoint)
-            let engine = Self.makeSimilarityEngine(
-                thumbnailLoader: thumbnailLoader,
-                accumulator: checkpointChannels.accumulator(for: .similarity),
-                runSequence: runSequence,
-                budget: analysisConcurrencyBudget
-            )
-            analysisTask = Task { [weak self] in
-                guard let self else { return }
-                await self.runSimilarityStageB(
-                    catalog: catalog,
-                    generation: generation,
-                    checkpoint: checkpoint,
-                    engine: engine
-                )
-            }
-            syncBackgroundTask()
+        // Never rebuild datasets underneath an in-flight Photos mutation.
+        guard !deletionState.isDeleting else { return }
+        // The request is admitted past the coordination guards; any queue entry is spent.
+        pendingAnalysisRequest = nil
+        guard photoPermissionState.isUsable else {
+            analysisState = .failed(.underlying("Photos access is required to read your library."))
             return
         }
         prepareSimilarityRun()
@@ -1019,11 +1113,10 @@ final class AppEnvironment {
     ///
     /// This is what every Analyze button calls. With both pipelines idle it starts the
     /// unified session; with exactly one still running (the other failed or was cancelled
-    /// mid-session) it starts only the idle one through its own entry point, which admits it
-    /// **concurrently over the running pipeline's catalog** (M14) — a retry of one pipeline
-    /// never restarts or cancels work that is still in flight, and never queues behind it.
-    /// Repeated taps are idempotent for the active session (while both run, the request is
-    /// already satisfied).
+    /// mid-session) it starts only the idle one through its own entry point, which queues it
+    /// behind the running pipeline rather than dropping the tap — a retry of one pipeline
+    /// never restarts or cancels work that is still in flight. Repeated taps are idempotent
+    /// for the active session (while both run, the request is already satisfied).
     ///
     /// Neither pipeline waits for the other to finish: similarity may reach `.completed` and
     /// become reviewable while the sharpness pass is still running, and completion, failure,
@@ -1051,6 +1144,9 @@ final class AppEnvironment {
         guard !(analysisState.isRunning && blurAnalysisState.isRunning) else { return }
         // Never rebuild datasets underneath an in-flight Photos mutation.
         guard !deletionState.isDeleting else { return }
+        // The unified session owns admission; a queued single-pass request is spent here and
+        // may be re-set by the single-pipeline fallback below.
+        pendingAnalysisRequest = nil
         guard photoPermissionState.isUsable else {
             if !analysisState.isRunning { analysisState = .failed(.underlying("Photos access is required to read your library.")) }
             if !blurAnalysisState.isRunning { blurAnalysisState = .failed(.underlying("Photos access is required to read your library.")) }
@@ -1058,8 +1154,8 @@ final class AppEnvironment {
         }
 
         // Exactly one pipeline still running: start only the idle one. Its own entry point
-        // admits it concurrently over the running pipeline's catalog (M14) instead of queueing
-        // behind it, so a retry of one screen never disturbs the pass still doing work.
+        // queues it behind the running pipeline (M10) instead of racing it, so a retry of
+        // one screen never disturbs the pass that is still doing work.
         if analysisState.isRunning {
             startBlurAnalysis(resuming: blurCheckpoint)
             return
@@ -1143,12 +1239,8 @@ final class AppEnvironment {
         planBuildGeneration += 1
         applyDeletion(.noSelection)
         // A fresh run enumerates the *current* catalog, so any removals recorded against a
-        // previous, superseded run are not this run's to reconcile (M13) — unless the
-        // concurrent sharpness pass (M14) is still running and still owns its own recorded
-        // removals: clearing them here would strand that pass's deletion reconciliation.
-        if !blurAnalysisState.isRunning {
-            deletionsDuringRunningPasses = []
-        }
+        // previous, superseded run are not this run's to reconcile (M13).
+        deletionsDuringRunningPasses = []
 
         analysisTask?.cancel()
         analysisGeneration += 1
@@ -1183,12 +1275,8 @@ final class AppEnvironment {
         planBuildGeneration += 1
         applyDeletion(.noSelection)
         // A fresh pass measures the *current* catalog, so any removals recorded against a
-        // previous, superseded run are not this pass's to reconcile (M13) — unless the
-        // concurrent similarity pass (M14) is still running and still owns its own recorded
-        // removals: clearing them here would strand that pass's deletion reconciliation.
-        if !analysisState.isRunning {
-            deletionsDuringRunningPasses = []
-        }
+        // previous, superseded run are not this pass's to reconcile (M13).
+        deletionsDuringRunningPasses = []
         blurAnalysisGeneration += 1
         blurSelection = PhotoSelectionModel()
         blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 0, totalUnits: 0))
@@ -1362,9 +1450,9 @@ final class AppEnvironment {
                     applyAnalysisProgress(progress)
                 case .completed(let result):
                     sawCompletion = true
-                    // The channel is released *before* the terminal state write: a
-                    // concurrently admitted pass (M14) may claim this kind's slot the
-                    // moment the state flips, which must find the checkpoint free.
+                    // The channel is released *before* the terminal state write: the flip
+                    // may hand a queued single-pass request its slot (M10), which must find
+                    // the checkpoint free.
                     finishCheckpointRun(kind: .similarity)
                     // Reconcile confirmed removals that landed while this pass ran (M13):
                     // the pass sampled the pre-mutation catalog, so its result may still
@@ -1454,14 +1542,13 @@ final class AppEnvironment {
         analysisTask?.cancel()
         analysisTask = nil
         // The checkpoint is abandoned before the state flip: cancelling a running pass is
-        // a terminal transition, and the flip may hand the kind's slot to a concurrently
-        // admitted pass (M14). Scoped to this kind (M13): a concurrently running sharpness
-        // pass keeps its own channel, its own file, and its own progress.
+        // a terminal transition, and the flip may drive a queued pass (M10) that claims
+        // its slot. Scoped to this kind (M13): a concurrently running sharpness pass keeps
+        // its own channel, its own file, and its own progress.
         discardInterruptedCheckpoint(kinds: [.similarity])
         if analysisState.isRunning {
             analysisState = .cancelled
         }
-        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -1530,19 +1617,16 @@ final class AppEnvironment {
 
     private func finishAnalysis(_ generation: Int, as state: PhotoAnalysisState) {
         guard isCurrentAnalysis(generation) else { return }
-        // Release the checkpoint slot before the terminal write (same order as the
-        // sharpness pass): a concurrently admitted pass (M14) may claim this kind's slot
-        // the moment the state flips. A paused run never reaches here (pausing bumped the
-        // generation, so this write would be staled anyway).
+        // Release the checkpoint slot before the terminal write (M10 — same order as the
+        // sharpness pass): the flip may drive a queued pass that claims the slot. A
+        // paused run never reaches here (pausing bumped the generation, so this write
+        // would be staled anyway).
         if case .cancelled = state {
             finishCheckpointRun(kind: .similarity)
         } else if case .failed = state {
             finishCheckpointRun(kind: .similarity)
         }
         analysisState = state
-        // Video measurement yields to the scans; the moment one ends it resumes even if
-        // the video screen is not on screen (M15-R1) — the pass must not strand.
-        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -1565,19 +1649,11 @@ final class AppEnvironment {
     /// built from — and resets the blur selection, so a fresh run always opens with
     /// nothing marked.
     ///
-    /// This is the **standalone, single-pass** entry point (retry, resume, and the unified
-    /// session's one-running fallback): it requires the catalog to already stand, or to be
-    /// about to stand from a concurrently running similarity pass. The unified Image Cleanup
+    /// This is the **standalone, single-pass** entry point (retry, resume, and the legacy
+    /// queue): it keeps its serialized admission so an explicit one-pass request never races
+    /// the other, and it requires the catalog to already stand. The unified Image Cleanup
     /// session — what every Analyze button calls — is `startImageAnalysis`, which builds the
     /// catalog once and launches this pass concurrently with similarity.
-    ///
-    /// **Concurrent admission (M14).** While the similarity pass is running this never queues
-    /// behind it and never cancels it. If the completed catalog already stands, the pass
-    /// starts immediately over that snapshot. If the catalog has not finished yet (the
-    /// similarity pass is still enumerating), the pass *waits boundedly* — a short, quiet
-    /// poll of the catalog state — and starts the moment the catalog stands. If the deadline
-    /// is hit, the pass fails honestly ("Your library scan has not finished") rather than
-    /// queueing silently, cancelling the other pass, or fabricating work.
     ///
     /// `resuming` carries an interrupted pass's checkpoint: already-classified assets are
     /// tallied without a request (only under the exact thresholds they were classified
@@ -1585,102 +1661,40 @@ final class AppEnvironment {
     /// continues.
     func startBlurAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !blurAnalysisState.isRunning else { return }
+        // Serialized admission for the standalone entry point (M10): the request queues —
+        // visible, never a silent drop — and starts when the running pass releases the
+        // pipeline. The unified session bypasses this by owning the shared catalog.
+        if analysisState.isRunning {
+            pendingAnalysisRequest = .blur
+            return
+        }
         // Never rebuild datasets underneath an in-flight Photos mutation.
         guard !deletionState.isDeleting else { return }
+        // The request is admitted past the coordination guards; any queue entry is spent.
+        pendingAnalysisRequest = nil
         guard photoPermissionState.isUsable else {
             blurAnalysisState = .failed(.underlying("Photos access is required to read your library."))
             return
         }
-        // The completed catalog is the snapshot the pass analyzes — the same one the
-        // concurrent similarity pass stands on, adopted without a second enumeration.
-        if case .completed(let catalog) = catalogState {
-            prepareBlurRun()
-            let generation = blurAnalysisGeneration
-            // Claim this pass's channel (adopting the carried payload on resume; discarding
-            // superseded interrupted state of this kind on a fresh start).
-            let runSequence = beginCheckpointRun(kind: .blur, carrying: checkpoint)
-            blurAnalysisTask = Task { [weak self] in
-                guard let self else { return }
-                await self.runBlurPass(
-                    catalog: catalog,
-                    generation: generation,
-                    checkpoint: checkpoint,
-                    runSequence: runSequence
-                )
-            }
-            syncBackgroundTask()
+        guard case .completed(let catalog) = catalogState else {
+            blurAnalysisState = .failed(.underlying("Your library scan has not finished. Build your catalog, then try again."))
             return
         }
-        // Concurrent admission while the catalog is still being read by the similarity
-        // pass: wait boundedly for the catalog to stand rather than queueing (M10's
-        // cancel-and-switch) or failing the moment the other pass is mid-read.
-        if analysisState.isRunning {
-            waitBlurStartForCatalogStanding(resuming: checkpoint)
-            return
-        }
-        blurAnalysisState = .failed(.underlying("Your library scan has not finished. Build your catalog, then try again."))
-    }
-
-    /// Bounded wait for the concurrently running similarity pass's catalog read to land,
-    /// then starts the sharpness pass over that snapshot (M14).
-    ///
-    /// This is a short MainActor poll of `catalogState` — deliberately not a continuation
-    /// registered against the read: a superseded or failed read (the enumeration's
-    /// generation guards) returns `nil` with no terminal callback, which would leave a
-    /// continuation suspended forever. The poll also observes cancellation and generation
-    /// supersession every tick, and gives up honestly at its deadline ("Your library scan
-    /// has not finished") instead of waiting indefinitely or fabricating work.
-    ///
-    /// Cancellation / pause / a superseding run bump `blurAnalysisGeneration` before this
-    /// task's own task is cancelled; the generation guard fires first, so the task returns
-    /// quietly without writing a state the canceller already owns.
-    private func waitBlurStartForCatalogStanding(resuming checkpoint: ScanCheckpoint?) {
-        // Claim the pass's state immediately (same common setup as a fresh start): the
-        // Potentially Blurry screen shows a pending session rather than a stale idle state
-        // while the read finishes.
         prepareBlurRun()
         let generation = blurAnalysisGeneration
-        syncBackgroundTask()
+        // Claim this pass's channel (adopting the carried payload on resume; discarding
+        // superseded interrupted state of this kind on a fresh start).
+        let runSequence = beginCheckpointRun(kind: .blur, carrying: checkpoint)
         blurAnalysisTask = Task { [weak self] in
             guard let self else { return }
-            // ~300 ms poll, ~180 s deadline: long enough for a large library's remaining
-            // enumeration, short enough that a read that will never land fails honestly
-            // rather than hanging the screen.
-            let pollNanos: UInt64 = 300_000_000
-            let maxPolls = 600
-            for _ in 0..<maxPolls {
-                guard !Task.isCancelled else { return }
-                guard self.isCurrentBlurAnalysis(generation) else { return }
-                if case .completed(let catalog) = self.catalogState {
-                    guard self.isCurrentBlurAnalysis(generation) else { return }
-                    guard !Task.isCancelled else { return }
-                    // The concurrent read landed: run the pass over that snapshot. The
-                    // state and generation are already claimed by the admission above.
-                    let runSequence = self.beginCheckpointRun(kind: .blur, carrying: checkpoint)
-                    await self.runBlurPass(
-                        catalog: catalog,
-                        generation: generation,
-                        checkpoint: checkpoint,
-                        runSequence: runSequence
-                    )
-                    return
-                }
-                // A cancelled/paused/superseded similarity pass leaves no catalog coming:
-                // the honest failure, not an endless wait.
-                if !self.analysisState.isRunning {
-                    var catalogStanding = false
-                    if case .completed = self.catalogState { catalogStanding = true }
-                    if !catalogStanding {
-                        guard self.isCurrentBlurAnalysis(generation) else { return }
-                        self.finishBlurAnalysis(generation, as: .failed(.underlying("Your library scan has not finished. Build your catalog, then try again.")))
-                        return
-                    }
-                }
-                try? await Task.sleep(nanoseconds: pollNanos)
-            }
-            guard self.isCurrentBlurAnalysis(generation) else { return }
-            self.finishBlurAnalysis(generation, as: .failed(.underlying("Your library scan has not finished. Build your catalog, then try again.")))
+            await self.runBlurPass(
+                catalog: catalog,
+                generation: generation,
+                checkpoint: checkpoint,
+                runSequence: runSequence
+            )
         }
+        syncBackgroundTask()
     }
 
     /// The sharpness pass over a catalog the caller has already built and stands in
@@ -1739,9 +1753,9 @@ final class AppEnvironment {
                     )
                 case .completed(let result):
                     sawCompletion = true
-                    // The channel is released *before* the terminal state write: a
-                    // concurrently admitted pass (M14) may claim this kind's slot the
-                    // moment the state flips, which must find the checkpoint free.
+                    // The channel is released *before* the terminal state write: the flip
+                    // may hand a queued single-pass request its slot (M10), which must find
+                    // the checkpoint free.
                     finishCheckpointRun(kind: .blur)
                     // Reconcile confirmed removals that landed while this pass ran (M13):
                     // the pass sampled the pre-mutation catalog, so its result may still
@@ -1828,14 +1842,13 @@ final class AppEnvironment {
         blurAnalysisTask?.cancel()
         blurAnalysisTask = nil
         // The checkpoint is abandoned before the state flip: cancelling a running pass is
-        // a terminal transition, and the flip may hand the kind's slot to a concurrently
-        // admitted pass (M14). Scoped to this kind (M13): a concurrently running similarity
-        // pass keeps its own channel, its own file, and its own progress.
+        // a terminal transition, and the flip may drive a queued pass (M10) that claims
+        // its slot. Scoped to this kind (M13): a concurrently running similarity pass keeps
+        // its own channel, its own file, and its own progress.
         discardInterruptedCheckpoint(kinds: [.blur])
         if blurAnalysisState.isRunning {
             blurAnalysisState = .cancelled
         }
-        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -1845,18 +1858,16 @@ final class AppEnvironment {
 
     private func finishBlurAnalysis(_ generation: Int, as state: BlurAnalysisState) {
         guard isCurrentBlurAnalysis(generation) else { return }
-        // Release the checkpoint slot before the terminal write: a concurrently admitted
-        // pass (M14) may claim this kind's slot the moment the state flips, which must find
-        // the checkpoint free. A paused pass never reaches here (its generation was bumped
-        // at pause, so this write would be staled anyway).
+        // Release the checkpoint slot before the terminal write: flipping the state may
+        // drive a queued pass into `beginCheckpointRun` (M10), which must find the slot
+        // free. A paused pass never reaches here (its generation was bumped at pause, so
+        // this write would be staled anyway).
         if case .cancelled = state {
             finishCheckpointRun(kind: .blur)
         } else if case .failed = state {
             finishCheckpointRun(kind: .blur)
         }
         blurAnalysisState = state
-        // Same resume-on-terminal as the similarity pass (M15-R1).
-        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -2021,10 +2032,6 @@ final class AppEnvironment {
                 partial[record.localIdentifier] = bytes
             }
             guard self.isCurrentPlanBuild(generation) else { return }
-            // One measurement source of truth (M15): these sizes are authoritative —
-            // publish them into the shared video-size state so the inventory shows and
-            // sorts by the same numbers this review will show.
-            self.recordResolvedVideoSizes(resolvedRecords)
 
             // Fresh authorization at the moment the plan is stamped.
             let authorization = self.photoPermission.currentStatus()
@@ -2074,16 +2081,9 @@ final class AppEnvironment {
     /// never be shown or confirmed under this screen, so any foreign deletion state — plan,
     /// stale record, failure, permission notice, or in-flight build — is dropped via the
     /// universal `noSelection` reset (an in-flight build is discarded first so it cannot land
-    /// afterwards), and this source prepares exactly as from the empty phase.
-    ///
-    /// Re-entering the *same* source keeps only a live plan that still matches the current
-    /// selection — the "Change Selection" round-trip must never re-resolve sizes. Every other
-    /// state is dropped and re-prepared over the current, preserved results: an empty phase, a
-    /// stale record, a plan whose selection no longer matches, or a leftover terminal outcome
-    /// (`.succeeded`/`.needsReview`) a deletion can leave behind when the screen is backed out
-    /// of without dismissing. That keeps the review reusable after a deletion — unaffected
-    /// groups still back a fresh plan — without re-running analysis and without the screen
-    /// showing a stale "Review out of date" for results that are still valid.
+    /// afterwards), and this source prepares exactly as from the empty phase. A plan that
+    /// already belongs to `source` is kept, so re-entering the same review never re-resolves
+    /// sizes.
     ///
     /// An in-flight mutation is untouchable: `noSelection` is universally legal, so applying
     /// it during `.deleting` would silently wipe the executing state (the outcome would then
@@ -2092,26 +2092,8 @@ final class AppEnvironment {
     func reviewDidAppear(from source: DeletionSelectionSource) {
         guard !deletionState.isDeleting else { return }
         guard planSource != source else {
-            let keepsLivePlan: Bool = {
-                switch deletionState {
-                case .readyForReview(let plan), .awaitingConfirmation(let plan):
-                    return plan.selectionSnapshot == selectionIDs(for: source)
-                default:
-                    return false
-                }
-            }()
-            if !keepsLivePlan {
-                if deletionState.isBuildingPlan {
-                    planBuildGeneration += 1 // an in-flight build can never become current
-                }
-                if case .noSelection = deletionState {
-                    // Already empty; nothing to drop.
-                } else {
-                    applyDeletion(.noSelection)
-                }
-                if selectionCount(for: source) > 0 {
-                    prepareDeletionPlan(from: source)
-                }
+            if case .noSelection = deletionState, selectionCount(for: source) > 0 {
+                prepareDeletionPlan(from: source)
             }
             return
         }
@@ -2615,16 +2597,10 @@ final class AppEnvironment {
 
     // MARK: - Video size resolution (measure once, largest-first honestly)
 
-    /// Ensures the current video dataset is measuring (M15): starts from `.idle` and
-    /// **resumes** a settled-partial measurement — a cancelled or interrupted run keeps
-    /// every byte it already measured and continues only the unknowns. An in-flight run
-    /// and a fully measured dataset are left exactly as they are.
-    ///
-    /// This is the screen-appear entry: the inventory never depends on a separate
-    /// "Measure Sizes" action (M14 removed that button), so re-opening the screen after a
-    /// yield, a cancellation on disappear, or a heavy pass finishing always reuses and
-    /// continues the shared measurement instead of stranding it.
+    /// Starts measuring the current video dataset from scratch. Only starts from `.idle` —
+    /// an in-flight or already-settled measurement is left exactly as it is.
     func startVideoSizeResolution() {
+        guard case .idle = videoSizeResolution else { return }
         resumeVideoSizeMeasurement()
     }
 
@@ -2637,7 +2613,7 @@ final class AppEnvironment {
         guard !videoSizeResolution.isMeasuring else { return }
         // Heavy passes take the cores and the thumbnail pipeline; video measurement is
         // nonessential detail work and waits for them (VideosView restarts it when a pass
-        // finishes, or the video screen reappears).
+        // finishes, or the user taps "Measure Sizes").
         guard !analysisState.isRunning else { return }
         guard !blurAnalysisState.isRunning else { return }
         guard photoPermissionState.isUsable else { return }
@@ -2707,7 +2683,7 @@ final class AppEnvironment {
             guard let self else { return }
             let batchSize = VideoSizeResolution.measurementBatchSize
             var pending = Array(targets)
-            var unavailableIDs: Set<String> = []
+            var unavailableCount = 0
             var lastPublish = ContinuousClock.now
             while !pending.isEmpty {
                 let batch = Array(pending.prefix(batchSize))
@@ -2726,7 +2702,7 @@ final class AppEnvironment {
                         measuredBytes[identifier] = size
                     case .unavailable, nil:
                         // Never counted as measured, never zero — only as attempted.
-                        unavailableIDs.insert(identifier)
+                        unavailableCount += 1
                     }
                 }
                 // Coalesced publishes: a cloud-only library resolves batches in
@@ -2740,7 +2716,7 @@ final class AppEnvironment {
                             datasetSignature: signature,
                             bytes: measuredBytes,
                             total: total,
-                            unavailableIDs: unavailableIDs
+                            unavailableCount: unavailableCount
                         )
                     )
                 }
@@ -2751,7 +2727,7 @@ final class AppEnvironment {
                     datasetSignature: signature,
                     bytes: measuredBytes,
                     total: total,
-                    unavailableIDs: unavailableIDs
+                    unavailableCount: unavailableCount
                 )
             )
             self.videoSizeTask = nil
@@ -2771,72 +2747,6 @@ final class AppEnvironment {
         videoSizeTask = nil
         if case .measuring(let measurement) = videoSizeResolution {
             videoSizeResolution = .settled(measurement)
-        }
-    }
-
-    /// Publishes plan-time size resolutions into the shared video-size state (M15): the
-    /// inventory and the review flow read **one** measurement source of truth, so a size
-    /// the review can show is a size the inventory shows and sorts by — without a second
-    /// measurement pass and without remeasuring the same asset on navigation.
-    ///
-    /// Rules, all about never letting a stale answer win:
-    /// - Only the **current** video dataset's assets are recorded, and only while the
-    ///   asset is byte-identical to what was measured (same modification date) — a
-    ///   resolution that raced a catalog change can never overwrite current results.
-    /// - A measurement stamped with another dataset's signature is never mixed into.
-    /// - A run that is currently measuring owns the state (it will measure those assets
-    ///   itself, and its next publish would overwrite a merge anyway) — the merge waits.
-    /// - A record that resolved to no bytes was *attempted* and honestly failed: it joins
-    ///   `unavailableIDs`, never a zero.
-    func recordResolvedVideoSizes(_ resolvedRecords: [PhotoAssetRecord]) {
-        guard !resolvedRecords.isEmpty else { return }
-        guard case .completed(let catalog) = catalogState else { return }
-        var current: [String: PhotoAssetRecord] = [:]
-        for record in VideoDataset.records(in: catalog) {
-            current[record.localIdentifier] = record
-        }
-        var measured: [String: Int64] = [:]
-        var unavailable: Set<String> = []
-        for record in resolvedRecords {
-            guard let live = current[record.localIdentifier],
-                  live.modificationDate == record.modificationDate
-            else { continue }
-            if let bytes = record.sizeInBytes {
-                measured[record.localIdentifier] = bytes
-            } else {
-                unavailable.insert(record.localIdentifier)
-            }
-        }
-        guard !measured.isEmpty || !unavailable.isEmpty else { return }
-        let signature = videoDatasetSignature
-        let total = current.count
-        switch videoSizeResolution {
-        case .measuring:
-            // The running pass owns the state; its own batches cover these assets.
-            return
-        case .idle:
-            videoSizeResolution = .settled(VideoSizeResolution.Measurement(
-                datasetSignature: signature,
-                bytes: measured,
-                total: total,
-                unavailableIDs: unavailable
-            ))
-        case .settled(let measurement):
-            guard measurement.datasetSignature == signature else { return }
-            var mergedBytes = measurement.bytes
-            for (assetID, bytes) in measured where mergedBytes[assetID] == nil {
-                mergedBytes[assetID] = bytes
-            }
-            // An asset measured now is no longer "could not be measured".
-            var mergedUnavailable = measurement.unavailableIDs
-            mergedUnavailable.subtract(measured.keys)
-            mergedUnavailable.formUnion(unavailable)
-            videoSizeResolution = .settled(VideoSizeResolution.Measurement(
-                datasetSignature: measurement.datasetSignature,
-                bytes: mergedBytes,
-                total: measurement.total,
-                unavailableIDs: mergedUnavailable
-            ))
         }
     }
 

@@ -135,10 +135,6 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     /// Per-asset ceiling on a PhotoKit callback (see the type docs). Exceeding it yields an
     /// honest `.unavailable` — never a hang, never zero.
     var callbackDeadlineNanoseconds: UInt64 = 5_000_000_000
-    /// Per-asset exact-bytes resolution, injectable for tests (M15-R1). `nil` binds the
-    /// production PhotoKit resource ladder below. Keyed by local identifier so tests need
-    /// neither a photo library nor network access.
-    var exactBytes: (@Sendable (String) async -> Int64?)?
 
     func sizes(for localIdentifiers: [String]) async -> [String: Int64] {
         let outcomes = await outcomes(for: localIdentifiers)
@@ -158,17 +154,6 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     /// failed batch).
     func outcomes(for localIdentifiers: [String]) async -> [String: VideoSizeOutcome] {
         guard !localIdentifiers.isEmpty else { return [:] }
-
-        // The injectable seam (M15-R1): tests drive the whole outcome mapping without a
-        // photo library, so the measured/unavailable contract is deterministic.
-        if let exactBytes {
-            var outcomes: [String: VideoSizeOutcome] = [:]
-            outcomes.reserveCapacity(localIdentifiers.count)
-            for identifier in localIdentifiers {
-                outcomes[identifier] = await exactBytes(identifier).map(VideoSizeOutcome.measured) ?? .unavailable
-            }
-            return outcomes
-        }
 
         let fetchOptions = PHFetchOptions()
         fetchOptions.fetchLimit = localIdentifiers.count
@@ -206,13 +191,11 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
                 of: SizeMeasurement.self,
                 returning: [SizeMeasurement].self
             ) { group in
-                let override = exactBytes
                 for asset in batch {
                     group.addTask {
                         let bytes = await Self.contentBytes(
                             for: asset,
-                            deadlineNanoseconds: deadline,
-                            override: override
+                            deadlineNanoseconds: deadline
                         )
                         return SizeMeasurement(
                             localIdentifier: asset.localIdentifier,
@@ -267,12 +250,8 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
 
     private static func contentBytes(
         for asset: PHAsset,
-        deadlineNanoseconds: UInt64,
-        override: (@Sendable (String) async -> Int64?)?
+        deadlineNanoseconds: UInt64
     ) async -> Int64? {
-        if let override {
-            return await override(asset.localIdentifier)
-        }
         switch asset.mediaType {
         case .video where !asset.mediaSubtypes.contains(.photoLive):
             return await videoBytes(for: asset, deadlineNanoseconds: deadlineNanoseconds)
@@ -283,77 +262,22 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         }
     }
 
-    /// The exact-bytes ladder for one plain video (M15-R1), all rungs local-only — a size
-    /// is never obtained by downloading anything:
-    ///
-    /// 1. the **current version's** file (the one the user sees; for an unedited video
-    ///    this is simply the video file on disk);
-    /// 2. the **original version's** file. `requestAVAsset(version: .current)` answers an
-    ///    `AVComposition` — no file URL — for an *edited* video even when the whole asset
-    ///    is local, which used to classify fully local videos as unmeasurable. The
-    ///    original file is still on disk and is exactly the bytes deleting frees (minus
-    ///    the small adjustment record), so it is a validated measurement, not a guess;
-    /// 3. otherwise `nil` — genuinely unavailable locally (cloud-only), reported honestly
-    ///    and never as zero.
-    ///
-    /// Both rungs go through the same first-answer-wins deadline as every other PhotoKit
-    /// callback here, so a pathological callback cannot hang a measurement batch.
-    struct VideoBytesProbes: Sendable {
-        var currentVersionURL: @Sendable (String) async -> URL?
-        var originalVersionURL: @Sendable (String) async -> URL?
-    }
-
-    static func videoBytes(assetID: String, probes: VideoBytesProbes) async -> Int64? {
-        if let url = await probes.currentVersionURL(assetID), let bytes = fileSize(at: url) {
-            return bytes
-        }
-        if let url = await probes.originalVersionURL(assetID), let bytes = fileSize(at: url) {
-            return bytes
-        }
-        return nil
-    }
-
-    /// The plain-video path: the production ladder over PhotoKit, network access disabled
-    /// at every rung (a cloud-only video answers nil promptly — the honest unavailable
-    /// outcome at callback speed).
+    /// The plain-video path: `requestAVAsset` with network access disabled answers promptly
+    /// for both a local video (an `AVURLAsset` to stat) and a cloud-only one (nil).
     private static func videoBytes(
         for asset: PHAsset,
         deadlineNanoseconds: UInt64
     ) async -> Int64? {
-        let assetID = asset.localIdentifier
-        let deadline = deadlineNanoseconds
-        return await videoBytes(
-            assetID: assetID,
-            probes: VideoBytesProbes(
-                currentVersionURL: { id in
-                    await assetURL(id, version: .current, deadlineNanoseconds: deadline)
-                },
-                originalVersionURL: { id in
-                    await assetURL(id, version: .original, deadlineNanoseconds: deadline)
-                }
-            )
-        )
-    }
-
-    /// One `requestAVAsset` rung: resolves the asset (process-wide reference cache), asks
-    /// for one version with network access disabled, and answers the file URL if PhotoKit
-    /// handed back a plain `AVURLAsset` (a composition has no file URL and answers nil).
-    private static func assetURL(
-        _ assetID: String,
-        version: PHVideoRequestOptionsVersion,
-        deadlineNanoseconds: UInt64
-    ) async -> URL? {
         await withDeadline(nanoseconds: deadlineNanoseconds) { deliver in
-            let asset = PhotoAssetReferenceCache.shared.asset(for: assetID)
-            guard let asset, asset.mediaType == .video else {
-                deliver(nil)
-                return
-            }
             let options = PHVideoRequestOptions()
             options.isNetworkAccessAllowed = false
-            options.version = version
+            options.version = .current
             PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
-                deliver((avAsset as? AVURLAsset)?.url)
+                guard let url = (avAsset as? AVURLAsset)?.url else {
+                    deliver(nil)
+                    return
+                }
+                deliver(fileSize(at: url))
             }
         }
     }

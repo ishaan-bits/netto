@@ -19,7 +19,8 @@ struct PotentiallyBlurryView: View {
         PotentiallyBlurryPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
-            blur: env.blurAnalysisState
+            blur: env.blurAnalysisState,
+            pendingBehindOtherPass: env.pendingAnalysisRequest == .blur
         )
     }
 
@@ -37,6 +38,7 @@ struct PotentiallyBlurryView: View {
         case .buildingCatalog: return "buildingCatalog"
         case .catalogFailed: return "catalogFailed"
         case .notStarted: return "notStarted"
+        case .queuedBehindSimilarity: return "queuedBehindSimilarity"
         case .analyzing: return "analyzing"
         case .paused: return "paused"
         case .cancelled: return "cancelled"
@@ -134,6 +136,20 @@ struct PotentiallyBlurryView: View {
             ) {
                 env.startImageAnalysis()
             }
+
+        case .queuedBehindSimilarity:
+            // The tap was never dropped (M10): the pass is in the coordinator's queue and
+            // starts automatically. Start Now is the explicit cancel-and-switch; Remove
+            // clears the queue and leaves the running analysis untouched.
+            PhaseMessage(
+                systemImage: "hourglass",
+                title: "Similar Photos analysis running",
+                message: "Your sharpness check is queued. It starts automatically when the Similar Photos analysis finishes — nothing is deleted during either check.",
+                buttonTitle: "Start Now (Cancels Similar Photos Analysis)",
+                buttonAction: { env.startPendingAnalysisNow() },
+                secondaryButtonTitle: "Remove from Queue",
+                secondaryButtonAction: { env.cancelPendingAnalysis() }
+            )
 
         case .analyzing(let progress):
             NettoProgressPanel(

@@ -71,22 +71,6 @@ extension PhotoThumbnailLoading {
         try await thumbnail(for: assetID, targetPixelSize: targetPixelSize, mode: .verification)
     }
 
-    /// The **network-permitted** rendition fetch (M15-R1): the same pixels contract as
-    /// `thumbnail` (upright, at most `targetPixelSize` on the longest side), but the
-    /// underlying request may use the network to materialize an iCloud-backed asset — the
-    /// product behaviour Photo Details already has for a photo the user is explicitly
-    /// looking at. Only an on-screen request for the *current* photo may use this; the
-    /// prefetch window and the analysis passes stay local-only so navigation never
-    /// downloads a library.
-    ///
-    /// The default rides the existing `previewImage` pipeline: bounded (its own timeout),
-    /// opportunistic interim frames discarded here, and a local-rendition ladder behind a
-    /// recoverable failure. Synthetic loaders (tests, previews) inherit `previewImage`'s
-    /// default of a plain local thumbnail.
-    func thumbnailAllowingNetwork(for assetID: String, targetPixelSize: Int) async throws -> CGImage {
-        try await previewImage(for: assetID, targetPixelSize: targetPixelSize) { _ in }
-    }
-
     /// Synthetic loaders (tests, previews) have no PhotoKit degradation step: serve the single
     /// frame and report no interim. The default keeps every existing conformer source-compatible.
     func previewImage(

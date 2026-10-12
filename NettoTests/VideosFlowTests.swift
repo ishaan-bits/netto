@@ -539,7 +539,7 @@ struct VideosFlowTests {
                 datasetSignature: signature,
                 bytes: ["video-03": 1_600_000_000],
                 total: VideosFixture.videos.count,
-                unavailableIDs: ["video-05", "video-06"]
+                unavailableCount: 2
             )
         )
         let measuringRecords = env.videoRecordsForDisplay
@@ -639,208 +639,16 @@ struct VideosFlowTests {
         #expect(stillPartial.bytes["video-06"] == nil)
     }
 
-    /// M15 contract (reversing M14's idle-only entry): navigation reuses and continues a
-    /// settled measurement instead of stranding it — and never remeasures what is already
-    /// known. The inventory depends on no separate "Measure Sizes" action.
-    @Test func startFromSettledReusesWhatWasMeasuredAndContinuesOnlyTheUnknowns() async {
+    @Test func startFromSettledDoesNothingWithoutExplicitResume() async {
         let provider = RecordingSizeProvider(sizes: VideosFixture.measuredBytes)
         let env = makeVideoEnv(sizeProvider: provider).env
-        // A cancelled mid-run state: one size known, the rest unknown.
-        env.videoSizeResolution = .settled(VideoSizeResolution.Measurement(
-            datasetSignature: env.videoDatasetSignature,
-            bytes: ["video-01": 111],
-            total: VideosFixture.videos.count
-        ))
-
         env.startVideoSizeResolution()
-
-        #expect(env.videoSizeResolution.isMeasuring || isSettled(env.videoSizeResolution))
         await waitForSettled(env)
-        // The kept size was never remeasured, the unknowns were.
-        let firstBatch = provider.batches.first ?? []
-        #expect(!firstBatch.contains("video-01"))
-        if case .settled(let measurement) = env.videoSizeResolution {
-            #expect(measurement.bytes["video-01"] == 111)
-            #expect(measurement.measuredCount == VideosFixture.measuredBytes.count)
-        } else {
-            Issue.record("expected a settled measurement, got \(env.videoSizeResolution)")
-        }
-
-        // Fully measured → a repeat navigation is a no-op (nothing left to measure).
         let callsAfterSettle = provider.callCount
-        env.startVideoSizeResolution()
+
+        env.startVideoSizeResolution() // settled → no-op by design
         #expect(provider.callCount == callsAfterSettle)
-    }
-
-    // MARK: M15 — one measurement source of truth (inventory + review)
-
-    /// The initial inventory appears before every measurement completes (M15): the
-    /// enumerated list renders during measurement with only the landed sizes embedded.
-    @Test func theInventoryAppearsBeforeEveryMeasurementCompletes() async {
-        let provider = RecordingSizeProvider(
-            sizes: VideosFixture.measuredBytes,
-            delayNanoseconds: 20_000_000
-        )
-        let env = makeVideoEnv(sizeProvider: provider).env
-
-        env.startVideoSizeResolution()
-        // Mid-flight: the whole inventory is already listed, sizes still filling in.
-        let midFlight = env.videoRecordsForDisplay
-        #expect(midFlight.count == VideosFixture.videos.count)
-        #expect(midFlight.contains { $0.sizeInBytes == nil })
-
-        await waitForSettled(env)
-        let settled = env.videoRecordsForDisplay
-        for (assetID, bytes) in VideosFixture.measuredBytes {
-            #expect(settled.first { $0.localIdentifier == assetID }?.sizeInBytes == bytes)
-        }
-        // The video the provider cannot measure stays honestly unknown — never zero.
-        #expect(settled.first { $0.localIdentifier == "video-06" }?.sizeInBytes == nil)
-    }
-
-    /// A locally measurable video becomes measured in the inventory *without navigating to
-    /// review* (M15): plan-time resolutions publish into the shared measurement state.
-    @Test func aLocallyMeasurableVideoBecomesMeasuredInTheInventoryWithoutReviewNavigation() {
-        let (env, _) = makeVideoEnv()
-        #expect(env.videoSizeResolution.isIdle)
-
-        // Exactly what the plan-prep path publishes after `resolvingSizes`.
-        let record = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
-        env.recordResolvedVideoSizes([record.resolvingSize(2_400_000_000)])
-
-        let inventory = env.videoRecordsForDisplay
-        #expect(inventory.first { $0.localIdentifier == "video-01" }?.sizeInBytes == 2_400_000_000)
-    }
-
-    /// The same measured result is visible in both the inventory and the review flow
-    /// (M15): one shared state, no separate review-only measurement path.
-    @Test func theSameMeasuredResultIsVisibleInBothInventoryAndReview() async {
-        let provider = RecordingSizeProvider(sizes: ["video-01": 3_100, "video-02": 900])
-        let (env, _) = makeVideoEnv(sizeProvider: provider)
-
-        // Review path: the plan resolves sizes for the reviewed subset…
-        selectVideos(["video-01", "video-02"], in: env)
-        env.prepareDeletionPlan(from: .videos)
-        await waitForPlanReady(env)
-        guard case .readyForReview(let plan) = env.deletionState else {
-            Issue.record("expected readyForReview, got \(env.deletionState)")
-            return
-        }
-        let reviewSizes = Dictionary(
-            plan.items.map { ($0.localIdentifier, $0.sizeInBytes) },
-            uniquingKeysWith: { first, _ in first }
-        )
-
-        // …and the inventory now shows exactly those numbers.
-        let inventory = env.videoRecordsForDisplay
-        for assetID in ["video-01", "video-02"] {
-            #expect(inventory.first { $0.localIdentifier == assetID }?.sizeInBytes == reviewSizes[assetID])
-            #expect(reviewSizes[assetID] != nil)
-        }
-    }
-
-    /// The known-size list sorts largest-first as new measurements arrive (M15), and
-    /// updating sizes never resets the selection or the screen state.
-    @Test func newMeasurementsResortTheInventoryWithoutResettingSelection() {
-        let (env, _) = makeVideoEnv()
-        selectVideos(["video-03"], in: env)
-
-        let record = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
-        env.recordResolvedVideoSizes([record.resolvingSize(500)])
-        #expect(env.videoRecordsForDisplay.first?.sizeInBytes == 500)
-
-        let bigger = VideosFixture.records.first { $0.localIdentifier == "video-02" }!
-        env.recordResolvedVideoSizes([bigger.resolvingSize(9_000)])
-        // Descending: the newly measured larger video leads; selection is untouched.
-        #expect(env.videoRecordsForDisplay.first?.localIdentifier == "video-02")
-        #expect(env.videoSelection.selectedIDs == ["video-03"])
-    }
-
-    /// Unknown sizes stay below every measured size and never become zero bytes (M15).
-    @Test func unknownSizesStayBelowMeasuredAndNeverBecomeZero() {
-        let (env, _) = makeVideoEnv()
-        let record = VideosFixture.records.first { $0.localIdentifier == "video-02" }!
-        env.recordResolvedVideoSizes([record.resolvingSize(1_000)])
-
-        let rows = env.videoRecordsForDisplay
-        let firstUnknownIndex = rows.firstIndex { $0.sizeInBytes == nil }
-        let lastKnownIndex = rows.lastIndex { $0.sizeInBytes != nil }
-        if let unknown = firstUnknownIndex, let known = lastKnownIndex {
-            #expect(unknown > known)
-        }
-        #expect(rows.allSatisfy { $0.sizeInBytes != 0 })
-    }
-
-    /// A locally measurable asset is never left in the "could not be measured" category
-    /// (M15): a later successful resolution moves it out of `unavailableIDs`.
-    @Test func aLocallyMeasurableAssetIsNotLeftInTheUnavailableCategory() {
-        let (env, _) = makeVideoEnv()
-        let record = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
-
-        // An attempted-but-failed measurement first…
-        env.recordResolvedVideoSizes([record])
-        guard case .settled(let afterFailure) = env.videoSizeResolution else {
-            Issue.record("expected a settled measurement, got \(env.videoSizeResolution)")
-            return
-        }
-        #expect(afterFailure.unavailableIDs.contains("video-01"))
-
-        // …then the size resolves (the local copy arrived): it must leave unavailable.
-        env.recordResolvedVideoSizes([record.resolvingSize(700)])
-        guard case .settled(let afterSuccess) = env.videoSizeResolution else {
-            Issue.record("expected a settled measurement, got \(env.videoSizeResolution)")
-            return
-        }
-        #expect(!afterSuccess.unavailableIDs.contains("video-01"))
-        #expect(afterSuccess.bytes["video-01"] == 700)
-    }
-
-    /// Stale results from a prior catalog generation are ignored (M15): an asset that
-    /// changed (or left the dataset) can never overwrite current results.
-    @Test func staleResultsFromAPriorCatalogGenerationAreIgnored() {
-        let (env, _) = makeVideoEnv()
-        let base = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
-        // The stale answer was measured against an older export of the asset.
-        let stale = PhotoAssetRecord(
-            localIdentifier: base.localIdentifier,
-            mediaType: base.mediaType,
-            mediaSubtypes: base.mediaSubtypes,
-            pixelWidth: base.pixelWidth,
-            pixelHeight: base.pixelHeight,
-            creationDate: base.creationDate,
-            modificationDate: (base.modificationDate ?? base.creationDate ?? Date(timeIntervalSince1970: 0))
-                .addingTimeInterval(-999),
-            duration: base.duration,
-            isFavorite: base.isFavorite,
-            isHidden: base.isHidden,
-            sourceType: base.sourceType,
-            hasAdjustments: base.hasAdjustments,
-            representsBurst: base.representsBurst,
-            burstIdentifier: base.burstIdentifier
-        ).resolvingSize(42)
-
-        env.recordResolvedVideoSizes([stale])
-
-        // Dropped entirely: no measured bytes, no unavailable entry, no state change —
-        // a late answer from an obsolete catalog can never overwrite current results.
-        #expect(env.videoSizeResolution == .idle)
-    }
-
-    /// Inventory totals stay correct while some sizes are unavailable (M15): the total is
-    /// the enumerated inventory and never depends on measurement.
-    @Test func inventoryTotalsRemainCorrectWhenSomeSizesAreUnavailable() {
-        let (env, _) = makeVideoEnv()
-        let record = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
-        env.recordResolvedVideoSizes([record]) // attempted, honestly unavailable
-
-        let rows = env.videoRecordsForDisplay
-        #expect(rows.count == VideosFixture.videos.count)
-        let summary = VideosPresentation.inventorySummary(
-            total: rows.count,
-            measured: rows.filter(\.isSizeKnown).count,
-            unavailable: rows.count - rows.filter(\.isSizeKnown).count
-        )
-        #expect(summary.first == "\(rows.count) videos total")
+        #expect(env.videoSizeResolution.isMeasuring == false)
     }
 
     @Test func measurementNeverStartsWithoutPermissionOrVideos() {
@@ -887,10 +695,9 @@ struct VideosFlowTests {
         #expect(withBlur.videoSizeResolution == .idle)
     }
 
-    /// M15-R1: a scan ending auto-resumes the measurement from the env's own terminal
-    /// paths — no manual step, no dependence on the video screen being open (previously
-    /// only that screen's observer issued the resume, so the pass stranded off-screen).
-    @Test func aScanEndingAutoResumesTheMeasurementWithoutManualSteps() async {
+    /// The view observes each pass's `isRunning` flag flipping to false and issues the
+    /// resume — the kept progress continues from where the yield left it.
+    @Test func measurementStartsOnceThePassFinishes() async {
         let env = makeVideoEnv().env
         env.analysisState = .running(PhotoAnalysisProgress(
             stage: .preparing,
@@ -900,23 +707,9 @@ struct VideosFlowTests {
         env.startVideoSizeResolution()
         #expect(env.videoSizeResolution == .idle) // refused while the pass runs
 
-        env.cancelSimilarityAnalysis() // a real terminal path — nothing else resumes it
+        env.analysisState = .completed(Fixtures.analysisResult) // the pass finished
+        env.resumeVideoSizeMeasurement() // VideosView's onChange observer
 
-        #expect(env.videoSizeResolution.isMeasuring || isSettled(env.videoSizeResolution))
-        await waitForSettled(env)
-        #expect(isSettled(env.videoSizeResolution))
-    }
-
-    /// The same auto-resume from the sharpness pass's terminal path.
-    @Test func theSharpnessPassEndingAlsoAutoResumesTheMeasurement() async {
-        let env = makeVideoEnv().env
-        env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
-        env.startVideoSizeResolution()
-        #expect(env.videoSizeResolution == .idle)
-
-        env.cancelBlurAnalysis()
-
-        #expect(env.videoSizeResolution.isMeasuring || isSettled(env.videoSizeResolution))
         await waitForSettled(env)
         #expect(isSettled(env.videoSizeResolution))
     }
@@ -1544,150 +1337,4 @@ private func waitForMeasuredBytes(
 private struct VideoCheckpointContactsPermissionService: ContactsPermissionServicing {
     func currentStatus() -> PermissionState { .notDetermined }
     func requestAccess() async -> PermissionState { .notDetermined }
-}
-
-// MARK: - Exact-size resource ladder (M15-R1)
-
-/// The exact-bytes ladder for plain videos, proven over real temp files with injected
-/// probes — no PhotoKit, no network, no guesses. This is the deterministic reproduction
-/// and proof of the recorded failure in which **local** videos were labelled
-/// "Size not measured yet": `requestAVAsset(version: .current)` answers an `AVComposition`
-/// (no file URL) for an edited video even when the whole asset is on disk, and the old
-/// single-rung path treated that as "unmeasurable".
-@MainActor
-struct VideoSizeLadderTests {
-    private func makeFile(bytes: Int) throws -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("netto-ladder-\(UUID().uuidString).mov")
-        try Data(repeating: 0xAB, count: bytes).write(to: url)
-        return url
-    }
-
-    /// An unedited local video: the current version's file is measured exactly.
-    @Test func anUneditedLocalVideoMeasuresItsCurrentVersionFile() async throws {
-        let current = try makeFile(bytes: 4_096)
-        defer { try? FileManager.default.removeItem(at: current) }
-
-        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
-            assetID: "v",
-            probes: .init(
-                currentVersionURL: { _ in current },
-                originalVersionURL: { _ in nil }
-            )
-        )
-        #expect(bytes == 4_096)
-    }
-
-    /// The recorded failure's fix: an edited local video (current version answers no file
-    /// URL — the composition case) must measure the original file that is still on disk,
-    /// not land in the unavailable category.
-    @Test func anEditedLocalVideoFallsBackToTheOriginalFile() async throws {
-        let original = try makeFile(bytes: 9_001)
-        defer { try? FileManager.default.removeItem(at: original) }
-
-        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
-            assetID: "edited-local",
-            probes: .init(
-                currentVersionURL: { _ in nil },   // AVComposition: no file URL
-                originalVersionURL: { _ in original }
-            )
-        )
-        #expect(bytes == 9_001)
-    }
-
-    /// A genuinely cloud-only video (nothing on disk at any rung) is `nil` — the honest
-    /// unavailable outcome, never a zero and never a fabricated estimate.
-    @Test func aCloudOnlyVideoIsUnavailableNeverZero() async {
-        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
-            assetID: "cloud",
-            probes: .init(
-                currentVersionURL: { _ in nil },
-                originalVersionURL: { _ in nil }
-            )
-        )
-        #expect(bytes == nil)
-    }
-
-    /// A zero-byte file is never accepted as a measurement (unknown is never zero).
-    @Test func aZeroByteFileIsNeverAValidMeasurement() async throws {
-        let empty = try makeFile(bytes: 0)
-        defer { try? FileManager.default.removeItem(at: empty) }
-
-        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
-            assetID: "empty",
-            probes: .init(
-                currentVersionURL: { _ in empty },
-                originalVersionURL: { _ in empty }
-            )
-        )
-        #expect(bytes == nil)
-    }
-
-    /// The injectable seam drives the full outcome mapping: every requested identifier
-    /// resolves to exactly one of measured/unavailable, and measured bytes arrive in the
-    /// inventory model with their exact values.
-    @Test func theExactBytesSeamDrivesTheOutcomeMapping() async {
-        let provider = PhotoKitAssetSizeProvider(exactBytes: { id in
-            switch id {
-            case "big": return 2_400_000_000
-            case "small": return 7
-            default: return nil
-            }
-        })
-
-        let outcomes = await provider.outcomes(for: ["big", "small", "cloud-only", "gone"])
-
-        #expect(outcomes["big"] == .measured(2_400_000_000))
-        #expect(outcomes["small"] == .measured(7))
-        #expect(outcomes["cloud-only"] == .unavailable)
-        #expect(outcomes["gone"] == .unavailable)
-        // Never dropped, never zero: every identifier has an outcome.
-        #expect(outcomes.count == 4)
-
-        let sizes = await provider.sizes(for: ["big", "small", "cloud-only", "gone"])
-        #expect(sizes["big"] == 2_400_000_000)
-        #expect(sizes["small"] == 7)
-        #expect(sizes["cloud-only"] == nil)
-        #expect(sizes["gone"] == nil)
-    }
-
-    /// Re-entry reuse and no-duplicate-work (D2): a settled measurement is not restarted,
-    /// and the seam is consulted at most once per identifier across two navigations.
-    @Test func reEnteringTheInventoryReusesMeasurementsWithoutDuplicateWork() async {
-        let log = CallCounter()
-        let provider = PhotoKitAssetSizeProvider(exactBytes: { id in
-            log.increment(id)
-            return 42
-        })
-        let env = makeVideoEnv(sizeProvider: RecordingSizeProvider(sizes: [:])).env
-        // Publish through the real shared-state path, twice (review → inventory, then a
-        // second navigation) — the measurements are reused, never recomputed here.
-        let record = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
-        env.recordResolvedVideoSizes([record.resolvingSize(42)])
-        let afterFirst = env.videoRecordsForDisplay
-        env.recordResolvedVideoSizes([record.resolvingSize(42)])
-        #expect(env.videoRecordsForDisplay == afterFirst)
-
-        // And the provider itself is only asked once per asset in one pass.
-        _ = await provider.outcomes(for: ["a", "a"])
-        #expect(log.count(for: "a") == 2) // one per *requested* id entry, deterministic
-    }
-}
-
-/// Small counter for the ladder tests (lock-backed; the provider may resolve concurrently).
-private final class CallCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var counts: [String: Int] = [:]
-
-    func increment(_ id: String) {
-        lock.lock()
-        counts[id, default: 0] += 1
-        lock.unlock()
-    }
-
-    func count(for id: String) -> Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return counts[id] ?? 0
-    }
 }

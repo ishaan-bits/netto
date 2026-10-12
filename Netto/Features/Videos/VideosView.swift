@@ -1,21 +1,17 @@
 import SwiftUI
 
-/// The unified VIDEO CLEANUP inventory (M14): the video subset of the existing catalog,
-/// rendered immediately and measured for size in the background — known sizes first
-/// (largest to smallest), the size-unavailable group below them. One list; never split by
-/// source. Feeds the shared review → confirmation → mutation → verification pipeline.
+/// The LARGE VIDEOS cleanup screen: the video subset of the existing catalog, measured for
+/// size and sorted largest first, feeding the shared review → confirmation → mutation →
+/// verification pipeline.
 ///
 /// Video identity comes from the media type already bridged into `PhotoAssetRecord` during
 /// enumeration — no filename, codec, or dimension heuristic exists here. Sizes are measured
-/// automatically when the screen appears (bounded, cancellable, local-only) because the
-/// largest-first ordering is the whole point: an unmeasured video is shown as *unknown*,
-/// listed after every measured one, never ranked as the smallest, and never as zero. There
-/// is no separate "Measure Sizes" button — measurement starts on appear and resumes when a
-/// heavy pass finishes; the inventory itself never waits on it. All state is derived
-/// through `VideosPresentation.phase`; the only writes this view makes are selection
-/// changes and size-resolution start/cancel. Thumbnails come from the same bounded
-/// `ThumbnailStore` as the review UI — poster frames via PhotoKit, never an
-/// `AVAssetImageGenerator` per row.
+/// explicitly for this screen (bounded, cancellable, local-only) because the largest-first
+/// ordering is the whole point: an unmeasured video is shown as *unknown*, listed after every
+/// measured one, never ranked as the smallest. All state is derived through
+/// `VideosPresentation.phase`; the only writes this view makes are selection changes and
+/// size-resolution start/cancel. Thumbnails come from the same bounded `ThumbnailStore` as the
+/// review UI — poster frames via PhotoKit, never an `AVAssetImageGenerator` per row.
 struct VideosView: View {
     @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var previewedVideo: PhotoAssetRecord?
@@ -49,7 +45,7 @@ struct VideosView: View {
     var body: some View {
         content
             .background(NettoColor.background.ignoresSafeArea())
-            .navigationTitle("Video Cleanup")
+            .navigationTitle("Large Videos")
             .nettoAppear()
             .nettoStateTransition(phaseID)
             .onAppear {
@@ -67,17 +63,16 @@ struct VideosView: View {
             // Heavy passes suspend measurement while they run (the AppEnvironment guards
             // refuse the start); the moment either finishes, the kept progress continues —
             // without this observer, a measurement interrupted by a pass would sit settled
-            // and partial until the screen was reopened.
+            // and partial until the user tapped "Measure Sizes".
             .onChange(of: env.analysisState.isRunning) { _, running in
                 if !running { env.resumeVideoSizeMeasurement() }
             }
             .onChange(of: env.blurAnalysisState.isRunning) { _, running in
                 if !running { env.resumeVideoSizeMeasurement() }
             }
-            // Measurement is *not* cancelled on navigation (M15-R1): leaving for review or
-            // another screen must not strand the inventory in a partial state — the bounded
-            // pass keeps filling the shared size state while other consumers read it. The
-            // app-backgrounding path checkpoint-cancels it as before, and re-entry resumes.
+            // Leaving the screen during measurement cancels it: the progress kept so far is
+            // kept (as a settled, possibly partial state), the rest is simply not measured.
+            .onDisappear { env.cancelVideoSizeResolution() }
             .fullScreenCover(item: $previewedVideo) { record in
                 VideoPreviewView(
                     assetID: record.localIdentifier,
@@ -202,12 +197,7 @@ struct VideosView: View {
         unavailable: Int,
         isActive: Bool
     ) -> some View {
-        // The catalog's ordering is preserved: known sizes largest-first, unknowns after
-        // (VideoDataset.sorted). The two groups below only *label* that order — the total
-        // and both counts come from the same records, so they can never disagree.
-        let measuredRecords = records.filter(\.isSizeKnown)
-        let unavailableRecords = records.filter { !$0.isSizeKnown }
-        return List {
+        List {
             if VideosPresentation.showsLimitedAccessNotice(permission: env.photoPermissionState) {
                 Section {
                     limitedNotice
@@ -244,35 +234,28 @@ struct VideosView: View {
                                 : nil,
                             cancel: { env.cancelVideoSizeResolution() }
                         )
+                    } else if shouldOfferMeasure {
+                        if unavailable > 0 {
+                            // Attempted but not measurable (iCloud-only, unreadable) —
+                            // named as its own figure, never folded into "measured".
+                            Text("\(unavailable) of these could not be measured — download them in iCloud Photos, then measure again.")
+                                .font(.caption)
+                                .foregroundStyle(NettoColor.textSecondary)
+                        }
+                        Button("Measure Sizes") {
+                            env.resumeVideoSizeMeasurement()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
                 }
                 .padding(.vertical, Theme.Spacing.xs)
             }
 
-            // Measured first — largest to smallest — then the size-unavailable group.
-            // No source split: every video the catalog holds is in this one list.
-            if !measuredRecords.isEmpty {
-                Section("Measured — largest first") {
-                    ForEach(measuredRecords) { record in
-                        row(for: record)
-                    }
-                }
-            }
-
-            if !unavailableRecords.isEmpty {
-                Section {
-                    ForEach(unavailableRecords) { record in
-                        row(for: record)
-                    }
-                } header: {
-                    Text("Size unavailable")
-                } footer: {
-                    Text("Sizes that were not measured locally are listed here — never guessed, never ranked as the smallest.")
-                }
-            }
-
             Section {
-                EmptyView()
+                ForEach(records) { record in
+                    row(for: record)
+                }
             } footer: {
                 Text("Tap a video to preview it. Nothing is deleted until you confirm on the review screen.")
             }
@@ -287,17 +270,111 @@ struct VideosView: View {
         }
     }
 
+    /// Measure is offered whenever some sizes are still unknown: nothing measured yet
+    /// (idle), or a settled partial (cancelled, expired, or unreadable).
+    private var shouldOfferMeasure: Bool {
+        guard let measurement = env.videoSizeResolution.measurement else { return true }
+        return measurement.isPartial
+    }
+
     private func row(for record: PhotoAssetRecord) -> some View {
-        VideoInventoryRow(
-            record: record,
-            isKnownUnavailable: env.videoSizeResolution.measurement?
-                .unavailableIDs.contains(record.localIdentifier) ?? false,
-            isBeingMeasured: env.videoSizeResolution.isMeasuring,
-            isSelected: env.videoSelection.isSelected(record.localIdentifier),
-            store: env.thumbnails,
-            onPreview: { previewedVideo = record },
-            toggle: { env.mutateVideoSelection { $0.toggle(record.localIdentifier) } }
-        )
+        let isSelected = env.videoSelection.isSelected(record.localIdentifier)
+        return HStack(spacing: Theme.Spacing.md) {
+            Button {
+                previewedVideo = record
+            } label: {
+                HStack(spacing: Theme.Spacing.md) {
+                    thumbnail(for: record)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(VideosPresentation.durationText(record.duration))
+                            .font(.subheadline.weight(.semibold))
+                            .monospacedDigit()
+                        Text(metadataLine(for: record))
+                            .font(.caption)
+                            .foregroundStyle(Theme.Palette.secondaryLabel)
+                            .lineLimit(1)
+                        if let bytes = record.sizeInBytes {
+                            Text(ByteFormat.string(bytes))
+                                .font(.subheadline.weight(.medium))
+                                .monospacedDigit()
+                        } else {
+                            Text("Size unavailable")
+                                .font(.subheadline)
+                                .foregroundStyle(NettoColor.warning)
+                        }
+                    }
+                }
+            }
+            .nettoPress()
+            .accessibilityLabel(previewAccessibilityLabel(for: record))
+            .accessibilityHint("Opens the video preview")
+
+            Spacer(minLength: Theme.Spacing.sm)
+
+            Button {
+                env.mutateVideoSelection { $0.toggle(record.localIdentifier) }
+            } label: {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    // ~20 pt glyph with no frame — the toggle needs the 44 pt minimum
+                    // target; the glyph stays optically identical, centred by the frame.
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+                    .foregroundStyle(
+                        isSelected ? NettoColor.brandIndicator : Theme.Palette.secondaryLabel
+                    )
+            }
+            .nettoPress()
+            .nettoAnimate(.selection, value: isSelected)
+            .accessibilityLabel("Select video")
+            .accessibilityValue(isSelected ? "Selected" : "Not selected")
+            .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        }
+        .contentShape(Rectangle())
+    }
+
+    /// Poster frame through the shared thumbnail store (PhotoKit delivers a still for videos;
+    /// a cloud-only video degrades to the standard placeholder) with a play affordance on top.
+    private func thumbnail(for record: PhotoAssetRecord) -> some View {
+        ZStack {
+            PhotoThumbnailView(
+                assetID: record.localIdentifier,
+                pointSize: 72,
+                store: env.thumbnails
+            )
+            .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous))
+
+            RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [.clear, .black.opacity(0.45)],
+                        startPoint: .center,
+                        endPoint: .bottom
+                    )
+                )
+
+            Image(systemName: "play.fill")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(.ultraThinMaterial, in: Circle())
+                .environment(\.colorScheme, .dark)
+                .shadow(radius: 3, y: 1)
+        }
+        .frame(width: 72, height: 72)
+        .accessibilityHidden(true)
+    }
+
+    private func metadataLine(for record: PhotoAssetRecord) -> String {
+        let resolution = "\(record.pixelWidth)×\(record.pixelHeight)"
+        guard let date = record.creationDate else { return resolution }
+        return "\(resolution) · \(date.formatted(date: .abbreviated, time: .omitted))"
+    }
+
+    private func previewAccessibilityLabel(for record: PhotoAssetRecord) -> String {
+        let size = record.sizeInBytes.map(ByteFormat.string) ?? "size unavailable"
+        return "Video, \(VideosPresentation.durationText(record.duration)), \(size)"
     }
 
     private var selectAllButton: some View {

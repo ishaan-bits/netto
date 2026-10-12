@@ -135,7 +135,7 @@ enum VideosPresentation {
             return "No videos found"
         case .measuringVideos(let measured, let total, let unavailable):
             if case .idle = resolution {
-                return "\(total) \(total == 1 ? "video" : "videos") · sizes not measured yet"
+                return "\(total) videos · sizes not measured yet"
             }
             var text = "Measuring sizes · \(measured) of \(total) videos…"
             if unavailable > 0 {
@@ -191,14 +191,12 @@ enum VideosPresentation {
     /// measurement figures derived from actual data. Illustrative shape:
     ///
     ///     7,061 videos total
-    ///     7,020 sizes unavailable — not measured locally
-    ///     41 videos sorted by known size
+    ///     7,061 sizes unavailable — stored in iCloud or unavailable locally
+    ///     12 videos sorted by known size
     ///
-    /// - `total` is the enumerated inventory — it never waits on measurement, and never
-    ///   depends on it.
-    /// - `unavailable` counts sizes the measurement could not resolve; never folded into
-    ///   measured, never zero, never given a cause this screen cannot evidence (whether a
-    ///   video lives in iCloud is not something the inventory claims).
+    /// - `total` is the enumerated inventory — it never waits on measurement.
+    /// - `unavailable` counts attempted-and-unmeasurable sizes (stored in iCloud, unreadable);
+    ///   never folded into measured, never zero.
     /// - `measured` counts videos actually sorted by a known size; the line is omitted
     ///   while nothing has been measured yet (an idle run says so instead, and an
     ///   all-unavailable library names only its unavailable figure).
@@ -206,18 +204,12 @@ enum VideosPresentation {
         guard total > 0 else { return [] }
         var lines = ["\(total) videos total"]
         if unavailable > 0 {
-            lines.append("\(unavailable) sizes unavailable — could not be measured locally")
+            lines.append("\(unavailable) sizes unavailable — stored in iCloud or unavailable locally")
         }
         if measured > 0 {
             lines.append("\(measured) videos sorted by known size")
         } else if unavailable == 0 {
             lines.append("Sizes not measured yet")
-        }
-        // The remainder is what the running (or interrupted) pass still has to attempt —
-        // named so the counters always add up instead of leaving rows silently labelled.
-        let stillToMeasure = total - measured - unavailable
-        if stillToMeasure > 0 {
-            lines.append("\(stillToMeasure) still to measure")
         }
         return lines
     }

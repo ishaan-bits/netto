@@ -80,7 +80,7 @@ struct CleanupSectionCard<Destination: View>: View {
                         .tint(NettoColor.brandIndicator)
                 }
             }
-        case .unknownCount(let text), .empty(let text), .paused(let text):
+        case .unknownCount(let text), .empty(let text), .queued(let text), .paused(let text):
             Text(text)
                 .font(NettoType.caption)
                 .foregroundStyle(NettoColor.textSecondary)
@@ -157,7 +157,7 @@ struct CleanupDestinationRow<Destination: View>: View {
                 .foregroundStyle(NettoColor.warning)
                 .lineLimit(2)
         case .measurement(let text), .progress(let text, _),
-             .unknownCount(let text), .empty(let text), .paused(let text):
+             .unknownCount(let text), .empty(let text), .queued(let text), .paused(let text):
             Text(text)
                 .font(NettoType.caption)
                 .foregroundStyle(NettoColor.textSecondary)

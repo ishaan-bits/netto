@@ -214,9 +214,13 @@ struct DashboardSectionsTests {
             catalog: .notStarted,
             analysis: .notStarted,
             blur: .notStarted,
+            pendingBehindOtherPass: false,
             resolution: .idle,
             videoSignature: "",
             videoRecords: [],
+            recordedVideos: [],
+            downloadedVideos: [],
+            otherVideoCount: 0,
             contactScan: .notStarted
         )
         #expect(status == .unavailable(reason: "Allow Contacts access to continue."))
@@ -232,9 +236,13 @@ struct DashboardSectionsTests {
             catalog: .notStarted,
             analysis: .notStarted,
             blur: .notStarted,
+            pendingBehindOtherPass: false,
             resolution: .idle,
             videoSignature: "",
             videoRecords: [],
+            recordedVideos: [],
+            downloadedVideos: [],
+            otherVideoCount: 0,
             contactScan: .notStarted
         )
         #expect(status == .unknownCount("Not analyzed yet"))
@@ -248,167 +256,15 @@ struct DashboardSectionsTests {
             catalog: .notStarted,
             analysis: .notStarted,
             blur: .notStarted,
+            pendingBehindOtherPass: false,
             resolution: .idle,
             videoSignature: "",
             videoRecords: [],
+            recordedVideos: [],
+            downloadedVideos: [],
+            otherVideoCount: 0,
             contactScan: .notStarted
         )
         #expect(status == .unavailable(reason: "Allow Photos access to continue."))
-    }
-}
-
-// MARK: - Unified Duplicate & Similar Photos destination (M14)
-
-/// One destination for both group kinds: the hub shows exactly one row for the one
-/// analysis pass, its status counts both kinds, and the in-screen filter narrows one
-/// shared result set — it never re-runs, re-selects, or fabricates groups.
-struct ImageCleanupUnifiedDestinationTests {
-    private static let exact = PhotoSimilarityGroup(
-        kind: .exactDuplicates,
-        memberAssetIDs: ["a", "b"],
-        evidence: .exactContent(fingerprint: "f", byteLength: 1),
-        recommendedBestAssetID: "a",
-        memberScores: [:]
-    )
-    private static let similar = PhotoSimilarityGroup(
-        kind: .nearDuplicates,
-        memberAssetIDs: ["c", "d", "e"],
-        evidence: .visualSimilarity(minDistance: 0.05, maxDistance: 0.1, threshold: 0.15),
-        recommendedBestAssetID: "c",
-        memberScores: [:]
-    )
-    private static let mixedResult = PhotoAnalysisResult(
-        exactGroups: [exact],
-        similarGroups: [similar],
-        unavailableAssets: [],
-        descriptorKind: .cpuGrid,
-        visionAvailable: false,
-        similarityThreshold: 0.15,
-        totalRecordCount: 5,
-        candidateBucketCount: 1,
-        candidatePairCount: 4
-    )
-
-    @Test func theHubHasExactlyOneDuplicateAndSimilarDestination() {
-        #expect(ImageCleanupDestination.allCases == [
-            .duplicateSimilarPhotos, .blurryImages, .oldScreenshots
-        ])
-        #expect(ImageCleanupDestination.duplicateSimilarPhotos.title == "Duplicate & Similar Photos")
-        #expect(ImageCleanupDestination.duplicateSimilarPhotos.accessibilityIdentifier
-            == "duplicateSimilarPhotosRow")
-    }
-
-    @Test func theMergedRowStatusCountsBothGroupKinds() {
-        let status = ImageCleanupDestination.status(
-            for: .duplicateSimilarPhotos,
-            permission: .authorized,
-            catalog: .notStarted,
-            analysis: .completed(Self.mixedResult),
-            blur: .notStarted
-        )
-        // 1 exact + 1 similar group — one count over the shared result, never a
-        // per-source or per-kind fabrication.
-        #expect(status == .count(2))
-    }
-
-    @Test func theMergedRowNeverFabricatesBeforeTheAnalysisCompletes() {
-        let idle = ImageCleanupDestination.status(
-            for: .duplicateSimilarPhotos,
-            permission: .authorized,
-            catalog: .notStarted,
-            analysis: .notStarted,
-            blur: .notStarted
-        )
-        #expect(idle == .unknownCount("Not analyzed yet"))
-    }
-
-    @Test func theFilterNarrowsOneSharedResultSet() {
-        #expect(SimilarPhotosGroupFilter.all.showsExact && SimilarPhotosGroupFilter.all.showsSimilar)
-        #expect(SimilarPhotosGroupFilter.exact.showsExact && !SimilarPhotosGroupFilter.exact.showsSimilar)
-        #expect(!SimilarPhotosGroupFilter.similar.showsExact && SimilarPhotosGroupFilter.similar.showsSimilar)
-        // Every filter keeps the same underlying result: it is presentation only.
-        #expect(SimilarPhotosGroupFilter.allCases.count == 3)
-    }
-
-    @Test func theHubIntroDescribesTheUnifiedDestination() {
-        let intro = ImageCleanupDestination.hubIntro(
-            permission: .authorized,
-            catalog: .notStarted,
-            analysis: .completed(Self.mixedResult),
-            blur: .notStarted
-        )
-        #expect(intro.contains("Duplicate & Similar Photos lists 1 exact group and 1 visually alike group"))
-        // The old two-row split is gone — the intro never names separate destinations.
-        #expect(!intro.contains("Duplicate Images lists"))
-        #expect(!intro.contains("Similar Images lists"))
-    }
-}
-
-// MARK: - Unified video inventory status (M14)
-
-/// The Video Cleanup card reports the unified inventory — one count over every video the
-/// catalog holds, never a Recorded/Downloaded split and never a source figure.
-struct VideoInventoryUnifiedTests {
-    @Test func theDashboardCardCountsTheUnifiedInventoryRegardlessOfSource() {
-        // One local video and one iTunes-synced import: the old split counted them on
-        // separate rows; the unified card counts the inventory as one.
-        let records = [
-            record(id: "v1", mediaType: .video),
-            record(id: "v2", mediaType: .video, sourceType: [.library, .itunesSynced]),
-        ]
-        let status = DashboardCleanupPresentation.status(
-            for: .videoCleanup,
-            permission: .authorized,
-            contactsPermission: .notDetermined,
-            catalog: .completed(catalog(records)),
-            analysis: .notStarted,
-            blur: .notStarted,
-            resolution: .settled(VideoSizeResolution.Measurement(
-                datasetSignature: "sig",
-                bytes: ["v1": 100, "v2": 200],
-                total: 2
-            )),
-            videoSignature: "sig",
-            videoRecords: VideoDataset.sorted(
-                VideoDataset.resolved(VideoDataset.records(in: catalog(records)), with: ["v1": 100, "v2": 200])
-            ),
-            contactScan: .notStarted
-        )
-        #expect(status == .count(2))
-    }
-
-    @Test func theTotalNeverDependsOnMeasurement() {
-        // Nothing measured yet: the card still reports the enumerated inventory — never a
-        // fabricated zero, never waiting on sizes.
-        let records = [record(id: "v1", mediaType: .video)]
-        let status = DashboardCleanupPresentation.status(
-            for: .videoCleanup,
-            permission: .authorized,
-            contactsPermission: .notDetermined,
-            catalog: .completed(catalog(records)),
-            analysis: .notStarted,
-            blur: .notStarted,
-            resolution: .idle,
-            videoSignature: "sig",
-            videoRecords: records,
-            contactScan: .notStarted
-        )
-        #expect(status == .measurement("1 video · sizes not measured yet"))
-    }
-
-    @Test func inventorySummaryTotalsAreHonestAndMeasurementIndependent() {
-        let empty = VideosPresentation.inventorySummary(total: 0, measured: 0, unavailable: 0)
-        #expect(empty.isEmpty)
-
-        let unknownOnly = VideosPresentation.inventorySummary(total: 7061, measured: 0, unavailable: 0)
-        #expect(unknownOnly.first == "7061 videos total")
-        #expect(unknownOnly.contains("Sizes not measured yet"))
-
-        let mixed = VideosPresentation.inventorySummary(total: 41, measured: 12, unavailable: 29)
-        #expect(mixed.first == "41 videos total")
-        // Unknown sizes are named as unmeasurable locally — never given a cause this
-        // screen cannot evidence.
-        #expect(mixed.contains("29 sizes unavailable — could not be measured locally"))
-        #expect(mixed.contains("12 videos sorted by known size"))
     }
 }

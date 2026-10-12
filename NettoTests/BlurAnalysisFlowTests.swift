@@ -602,361 +602,258 @@ struct BlurAnalysisFlowTests {
         #expect(env.selection.selectedIDs.isEmpty)
     }
 
-    // MARK: M14 — concurrent, independent photo analysis (no queue, no cancel-and-switch)
-
-    /// The recording regression (M13B → M14): with the sharpness pass running alone and the
-    /// completed catalog standing, a Similar Photos request starts **immediately over that
-    /// catalog** — concurrently with the running pass. It never queues behind the pass,
-    /// never cancels it, and never re-enumerates the library.
-    @Test func similarityStartsConcurrentlyWhileTheSharpnessPassIsRunning() {
+    /// Similarity analysis's Stage A rebuilds the catalog, and a running sharpness pass
+    /// owns a snapshot of the records it was started with — the request must not replace
+    /// that catalog or wipe state on the way out. M10: the request is queued (visible,
+    /// auto-started later), never silently dropped.
+    @Test func similarityAnalysisIsQueuedWhileTheSharpnessPassIsRunning() {
         let (env, _, _) = makeBlurEnv()
+        let analysisBefore = env.analysisState
+        let catalogBefore = env.catalogState
+        env.selection.admitLibraryAssets(["sharp-01"])
+        env.selection.setSelected(true, forAsset: "sharp-01")
         let running = BlurAnalysisProgress(completedUnits: 1, totalUnits: 4)
         env.blurAnalysisState = .running(running)
-        let catalogBefore = env.catalogState
 
         env.startSimilarityAnalysis()
 
-        // Admitted immediately: the pass is running — not queued, not failed, not dropped.
-        #expect(env.analysisState.isRunning)
-        // The sharpness pass is untouched — concurrent, never cancelled by the start.
-        #expect(env.blurAnalysisState == .running(running))
-        // The standing catalog is adopted as-is: the same snapshot the pass stands on.
+        // No run started, no failure substituted — the call never got past the queue.
+        #expect(env.analysisState == analysisBefore)
+        // The queue acknowledges the request instead of dropping it.
+        #expect(env.pendingAnalysisRequest == .similarity)
+        // The catalog the in-flight sharpness pass snapshotted is still standing.
         #expect(env.catalogState == catalogBefore)
+        // No side effects leaked out ahead of the queue: the shared selection survives.
+        #expect(env.selection.selectedIDs == ["sharp-01"])
+        // And the sharpness pass itself was left alone.
+        #expect(env.blurAnalysisState == .running(running))
     }
 
-    /// The concurrent similarity pass over the standing catalog actually runs Stage B and
-    /// lands a real result — admission without a queue, verified to completion.
-    @Test func theConcurrentSimilarityRunOverTheStandingCatalogCompletes() async {
+    /// The admission rule is symmetric (see `startBlurAnalysis`): while a similarity run
+    /// owns the analysis machinery, a sharpness pass is queued — never started over the
+    /// in-flight run, never silently dropped.
+    @Test func sharpnessPassIsQueuedWhileSimilarityIsRunning() {
+        let (env, _, _) = makeBlurEnv()
+        let catalogBefore = env.catalogState
+        let analysisState = PhotoAnalysisProgress(stage: .preparing, completedUnits: 3, totalUnits: 10)
+        env.analysisState = .running(analysisState)
+
+        env.startBlurAnalysis()
+
+        // No run started, no failure substituted, nothing superseded — the queue holds it.
+        #expect(env.blurAnalysisState == .notStarted)
+        #expect(env.pendingAnalysisRequest == .blur)
+        #expect(env.analysisState == .running(analysisState))
+        #expect(env.catalogState == catalogBefore)
+        #expect(env.deletionState == .noSelection)
+    }
+
+    // MARK: - Analysis coordination (M10)
+
+    /// The queue's core contract: a request that could not start is acknowledged, and it
+    /// starts itself exactly when the running pass releases the pipeline.
+    @Test func aQueuedSimilarityRunStartsAutomaticallyWhenTheSharpnessPassCompletes() {
         let (env, _, _) = makeBlurEnv()
         env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
-
         env.startSimilarityAnalysis()
-        await waitForSimilaritySettled(env)
+        #expect(env.pendingAnalysisRequest == .similarity)
+        #expect(env.analysisState == .completed(similarPhotosFixtureResult)) // untouched
 
-        guard case .completed = env.analysisState else {
-            Issue.record("expected the concurrent similarity run to complete, got \(env.analysisState)")
-            return
-        }
-        // The sharpness pass was never cancelled by the concurrent start.
-        #expect(env.blurAnalysisState.isRunning)
+        // The sharpness pass completes: the terminal flip drives the queue.
+        env.blurAnalysisState = .completed(.empty)
+
+        #expect(env.pendingAnalysisRequest == nil)
+        #expect(env.analysisState.isRunning)
     }
 
-    /// Adopting the standing catalog never re-enumerates the library: the reader factory is
-    /// not called again — the concurrent pass analyzes the same snapshot, one read total.
-    @Test func concurrentSimilarityAdoptionNeverReEnumeratesTheLibrary() {
-        let probe = BlurProbe()
-        let store = InMemoryScanSnapshotStore()
-        let env = AppEnvironment(
-            storageProvider: FakeStorage(),
-            photoPermission: FakePermissionService(.authorized),
-            makePhotoLibrary: { FakeLibrary(records: blurFixtureRecords) },
-            thumbnailLoader: BlurEngineThumbnails(probe: probe, fallbackImage: blurFixtureSharpChecker),
-            sizeProvider: FakeSizeProvider(sizes: [:]),
-            deletionService: RecordingDeletionService(outcome: .succeeded(DeletionSuccess(
-                plannedCount: 1,
-                verifiedRemovedCount: 1,
-                remainingIDs: []
-            ))),
-            scanSnapshotStore: store,
-            sessionToken: "session-1"
-        )
-        env.photoPermissionState = .authorized
-        env.catalogState = .completed(CatalogScanResult(
-            records: blurFixtureRecords,
-            libraryAssetCount: blurFixtureRecords.count,
-            accessLevel: .authorized
-        ))
+    /// The symmetric direction: a queued sharpness pass starts when similarity finishes.
+    @Test func aQueuedSharpnessPassStartsAutomaticallyWhenSimilarityCompletes() {
+        let (env, _, _) = makeBlurEnv()
+        env.analysisState = .running(PhotoAnalysisProgress(stage: .comparing, completedUnits: 1, totalUnits: 4))
+        env.startBlurAnalysis()
+        #expect(env.pendingAnalysisRequest == .blur)
+        #expect(env.blurAnalysisState == .notStarted) // untouched
+
+        // The similarity pass completes: the terminal flip drives the queue.
         env.analysisState = .completed(similarPhotosFixtureResult)
-        env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
 
-        env.startSimilarityAnalysis()
-
-        // Adopted the standing catalog — running without any new enumeration (the factory
-        // above would have to be called again for a second read).
-        #expect(env.analysisState.isRunning)
-        #expect(env.catalogState == .completed(CatalogScanResult(
-            records: blurFixtureRecords,
-            libraryAssetCount: blurFixtureRecords.count,
-            accessLevel: .authorized
-        )))
-    }
-
-    /// The admission rule is symmetric: while a similarity run is mid-enumeration (no
-    /// completed catalog yet), a sharpness request is admitted **immediately** into a
-    /// bounded wait for that read — it never queues, never fails the tap away, and starts
-    /// the moment the catalog stands.
-    @Test func sharpnessPassStartsOnceTheConcurrentlyReadCatalogLands() async {
-        let (env, _, _) = makeBlurEnv()
-        // The similarity pass is mid Stage A: running, with no completed catalog standing.
-        env.catalogState = .notStarted
-        env.analysisState = .notStarted
-        env.startSimilarityAnalysis()
-        #expect(env.analysisState.isRunning)
-        if case .completed = env.catalogState {
-            Issue.record("catalog should still be mid-read, not completed")
-        }
-
-        env.startBlurAnalysis()
-
-        // Admitted into the bounded wait — running, not queued, not failed.
+        #expect(env.pendingAnalysisRequest == nil)
         #expect(env.blurAnalysisState.isRunning)
-        // The similarity pass keeps its pipeline — the wait never cancels it.
-        #expect(env.analysisState.isRunning)
-
-        // The read lands: the waiting pass starts over that catalog and both settle.
-        await waitForBlurSettled(env)
-        await waitForSimilaritySettled(env)
-        guard case .completed = env.blurAnalysisState else {
-            Issue.record("expected the waiting sharpness pass to complete over the landed catalog, got \(env.blurAnalysisState)")
-            return
-        }
-        guard case .completed = env.analysisState else {
-            Issue.record("expected the similarity pass to complete, got \(env.analysisState)")
-            return
-        }
-        guard case .completed = env.catalogState else {
-            Issue.record("expected the shared catalog to stand, got \(env.catalogState)")
-            return
-        }
     }
 
-    /// With the completed catalog already standing and a similarity pass running, a
-    /// sharpness request starts immediately over that snapshot — concurrent, never queued.
-    @Test func sharpnessPassStartsConcurrentlyWhileSimilarityIsRunning() {
-        let (env, _, _) = makeBlurEnv()
-        let similarityRunning = PhotoAnalysisProgress(stage: .comparing, completedUnits: 1, totalUnits: 4)
-        env.analysisState = .running(similarityRunning)
-        let catalogBefore = env.catalogState
-
-        env.startBlurAnalysis()
-
-        #expect(env.blurAnalysisState.isRunning)
-        // The similarity pass is untouched.
-        #expect(env.analysisState == .running(similarityRunning))
-        // Adopted the standing catalog — no second enumeration, no failed substitution.
-        #expect(env.catalogState == catalogBefore)
-    }
-
-    /// THE unified-entry recording scenario: `startImageAnalysis()` with exactly one
-    /// pipeline running (sharpness alone) starts the idle similarity pass **concurrently**
-    /// over the running pass's catalog — it never queues the request (M10's behavior) and
-    /// never cancels the pass still doing work.
-    @Test func startImageAnalysisWithExactlyOnePipelineRunningStartsTheIdleOneConcurrently() {
-        let (env, _, _) = makeBlurEnv()
-        let running = BlurAnalysisProgress(completedUnits: 1, totalUnits: 4)
-        env.blurAnalysisState = .running(running)
-
-        env.startImageAnalysis()
-
-        // The idle pipeline starts immediately — concurrently, not queued.
-        #expect(env.analysisState.isRunning)
-        // The running pipeline is never cancelled or superseded.
-        #expect(env.blurAnalysisState == .running(running))
-    }
-
-    /// Symmetric unified-entry scenario: with similarity alone running (mid-enumeration),
-    /// the Analyze tap admits the sharpness pass into the bounded wait — both run to
-    /// completion, neither is cancelled by the other.
-    @Test func startImageAnalysisWhileSimilarityIsMidEnumerationAdmitsBlurConcurrently() async {
-        let (env, _, _) = makeBlurEnv()
-        env.catalogState = .notStarted
-        env.analysisState = .notStarted
-        env.startImageAnalysis()
-
-        // Both pipelines are running: similarity over the shared read, blur boundedly
-        // waiting for it — concurrent admission, no queue, no cancel-and-switch.
-        #expect(env.analysisState.isRunning)
-        #expect(env.blurAnalysisState.isRunning)
-
-        await waitForBlurSettled(env)
-        await waitForSimilaritySettled(env)
-        guard case .completed = env.blurAnalysisState else {
-            Issue.record("expected the sharpness pass to complete, got \(env.blurAnalysisState)")
-            return
-        }
-        guard case .completed = env.analysisState else {
-            Issue.record("expected the similarity pass to complete, got \(env.analysisState)")
-            return
-        }
-    }
-
-    /// Cancelling the sharpness pass is its own business: the concurrently admitted
-    /// similarity pass keeps running and completes — the cancel path is scoped per kind.
-    @Test func cancellingTheSharpnessPassLeavesTheConcurrentSimilarityPassRunning() async {
+    /// Repeated taps while the pass is queued are no-ops — the queue holds one slot and
+    /// the same request twice is the same request, never a second job.
+    @Test func duplicateTapsDoNotDuplicateTheQueueOrTheJob() {
         let (env, _, _) = makeBlurEnv()
         env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
         env.startSimilarityAnalysis()
+        env.startSimilarityAnalysis()
+        env.startSimilarityAnalysis()
+        #expect(env.pendingAnalysisRequest == .similarity)
+
+        env.blurAnalysisState = .completed(.empty)
         #expect(env.analysisState.isRunning)
+        // The queue is spent; nothing else is waiting to start behind it.
+        #expect(env.pendingAnalysisRequest == nil)
+    }
+
+    /// A different request replaces the slot: the latest user intent is what runs next.
+    @Test func aDifferentQueuedRequestReplacesThePreviousOne() {
+        let (env, _, _) = makeBlurEnv()
+        // Sequence: similarity running → queue blur → similarity cancelled (terminal) →
+        // blur starts → queue similarity. The slot always holds the latest intent.
+        env.analysisState = .running(PhotoAnalysisProgress(stage: .comparing, completedUnits: 1, totalUnits: 4))
+        env.startBlurAnalysis()
+        #expect(env.pendingAnalysisRequest == .blur)
+        env.analysisState = .cancelled
+        #expect(env.blurAnalysisState.isRunning)
+        // While the just-started blur runs, the user asks for similarity again.
+        env.startSimilarityAnalysis()
+        #expect(env.pendingAnalysisRequest == .similarity)
+    }
+
+    /// Cancelling the running pass is a terminal transition: the queued pass starts
+    /// through the normal generation-guarded cancel path.
+    @Test func cancellingTheRunningPassStartsTheQueuedPass() {
+        let (env, _, _) = makeBlurEnv()
+        env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
+        env.startSimilarityAnalysis()
+        #expect(env.pendingAnalysisRequest == .similarity)
 
         env.cancelBlurAnalysis()
 
         #expect(env.blurAnalysisState == .cancelled)
+        #expect(env.pendingAnalysisRequest == nil)
         #expect(env.analysisState.isRunning)
-        await waitForSimilaritySettled(env)
-        guard case .completed = env.analysisState else {
-            Issue.record("expected the concurrent similarity pass to complete after the blur cancel, got \(env.analysisState)")
-            return
-        }
     }
 
-    /// The symmetric cancel: cancelling the similarity pass leaves the concurrently
-    /// running sharpness pass untouched.
-    @Test func cancellingTheSimilarityPassLeavesTheConcurrentSharpnessPassRunning() {
-        let (env, _, _) = makeBlurEnv()
-        env.analysisState = .running(PhotoAnalysisProgress(stage: .comparing, completedUnits: 1, totalUnits: 4))
-        env.startBlurAnalysis()
-        #expect(env.blurAnalysisState.isRunning)
-
-        env.cancelSimilarityAnalysis()
-
-        #expect(env.analysisState == .cancelled)
-        #expect(env.blurAnalysisState.isRunning)
-    }
-
-    /// Failing one concurrent pass never touches the other: the surfaces are independent.
-    @Test func failingOneConcurrentPassLeavesTheOtherRunning() {
+    /// Failing the running pass releases the queue the same way completion does.
+    @Test func failingTheRunningPassStartsTheQueuedPass() {
         let (env, _, _) = makeBlurEnv()
         env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
         env.startSimilarityAnalysis()
-        #expect(env.analysisState.isRunning)
 
         env.blurAnalysisState = .failed(.cancelled)
 
+        #expect(env.pendingAnalysisRequest == nil)
         #expect(env.analysisState.isRunning)
     }
 
-    /// Repeated Analyze taps while both pipelines already run are idempotent — the session
-    /// already satisfies the request; nothing restarts or is double-admitted.
-    @Test func repeatTapsWhileBothPipelinesRunAreIdempotent() {
+    /// "Remove from Queue" clears the slot and never touches the running pass.
+    @Test func removingTheQueueNeverTouchesTheRunningPass() {
+        let (env, _, _) = makeBlurEnv()
+        let running = BlurAnalysisProgress(completedUnits: 2, totalUnits: 4)
+        env.blurAnalysisState = .running(running)
+        env.startSimilarityAnalysis()
+
+        env.cancelPendingAnalysis()
+
+        #expect(env.pendingAnalysisRequest == nil)
+        #expect(env.blurAnalysisState == .running(running))
+        #expect(env.analysisState == .completed(similarPhotosFixtureResult))
+    }
+
+    /// Explicit cancel-and-switch: the running pass is cancelled and the queued one
+    /// starts immediately — exactly once, with no double-drive from the cancel's own
+    /// terminal flip.
+    @Test func startNowCancelsTheRunningPassAndStartsTheQueuedOneImmediately() {
         let (env, _, _) = makeBlurEnv()
         env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
         env.startSimilarityAnalysis()
-        let similarityState = env.analysisState
-        let blurState = env.blurAnalysisState
+        #expect(env.pendingAnalysisRequest == .similarity)
 
-        env.startSimilarityAnalysis()
-        env.startBlurAnalysis()
-        env.startImageAnalysis()
+        env.startPendingAnalysisNow()
 
-        #expect(env.analysisState == similarityState)
-        #expect(env.blurAnalysisState == blurState)
+        #expect(env.blurAnalysisState == .cancelled)
+        #expect(env.pendingAnalysisRequest == nil)
+        #expect(env.analysisState.isRunning)
     }
 
-    /// A same-kind repeat start while the pass is running is a guarded no-op — never a
-    /// second job, never a state reset underneath the in-flight run.
-    @Test func repeatedStartsOfTheSamePassAreGuardedNoOps() {
+    /// A paused pass still owns the pipeline (it resumes itself); handing the slot over
+    /// now would run two passes on foreground. The queue waits.
+    @Test func aPausedPassDoesNotHandThePipelineToTheQueuedPass() {
         let (env, _, _) = makeBlurEnv()
         env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
         env.startSimilarityAnalysis()
-        let running = env.analysisState
+        #expect(env.pendingAnalysisRequest == .similarity)
 
-        env.startSimilarityAnalysis()
-        env.startSimilarityAnalysis()
+        // Pause: running → paused is a non-terminal release for coordination purposes.
+        env.blurAnalysisState = .paused(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
 
-        #expect(env.analysisState == running)
-        #expect(env.blurAnalysisState.isRunning)
+        #expect(env.pendingAnalysisRequest == .similarity)
+        #expect(env.analysisState == .completed(similarPhotosFixtureResult))
     }
 
-    /// The bounded wait fails honestly when the catalog never lands: cancelling the
-    /// similarity pass mid-read leaves no catalog coming, and the waiting sharpness pass
-    /// reports "Your library scan has not finished" rather than hanging or queueing.
-    @Test func theWaitingSharpnessPassFailsHonestlyWhenTheCatalogNeverLands() async {
+    /// A deletion in flight keeps the queue; the flip out of `.deleting` starts it — the
+    /// mutation's dataset churn never runs underneath a freshly started pass.
+    @Test func aDeletionKeepsTheQueueAndDrivesItWhenTheMutationFinishes() {
         let (env, _, _) = makeBlurEnv()
-        env.catalogState = .notStarted
-        env.analysisState = .notStarted
+        env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
         env.startSimilarityAnalysis()
-        env.startBlurAnalysis()
-        #expect(env.blurAnalysisState.isRunning)
+        #expect(env.pendingAnalysisRequest == .similarity)
 
-        // The only read that could produce the catalog is cancelled: no standing catalog
-        // is coming.
-        env.cancelSimilarityAnalysis()
-
-        // The bounded wait observes the honest terminal within its poll interval.
-        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while env.blurAnalysisState.isRunning, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        #expect(env.blurAnalysisState == .failed(
-            .underlying("Your library scan has not finished. Build your catalog, then try again.")
-        ))
-        #expect(env.analysisState == .cancelled)
-    }
-
-    /// Deletion reconciliation survives concurrent admission (M13 → M14): starting the
-    /// second pipeline over the running pass's catalog never restarts or supersedes the
-    /// running pass — its in-flight stage and progress are untouched.
-    @Test func concurrentAdmissionNeverCancelsOrRestartsTheOtherPass() {
-        let (env, _, _) = makeBlurEnv()
-        // Similarity mid-run (comparing, mid-progress); the sharpness pass is admitted
-        // concurrently over its catalog.
-        let midRun = PhotoAnalysisProgress(stage: .comparing, completedUnits: 2, totalUnits: 4)
-        env.analysisState = .running(midRun)
-
-        env.startBlurAnalysis()
-        #expect(env.blurAnalysisState.isRunning)
-
-        // The similarity pass keeps its exact stage and progress: a restart would have
-        // flipped it back to `preparing`, a cancel would have flipped it to `.cancelled`.
-        #expect(env.analysisState == .running(midRun))
-    }
-
-    /// M13 → M14: a confirmed deletion that lands while BOTH passes run is recorded and
-    /// reconciled out of *both* results when they land — and admitting the second pass
-    /// concurrently (which sets up its own run while the first is mid-flight) must never
-    /// clear the first pass's recorded removals. The deleted photo therefore appears in
-    /// neither completed result, and no pass is cancelled or restarted by the mutation.
-    @Test func aDeletionDuringConcurrentPassesReconcilesBothResults() async {
-        // Slow thumbnails so both real passes are still in flight when the deletion lands.
-        let (env, _, _) = makeBlurEnv(thumbnailDelayNanos: 250_000_000)
-        env.startBlurAnalysis()
-        #expect(env.blurAnalysisState.isRunning)
-        // Concurrent admission (M14): the similarity pass adopts the standing catalog and
-        // starts over the same snapshot while the sharpness pass runs.
-        env.startSimilarityAnalysis()
-        #expect(env.analysisState.isRunning)
-
-        // Delete blur-01 (a photo both passes will report) through the real pipeline.
-        env.mutateSelection {
-            $0.admitLibraryAssets(["blur-01"])
-            $0.setSelected(true, forAsset: "blur-01")
-        }
-        env.prepareDeletionPlan()
-        await waitForPlanReady(env)
-        guard case .readyForReview = env.deletionState else {
-            Issue.record("expected readyForReview while both passes run, got \(env.deletionState)")
-            return
-        }
-        env.beginConfirmation()
-        await env.confirmDeletion()
-        guard case .succeeded = env.deletionState else {
-            Issue.record("expected succeeded, got \(env.deletionState)")
-            return
-        }
-        // The mutation cancelled neither pass (M13): both are still finishing their work.
-        #expect(env.blurAnalysisState.isRunning)
-        #expect(env.analysisState.isRunning)
-
-        await waitForBlurSettled(env)
-        await waitForSimilaritySettled(env)
-
-        guard case .completed(let blur) = env.blurAnalysisState else {
-            Issue.record("expected the sharpness pass to complete, got \(env.blurAnalysisState)")
-            return
-        }
-        // The deleted photo is reconciled out of the sharpness result — its work for the
-        // surviving photo stands (no full re-run).
-        #expect(blur.candidates.map(\.assetID) == ["blur-02"])
-        #expect(blur.unavailableAssets.allSatisfy { $0.assetID != "blur-01" })
-
-        guard case .completed(let similarity) = env.analysisState else {
-            Issue.record("expected the similarity pass to complete, got \(env.analysisState)")
-            return
-        }
-        let grouped = Set(
-            (similarity.exactGroups + similarity.similarGroups).flatMap(\.memberAssetIDs)
+        // The mutation path cancels the running pass while `.deleting` — the queue must
+        // survive that terminal flip and wait for the deletion to leave `.deleting`.
+        let plan = DeletionPlan(
+            schemaVersion: DeletionPlan.currentVersion,
+            items: [],
+            authorization: .authorized,
+            sessionToken: "session-1",
+            analysisSignature: "signature"
         )
-        #expect(!grouped.contains("blur-01"))
+        env.deletionState = .deleting(plan)
+        env.cancelBlurAnalysis()
+        #expect(env.pendingAnalysisRequest == .similarity)
+        #expect(!env.analysisState.isRunning)
+
+        env.deletionState = .noSelection
+
+        #expect(env.pendingAnalysisRequest == nil)
+        #expect(env.analysisState.isRunning)
+    }
+
+    /// The Potentially Blurry phase reports its queue the same way (M10): acknowledged
+    /// as queued, never as notStarted/scanRequired — and never over a running or paused
+    /// pass or a permission gate.
+    @Test func theBlurPhaseReportsQueuedWhileSimilarityOwnsThePipeline() {
+        let completedCatalog = CatalogScanResult(records: blurFixtureRecords, libraryAssetCount: blurFixtureRecords.count, accessLevel: .authorized)
+        let resting: [BlurAnalysisState] = [.notStarted, .cancelled]
+        for blur in resting {
+            #expect(
+                PotentiallyBlurryPresentation.phase(
+                    permission: .authorized,
+                    catalog: .completed(completedCatalog),
+                    blur: blur,
+                    pendingBehindOtherPass: true
+                ) == .queuedBehindSimilarity
+            )
+        }
+        // A running or paused pass wins over the queue flag.
+        #expect(
+            PotentiallyBlurryPresentation.phase(
+                permission: .authorized,
+                catalog: .completed(completedCatalog),
+                blur: .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4)),
+                pendingBehindOtherPass: true
+            ) == .analyzing(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
+        )
+        #expect(
+            PotentiallyBlurryPresentation.phase(
+                permission: .authorized,
+                catalog: .completed(completedCatalog),
+                blur: .paused(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4)),
+                pendingBehindOtherPass: true
+            ) != .queuedBehindSimilarity
+        )
+        // Permission still gates everything.
+        #expect(
+            PotentiallyBlurryPresentation.phase(
+                permission: .denied,
+                catalog: .completed(completedCatalog),
+                blur: .notStarted,
+                pendingBehindOtherPass: true
+            ) == .permissionDenied
+        )
     }
 
     // MARK: Derived-cache correctness (the grid's record cache)
@@ -1075,8 +972,7 @@ private let similarPhotosFixtureResult = PhotoAnalysisResult(
 
 @MainActor
 private func makeBlurEnv(
-    state: BlurAnalysisState = .notStarted,
-    thumbnailDelayNanos: UInt64 = 0
+    state: BlurAnalysisState = .notStarted
 ) -> (env: AppEnvironment, probe: BlurProbe, store: InMemoryScanSnapshotStore) {
     let probe = BlurProbe()
     let store = InMemoryScanSnapshotStore()
@@ -1095,8 +991,7 @@ private func makeBlurEnv(
                 "blur-02": blurFixtureBlurryScene,
                 "flat-01": blurFixtureFlat,
                 "dark-01": blurFixtureDarkNoise,
-            ],
-            delayNanos: thumbnailDelayNanos
+            ]
         ),
         sizeProvider: FakeSizeProvider(sizes: [
             "blur-01": 700,
@@ -1148,20 +1043,6 @@ private func waitForBlurSettled(
     }
     if env.blurAnalysisState.isRunning {
         Issue.record("blur analysis still running after timeout: \(env.blurAnalysisState)")
-    }
-}
-
-@MainActor
-private func waitForSimilaritySettled(
-    _ env: AppEnvironment,
-    timeoutMilliseconds: Int = 5_000
-) async {
-    let deadline = ContinuousClock.now.advanced(by: .milliseconds(timeoutMilliseconds))
-    while env.analysisState.isRunning, ContinuousClock.now < deadline {
-        try? await Task.sleep(for: .milliseconds(10))
-    }
-    if env.analysisState.isRunning {
-        Issue.record("similarity analysis still running after timeout: \(env.analysisState)")
     }
 }
 

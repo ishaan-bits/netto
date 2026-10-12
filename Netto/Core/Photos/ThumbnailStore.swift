@@ -1,18 +1,6 @@
 import CoreGraphics
 import Foundation
 
-/// Which network policy one store read uses (M15-R1). Both policies share one cache key —
-/// the rendition identity is asset + pixel size — so there is still exactly one cache.
-/// Prefetch and the analysis passes use `.localOnly`; only an on-screen request for the
-/// photo the user is currently looking at may use `.allowNetwork`, matching Photo Details'
-/// sanctioned behaviour for an explicitly opened photo.
-enum ThumbnailStoreLoadPolicy: Sendable, Equatable {
-    /// Never touches the network: an iCloud-backed asset fails honestly and quickly.
-    case localOnly
-    /// May materialize an iCloud-backed asset over the network (bounded, cancellable).
-    case allowNetwork
-}
-
 /// Bounded, request-coalescing cache for review thumbnails.
 ///
 /// The review UI shows the same asset repeatedly (strip, detail, revisit), so every load goes
@@ -59,22 +47,8 @@ actor ThumbnailStore {
     }
 
     /// Returns a thumbnail of at most `targetPixelSize` on its longest side, or throws the
-    /// loader's error on first failure and the cached failure afterwards. Local-only.
+    /// loader's error on first failure and the cached failure afterwards.
     func image(for assetID: String, targetPixelSize: Int) async throws -> CGImage {
-        try await image(for: assetID, targetPixelSize: targetPixelSize, policy: .localOnly)
-    }
-
-    /// The same read under an explicit network policy (M15-R1). Both policies share one
-    /// cache key — the rendition identity is asset + pixel size — so a frame fetched with
-    /// the network is a cache hit for later local reads and vice versa; there is no second
-    /// cache. Negative caching is unchanged and policy-independent: only a permanently
-    /// gone asset is remembered as a failure, so a transient miss (iCloud, timeout,
-    /// network) is always retryable.
-    func image(
-        for assetID: String,
-        targetPixelSize: Int,
-        policy: ThumbnailStoreLoadPolicy
-    ) async throws -> CGImage {
         let key = Self.key(assetID: assetID, targetPixelSize: targetPixelSize)
 
         if let cached = entries[key] {
@@ -94,14 +68,7 @@ actor ThumbnailStore {
         }
 
         let loader = self.loader
-        let load = Task {
-            try await Self.fetch(
-                loader: loader,
-                assetID: assetID,
-                targetPixelSize: targetPixelSize,
-                policy: policy
-            )
-        }
+        let load = Task { try await loader.thumbnail(for: assetID, targetPixelSize: targetPixelSize) }
         inFlight[key] = load
 
         do {
@@ -116,35 +83,6 @@ actor ThumbnailStore {
             }
             throw error
         }
-    }
-
-    private static func fetch(
-        loader: any PhotoThumbnailLoading,
-        assetID: String,
-        targetPixelSize: Int,
-        policy: ThumbnailStoreLoadPolicy
-    ) async throws -> CGImage {
-        switch policy {
-        case .localOnly:
-            return try await loader.thumbnail(for: assetID, targetPixelSize: targetPixelSize)
-        case .allowNetwork:
-            return try await loader.thumbnailAllowingNetwork(for: assetID, targetPixelSize: targetPixelSize)
-        }
-    }
-
-    /// The resident frame for a key, if one is already cached — **without** starting a
-    /// load (M15). A hit promotes the entry like a full read; a miss (or a cached failure)
-    /// answers `nil` and loads nothing, so a display path can decide whether it has
-    /// something to show *before* it ever presents a loading state. Never returns a
-    /// negatively-cached failure as an image.
-    func peekCached(assetID: String, targetPixelSize: Int) -> CGImage? {
-        let key = Self.key(assetID: assetID, targetPixelSize: targetPixelSize)
-        guard let cached = entries[key] else { return nil }
-        touch(key)
-        if case .hit(let image) = cached {
-            return image
-        }
-        return nil
     }
 
     /// Deletion invalidation: drops every rendition (all sizes) of the named assets from the

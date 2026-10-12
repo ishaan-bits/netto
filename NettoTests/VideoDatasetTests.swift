@@ -306,7 +306,7 @@ struct VideoDatasetTests {
             datasetSignature: fixtureSignature,
             bytes: ["video-01": 1],
             total: 6,
-            unavailableIDs: ["video-05", "video-06"]
+            unavailableCount: 2
         )
         let phase = VideosPresentation.phase(
             permission: .authorized,
@@ -434,7 +434,7 @@ struct VideoDatasetTests {
                 datasetSignature: fixtureSignature,
                 bytes: ["video-01": 1],
                 total: 6,
-                unavailableIDs: ["video-05", "video-06"]
+                unavailableCount: 2
             )
         )
         let text = VideosPresentation.statusText(
@@ -499,7 +499,7 @@ struct VideoDatasetTests {
         // run says so instead of claiming a progress that is not running.
         #expect(
             VideosPresentation.inventorySummary(total: 6, measured: 0, unavailable: 0)
-                == ["6 videos total", "Sizes not measured yet", "6 still to measure"]
+                == ["6 videos total", "Sizes not measured yet"]
         )
     }
 
@@ -508,7 +508,7 @@ struct VideoDatasetTests {
             VideosPresentation.inventorySummary(total: 6, measured: 4, unavailable: 2)
                 == [
                     "6 videos total",
-                    "2 sizes unavailable — could not be measured locally",
+                    "2 sizes unavailable — stored in iCloud or unavailable locally",
                     "4 videos sorted by known size",
                 ]
         )
@@ -521,7 +521,7 @@ struct VideoDatasetTests {
             VideosPresentation.inventorySummary(total: 7061, measured: 0, unavailable: 7061)
                 == [
                     "7061 videos total",
-                    "7061 sizes unavailable — could not be measured locally",
+                    "7061 sizes unavailable — stored in iCloud or unavailable locally",
                 ]
         )
     }

@@ -25,15 +25,12 @@ enum VideoSizeResolution: Sendable, Equatable {
         let bytes: [String: Int64]
         /// Videos in the dataset when this measurement started.
         let total: Int
-        /// Videos this run *attempted* and could not measure (iCloud-only, unreadable,
-        /// deleted mid-run) — kept as identifiers (M15), not just a count, so the UI can
-        /// distinguish "not measured yet" from "measured and honestly unavailable" per
-        /// row. Never counted as measured — shown as its own figure so a batch of failures
-        /// still advances on-screen progress honestly, instead of leaving the counter
-        /// pinned at zero.
-        var unavailableIDs: Set<String> = []
+        /// Videos this run attempted but could not measure (iCloud-only, unreadable,
+        /// deleted mid-run). Never counted as measured — shown as its own figure so a
+        /// batch of failures still advances on-screen progress honestly, instead of
+        /// leaving the counter pinned at zero.
+        var unavailableCount: Int = 0
 
-        var unavailableCount: Int { unavailableIDs.count }
         var measuredCount: Int { bytes.count }
         /// Videos this run has finished *attempting* — measured plus honestly-unavailable.
         /// Progress that includes both never stalls while real work is happening.

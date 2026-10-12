@@ -10,12 +10,12 @@ is no backend, no cloud processing, and no third-party analytics.
 - **Storage dashboard** — storage and permission status up front, then four primary
   cleanup sections (**Image Cleanup**, **Video Cleanup**, **Duplicate Contacts**,
   **Swipe Cleanup**), each with live scan progress and a status line derived from real
-  app state. Image Cleanup groups the three photo destinations (**Duplicate & Similar
-  Photos**, **blurry**, **old screenshots**) behind one row; Old Screenshots lists
-  screenshots at least **90 days** old (oldest first, unknown dates never counted as
-  old). Video Cleanup opens one immediate, local-first inventory of **every** video —
-  known sizes first (largest to smallest), the size-unavailable group below — never split
-  by source.
+  app state. Image Cleanup groups the four photo destinations (duplicates, similar
+  shots, blurry, old screenshots) behind one row; Old Screenshots lists screenshots at
+  least **90 days** old (oldest first, unknown dates never counted as old). Video
+  Cleanup splits the library into **Recorded**, **Downloaded**, and a reported
+  **other/unknown** count that is never guessed into a source, with the biggest measured
+  videos reviewed first.
 - **Premium scan animation** — the dashboard's scan core is a native SwiftUI visual: a
   luminous green centre, concentric rings, and a slow sweep that runs **only** while a
   scan is actually in flight and settles the moment it is paused, cancelled, failed, or
@@ -24,10 +24,7 @@ is no backend, no cloud processing, and no third-party analytics.
   or completion.
 - **Similar / duplicate photo detection** — exact duplicates and near-duplicate shots
   found through content fingerprints, perceptual hashes, and Vision features, presented
-  as reviewable groups. One destination (**Duplicate & Similar Photos**, M14) reviews
-  both group kinds over the single shared result set, with an in-screen **All / Exact /
-  Similar** filter that narrows the listing — it never re-runs analysis or forks the
-  selection.
+  as reviewable groups.
 - **Potentially Blurry detection** — an on-device sharpness pass scores every scanned
   photo on a small local thumbnail and flags candidates for review in three tabs
   (All Flagged / Likely Blurry / Borderline, with live counts). Classification uses
@@ -35,10 +32,8 @@ is no backend, no cloud processing, and no third-party analytics.
   thresholds calibrated against a labelled synthetic corpus; every candidate is a
   suggestion for human review — nothing is preselected and nothing is auto-deleted.
 - **Screenshot cleanup** — every screenshot in the library, selectable in bulk.
-- **Video cleanup** — one immediate inventory of every video the scan found: known sizes
-  first (largest to smallest), size-unavailable videos below in a separate group, with
-  measurement running automatically in the background (never a blocking step, and no
-  separate "Measure Sizes" button).
+- **Large video cleanup** — videos ordered largest-first with measured sizes, so the
+  biggest wins are reviewed first.
 - **Duplicate contact detection** — contacts that look like duplicates (shared phone,
   email, or name + organization), merged with kept fields or deleted.
 - **Safe Review → Confirm → Delete flow** — every section follows the same shape:
@@ -69,18 +64,7 @@ Beyond the core cleanup loop:
 - **Swipe Keep/Delete review mode** — a Tinder-style swipe session over the photo
   library (similarity deck or the whole library from the dashboard card): swipe to keep
   or mark for cleanup, with Undo and a persistent bottom bar showing the session's live
-  Delete-mark count and a **Review Cleanup** handoff. Each card's image is the
-  **screen-sized local thumbnail** from the shared bounded cache (M15): a bounded window
-  of ~20 photos is warmed ahead of the cursor (a fast low-resolution frame for the whole
-  window, the sharp screen-sized one for the current photo and the next few), so a warm
-  card renders with no loading state and reaches full sharpness immediately. The
-  low-resolution frame is only ever a temporary stand-in, never the final image; routine
-  swipes never fetch full-resolution originals. If a photo's local rendition is not on
-  device (iCloud-backed), the card shows an honest download state and uses the same
-  permitted network-enabled request Photo Details uses for a photo you are looking at —
-  bounded, cancellable, and only ever for the photo on screen (the prefetch window stays
-  local-only, so navigation never downloads a library). Transient failures stay retryable
-  and keep any frame already on screen; no pixels ever enter the persisted session. Shuffle re-orders only the photos
+  Delete-mark count and a **Review Cleanup** handoff. Shuffle re-orders only the photos
   you have not reviewed yet (no repeats within a pass; **Start New Pass** on the
   completion screen resets position and keeps every decision), the session itself —
   deck order, position, undo history, and the decision log — persists through
@@ -360,11 +344,10 @@ never left "0 of N". Even when the callback arrived, it was slow enough that a
 - **Enumerate first; measure second** — the Videos screen renders the full inventory as
   soon as the catalog is complete: every video listed immediately, sizes filling in as
   they measure, a summary of the real counts (`N videos total` / `Y sizes unavailable —
-  not measured locally` / `Z videos sorted by known size`), and a compact progress panel
-  with cancel while measurement runs. Unknown sizes stay after every measured one —
-  never ranked, never zero — and rows say so. (M14 later removed the idle "Measure
-  Sizes" button entirely: measurement now starts automatically when the unified video
-  inventory appears, and resumes when a heavy pass finishes.)
+  stored in iCloud or unavailable locally` / `Z videos sorted by known size`), and a
+  compact progress panel with cancel while measurement runs. An idle screen offers
+  "Measure Sizes" instead of blocking. Unknown sizes stay after every measured one —
+  never ranked, never zero — and rows say so.
 - **Cached inventory, coalesced updates** — `AppEnvironment.videoRecordsForDisplay`
   (replacing the settled-only cache) serves the resolved, largest-first list and
   rebuilds only when the catalog or measurement changes, never per render; measurement
@@ -372,12 +355,6 @@ never left "0 of N". Even when the callback arrived, it was slow enough that a
   fast pass over thousands of cloud-only videos cannot storm the main actor.
 
 ### Analysis coordination & widget delivery (M10)
-
-> **Superseded by M14:** the one-slot queue and its "queued" UI described below were
-> removed entirely. Both passes now admit **concurrently** over one catalog — neither
-> queues behind, cancels, or blocks the other. The widget-delivery work below is
-> unchanged and current. See [Concurrent independent scans & unified
-> destinations](#concurrent-independent-scans--unified-destinations-m14).
 
 Two failures from a fresh iPhone 17 Pro recording: the Similar Photos screen's
 "Analyze Photo Library" button did nothing while a sharpness pass was running (2 731 /
@@ -445,16 +422,14 @@ measurement pipeline.)
   count rather than being guessed old or young, and eligible items are ordered oldest
   first. The threshold is stated in the UI, not just the code.
 - **Video sources are classified, not guessed** — `VideoSourceClassification` maps each
-  video's PhotoKit source evidence to Recorded, Downloaded, or other/unknown without
-  ever inferring origin from a missing signal. (M14: the classification no longer splits
-  the UI — Video Cleanup is one unified inventory — but the evidence mapping remains as
-  tested, honest logic.) The inventory orders the biggest measured videos first and
-  never ranks an unknown size as zero (measurement state is shared with the video
-  inventory, keyed to the catalog generation so a rebuild invalidates it).
+  video's PhotoKit source evidence to Recorded, Downloaded, or other/unknown; the
+  other/unknown bucket is surfaced as its own count rather than folded into a guess.
+  Video Cleanup orders the biggest measured videos first and never ranks an unknown
+  size as zero (measurement state is shared with the video inventory, keyed to the
+  catalog generation so a rebuild invalidates it).
 - **No analysis starts on open** — the sections and hubs read existing state only;
-  requesting a pass is still an explicit user action. (M14: the pass starts immediately
-  and concurrently with any other running pass — the M10 queue it used to go through is
-  gone; checkpoint safety and the deletion-confirmation contract are unchanged.)
+  requesting a pass is still an explicit user action through the M10 coordinator, whose
+  one-slot queue, checkpoint safety, and deletion-confirmation contract are unchanged.
 
 ### Premium scan animation (M12)
 
@@ -495,9 +470,8 @@ runs that queued behind each other, so a scan only ever advanced one of them.
   enumerates the library **once**, then launches the similarity and sharpness passes
   **concurrently** over the same snapshot. With exactly one pipeline still running (the
   other failed or was cancelled mid-session) it starts only the idle one through that
-  pipeline's own entry point — which since M14 admits it **concurrently over the running
-  pass's catalog** (no queue, no cancel, no second enumeration). Repeated taps are
-  idempotent for the active session.
+  pipeline's own entry point, which queues it behind the running pass rather than racing
+  it. Repeated taps are idempotent for the active session.
 - **The shared read outlives a single cancel** — the one `PHAsset.fetchAssets`
   enumeration lives in `catalogTask`, not either pipeline's task, so cancelling one
   pipeline's *work* leaves the read standing for the other. The read is only abandoned
@@ -520,201 +494,13 @@ runs that queued behind each other, so a scan only ever advanced one of them.
   is kept and the pass never reports a just-deleted asset as removed. Only a standalone
   catalog read is still abandoned (it would complete with pre-mutation records). The
   dashboard's cancel stops **both** pipelines — cancelling only similarity would orphan
-  the sharpness pass.
+  the sharpness pass, and the next Analyze would queue behind that orphan.
 - **Performance is honest, not claimed** — because the primary scan now includes the
   sharpness pass, it fully settles noticeably longer on a large library than the old
   similarity-only scan (the scan card reaches "Finished" once similarity completes, while
   the sharpness row keeps reporting real counted progress). No wall-clock figure is
   claimed for a physical device; the Simulator end-to-end validation is the only timing
   evidence, and it is not representative of device performance.
-
-### Reusable review after deletion (M13B)
-
-After a confirmed deletion the review stays **reusable over the surviving results** — no
-re-analysis is ever forced, and unaffected groups are never discarded.
-
-- **Only the affected identifiers are reconciled** — `removingAssets` prunes the completed
-  similarity result in place: a group that loses members below two dissolves, a group that
-  keeps its recommended KEEP keeps it (a removed KEEP promotes the best remaining member),
-  and every unaffected group stands with its original membership, evidence, and
-  recommendation. The sharpness result and the catalog are pruned the same way — in place,
-  never reset to "start analysis".
-- **The review re-prepares instead of staling** — `reviewDidAppear` now keeps only a live
-  plan that still matches the current selection (so the "Change Selection" round-trip never
-  re-resolves sizes) and re-prepares every other state over the current, preserved results.
-  Previously a leftover state — a stale record, a plan whose selection no longer matched, or
-  a terminal outcome reached by backing out of the review without tapping "Done" — blocked
-  re-preparation, so re-entering the review showed a stale "Review out of date" and demanded
-  "Review Again" even though the unaffected results were still valid. The review now opens
-  ready over the survivors.
-- **Identifiers are revalidated before every mutation** — the deletion service resolves every
-  planned identifier against the live library immediately before mutating and refuses the
-  whole plan (`.stale([.assetsMissing])`, zero mutations) rather than silently shrinking it,
-  so an identifier that vanished between planning and execution can never be counted as
-  removed.
-- **Confirmation and truthful counts are unchanged** — the plan → confirmation → mutation
-  pipeline, the fresh-authorization read, the pure staleness validation, and the honest
-  planned/verified/remaining counts are exactly as before; nothing was relaxed to make the
-  review reusable.
-
-### Concurrent independent scans & unified destinations (M14)
-
-A fresh-device recording reproduced two stuck-scan symptoms (Similar Photos' Analyze
-appearing to do nothing while the sharpness pass ran, and the mirror case) and the
-Potentially Blurry screen failing outright with "Your library scan has not finished"
-while similarity was mid-enumeration. Root cause, confirmed in code: M10's one-slot
-queue serialized the two passes — exactly one heavy pass could be admitted at a time,
-and a request for the other was queued behind it (or cancelled-and-switched through its
-"Start Now" button, which surfaced as "Scan cancelled"). M14 removes that coordinator
-entirely and restores genuinely concurrent, independent scans.
-
-- **Both passes run concurrently — no queue, no cancel-and-switch** — `pendingAnalysisRequest`,
-  `drivePendingAnalysis`, `startPendingAnalysisNow`, the queued phases, and the "Start Now
-  (Cancels …)" / "Remove from Queue" UI are gone. Requesting the idle pass while the other
-  runs starts it **immediately**, over the same completed catalog snapshot the running pass
-  stands on — one library enumeration, never a second read, never a cancelled sibling. If
-  the sharpness pass is requested while similarity is still enumerating, it is admitted
-  into a **bounded wait** (a short poll of the catalog state) and starts the moment the
-  read lands; if no catalog ever lands, it fails honestly ("Your library scan has not
-  finished") instead of hanging. The shared `AnalysisConcurrencyBudget` and
-  `ScanConcurrencyPolicy.sharedWidth` still split the thermal-scaled worker width between
-  the two passes, so concurrent runs never exceed one pass's footprint.
-- **One destination for one pass** — Image Cleanup's separate "Duplicate Images" and
-  "Similar Images" rows are merged into a single **Duplicate & Similar Photos**
-  destination: one analysis pass produces both exact-duplicate and similar groups, and
-  one screen reviews both over the shared result set with an in-screen **All / Exact /
-  Similar** filter that only narrows the listing (never re-runs analysis, never forks the
-  selection). Classification evidence stays distinct internally.
-- **Video Cleanup is one immediate inventory** — the Recorded / Downloaded hub rows are
-  gone. Tapping Video Cleanup opens the unified inventory directly: every video the
-  catalog holds in one list, measured sizes first (largest to smallest), the
-  size-unavailable group below, and measurement starting automatically on appear (no
-  separate "Measure Sizes" button). Unknown sizes are labelled "not measured locally" —
-  never a guessed zero, and never a claim (like iCloud residency) this screen cannot
-  evidence. The summary's total comes from enumeration and never depends on measurement.
-- **Swipe Cleanup opens instantly on prefetched thumbnails** — each swipe card shows a
-  lightweight, local-only thumbnail the moment it appears (M14 prefetches a bounded
-  window of ~20 thumbnails ahead of the cursor, current photo first, through the shared
-  bounded `ThumbnailStore` — the same size and options the card displays, so a warmed
-  key is a cache hit) and the large preview crossfades over it when it arrives. The
-  prefetch is local-only and never full-resolution; Shuffle / Start New Pass re-walk the
-  window, deletion invalidates the store as before, and no pixels ever enter the
-  persisted session snapshot. (Before M14 every swipe waited on one uncached large
-  preview request — the per-card latency this removes. **M15 supersedes the frame
-  hierarchy below:** the 480 px stand-in proved too soft as a final and the "large
-  preview" wait was itself the latency — the card's final image is now the screen-sized
-  local thumbnail, see [Swipe readiness & video size truth](#swipe-readiness--video-size-truth-m15).)
-- **Deletion reconciliation survives concurrent admission** — starting the second pass
-  over a running pass's catalog never clears that pass's recorded mid-run removals
-  (`deletionsDuringRunningPasses` is only reset when *no* other pass is running), so a
-  deletion landing while both passes run is reconciled out of **both** completed results.
-- **Honesty unchanged** — no fabricated counts, no forced downloads, no private APIs;
-  the Simulator-only validation caveat stands (see Testing & verification and Known
-  limitations).
-
-### Swipe readiness & video size truth (M15)
-
-Two physical-device regressions from the October 12 recordings. M14's tests passing did
-not prevent either, and both were fixed at the confirmed root cause, not papered over.
-
-- **Swipe cards were soft and slow (confirmed cause)** — the card's *final* image was the
-  uncached, network-enabled `previewImage` path (Photo Details' explicit-open request at
-  1 400 px), while the prefetched cache was warmed at only 480 px and merely stood in
-  underneath. Every swipe therefore waited on a fresh opportunistic PhotoKit request
-  (the loader's own docs record ~2.5 s per non-local asset on that path), and the frame
-  the user saw first was a 2.1× upscale of the 480 px stand-in — visibly soft. Fix: the
-  card's final image is now the **screen-sized local thumbnail** (1 080 px — the 340 pt
-  box at 3x), the same rendition the prefetcher warms, at the same cache key
-  (`ThumbnailStore.peekCached` + `image`): a warm card renders with **no loading state at
-  all**, and the low-resolution thumbnail of the same photo is only a *temporary*
-  stand-in while the screen-sized one prepares — it is replaced the moment it lands and
-  never left on screen as though it were sharp. The prefetch window is two-tier and
-  prioritized: the low-resolution frame covers the whole 20-photo window, the
-  screen-sized tier covers the current photo and the next five, sequentially issued
-  (bounded, deduplicated through the store's in-flight coalescing). Routine swipes never
-  use the network-enabled preview path and never fetch full-resolution originals; a
-  photo with no local rendition shows the honest unavailable state with retry. Every
-  frame is tagged with its asset and generation-guarded (`SwipeCardFrameModel`), so fast
-  swipes, Shuffle, Undo, and session restore can never show one photo's pixels for
-  another. Keep/Delete, Undo, Shuffle, Start New Pass, session persistence, and the
-  deletion handoff are untouched. (**M15-R1 supersedes the local-only rule**: on device
-  it dead-ended every iCloud-backed photo in "Photo unavailable"; the current card now
-  falls back to the permitted network-enabled request — see below.)
-- **Video inventory never showed sizes the review had (confirmed cause)** — two defects:
-  (1) leaving Video Cleanup cancelled the measurement into a settled-partial state, but
-  re-entering only *started* from `.idle`, so a settled-partial was stranded forever
-  (M14's removal of the "Measure Sizes" button had removed the manual escape); (2) the
-  review flow resolves sizes at plan time through the size provider — an authoritative
-  measurement — but those results were never published into `videoSizeResolution`, the
-  inventory's size state. The review could therefore show a size the inventory labelled
-  "not measured". Fix: **one measurement source of truth**. Plan-time resolutions are
-  merged into `videoSizeResolution` (`recordResolvedVideoSizes`), keyed by stable asset
-  identity and the catalog dataset signature, validated against the live record's
-  modification date, never mixed across datasets, and never allowed to overwrite a
-  currently running measurement pass (whose own batches cover those assets anyway).
-  Screen entry now *resumes* a settled-partial measurement automatically — reusing every
-  byte already measured and continuing only the unknowns — with no manual action. The
-  inventory and review read the same shared state: the same measured result is visible
-  in both, without a second measurement pass and without remeasuring on navigation.
-- **Honest unknown sizes are now distinguished** — the measurement model tracks *which*
-  videos were attempted and honestly unavailable (`unavailableIDs`, not just a count), so
-  rows say "Size not measured yet" versus "Size unavailable — could not be measured".
-  Unknown sizes still sort below every measured size, are never ranked as zero, and no
-  video is ever labelled iCloud-only without evidence. Newly measured sizes republish the
-  sorted list live, without resetting selection.
-
-### Swipe availability & video size truth at the root (M15-R1)
-
-A second device recording contradicted M15's simulator-green state: Swipe Cleanup showed
-`Photo unavailable` for iCloud-backed photos and took seconds per image, and Video Cleanup
-still listed thousands of videos — including local ones — as `Size not measured yet`.
-Both failures reproduced deterministically in tests before any fix, and both were fixed at
-the confirmed root cause.
-
-- **Swipe: local-only display was the bug (confirmed cause)** — M15 routed the card's
-  final frame through `PhotoKitThumbnailLoader.thumbnail`, whose request options set
-  `isNetworkAccessAllowed = false`. On an Optimize-Storage library that fails
-  `.onlyInICloud` for every photo whose full rendition is not on disk, and the card
-  dead-ended in the error state with no way forward. Two further defects compounded it:
-  `SwipeCardFrameModel.prepare` kept a settled failure across revisits (a transient miss
-  stuck forever), and the terminal error replaced a valid low-resolution frame outright.
-- **New loading contract (`SwipeCardFrameModel.Phase`)** — `preparing(temporary:)`,
-  `downloading(temporary:)`, `final`, `retryable(error, visible:)`, `unavailable(error)`:
-  a warm cache key renders with no loading state; a low-resolution frame stays visible
-  while anything sharper prepares *or downloads*; a local-only miss falls through to the
-  **permitted network-enabled request** (the same bounded, cancellable pipeline Photo
-  Details uses — `thumbnailAllowingNetwork` → `previewImage`, incl. its local-rendition
-  ladder), for the photo on screen only; a transient failure (iCloud download failed,
-  timeout, PhotoKit hiccup) is `retryable` — keeping the visible frame, with Retry that
-  issues exactly one fresh chain — and only a genuine terminal failure (asset gone,
-  access off) claims permanent unavailability. Failures never poison the cache: only a
-  permanently-gone asset is remembered, and success and failure are stored separately.
-- **One cache, one key, both policies** — `ThumbnailStore.image(...policy:)` shares the
-  asset+size key between `.localOnly` and `.allowNetwork`, so a downloaded frame is a
-  later cache hit and prefetch output is exactly what the renderer reads. Prefetch stays
-  local-only (a swipe never downloads a library), bounded, and sequential in priority
-  order; superseding a window walk never cancels the visible card's request. Stale
-  callbacks and wrong-asset frames are excluded by the model's generation + asset tag.
-- **Video sizes: one exact-size ladder (confirmed cause)** — `requestAVAsset(version:
-  .current)` answers an `AVComposition` (no file URL) for an **edited** video even when
-  the whole asset is local, and the old single-rung path recorded that as unmeasurable.
-  `PhotoKitAssetSizeProvider` now walks a local-only ladder: the current version's file,
-  then the original version's file (what deleting frees, minus the small adjustment
-  record), then the content-editing-input URLs — exact bytes from real files at every
-  rung, `nil` (honest unavailable) only when nothing is on disk. Nothing is ever
-  downloaded to measure, no size is ever estimated, and unknown is never zero.
-- **Video lifecycle: no more stranded passes (confirmed cause)** — leaving the inventory
-  cancelled the measurement and only the inventory screen could resume it, so a user
-  living on review/the dashboard never got measurements at all. Measurement is no longer
-  cancelled on navigation (app-backgrounding still checkpoint-cancels), and every scan
-  terminal path (finish or cancel of either pipeline) auto-resumes it. Rows now read
-  "Measuring size…" while a pass works through the dataset, "not measured yet" only when
-  nothing has attempted them, and "could not be measured" after a genuine terminal
-  outcome; the summary counts add up (total / sorted / unavailable / still to measure).
-- **Where sizes come from, for both screens** — the shared `videoSizeResolution` state
-  remains the single source of truth: the bulk pass and review's plan-time resolutions
-  (`recordResolvedVideoSizes`) both publish into it, keyed by asset identity + dataset
-  signature + modification date, so the inventory and the review always agree.
 
 ## Privacy
 
@@ -779,7 +565,7 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
 
 ## Testing & verification
 
-- **Unit suite** — 863 Swift Testing cases across 86 suites covering the pure
+- **Unit suite** — 49 files, 838 Swift Testing cases across 83 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -861,60 +647,6 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification (M15-R1)** — the two recorded failures were first reproduced as
-  failing deterministic tests (iCloud-backed photo dead-ending in "Photo unavailable";
-  transient failure sticking across revisit), then fixed. Focused suites
-  (`SwipeReviewTests`, `ThumbnailStoreTests`, `PhotoPreviewTests`, `VideosFlowTests`,
-  `VideoDatasetTests`) report **181 tests green**; the full suite reports **897 passed,
-  0 failed** (the pre-existing `cancellationPropagatesOutOfTheLoader` skip is unchanged;
-  5 UI cases included); one clean app build with **no warnings** and a clean
-  `git diff --check`. New coverage includes the permitted fallback (local miss →
-  network-enabled request → frame), preview-survives-download-failure with retry, retry
-  issuing exactly one request, prefetch-cancel isolation from the visible card, per-asset
-  frame identity at pixel level, and the exact-size ladder (current → original → honest
-  unavailable; zero-byte files refused) with the injectable measurement seam driving the
-  outcome mapping. Harness evidence (deterministic fakes, not device timing): cache-hit
-  frames render with zero PhotoKit requests, one request per rendition per asset
-  (coalesced, peak in-flight 1 for the prefetch walk), stale callbacks discarded by
-  generation guards. **No device latency is claimed or measured.**
-- **Recent verification (M15)** — focused Swipe Cleanup and Video Cleanup suites first
-  (fixing failures before any full run), then the complete suite: **885 passed, 0 failed**
-  (the pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is
-  unchanged; 5 UI cases included), plus one clean app build with **no warnings** and a
-  clean `git diff --check`. New deterministic tests use a controllable image provider and
-  the real cache-to-display path: a prefetched thumbnail is reused by the display without
-  a second load, prefetch and display request exactly the same two renditions (cache keys
-  match), a warm card never enters a loading state, the low-resolution preview is
-  replaced by the screen-sized final, fast consecutive swipes and stale callbacks can
-  never show another asset's frame (per-asset frame identity is asserted pixel-level),
-  shuffle/undo/restoration keep the prefetch window aligned with the cursor, the walk
-  stays request-bounded and single-flight, a failed request never stalls the deck, and
-  the window never requests full-resolution images. Video cases drive the real dataset
-  and view-model mapping: the inventory renders before measurement completes, a plan-time
-  resolution lands in the inventory without review navigation, the same measured result
-  is visible in inventory and review, new sizes re-sort largest-first without resetting
-  selection, unknowns stay below and never become zero, a later success removes a video
-  from the unavailable category, settled measurements are reused and continued on
-  navigation (never remeasured), stale prior-catalog answers are dropped, and totals stay
-  correct with unavailable sizes. **No latency or thermal figure is claimed** — the fixes
-  are structural (a cache-hit display path replacing an uncached network-enabled request
-  per swipe), and device timing was not measured.
-- **Recent verification (M14)** — after restoring concurrent scans and unifying the
-  destinations, a full-suite run reported **863 unit tests in 86 suites + 5 UI tests:
-  867 passed, 0 failed** (the pre-existing `cancellationPropagatesOutOfTheLoader`
-  suite-context skip is unchanged), plus one clean app build with **no warnings**. The
-  M10 queue tests were rewritten into concurrency-overlap proofs: a Similar Photos
-  request starts immediately over the sharpness pass's standing catalog (and vice versa,
-  including the bounded wait for a mid-enumeration catalog), the unified Analyze entry
-  admits the idle pipeline concurrently instead of queueing it, adoption never
-  re-enumerates the library, cancelling or failing one pass leaves the other running,
-  repeated taps are idempotent, the bounded wait fails honestly when no catalog lands,
-  and a deletion landing while both passes run reconciles out of both completed results.
-  Further new cases pin the unified Duplicate & Similar Photos destination (one row,
-  combined count, filter semantics, hub copy), the unified video inventory (one count
-  regardless of source, measurement-independent totals, honest summary wording), and the
-  swipe prefetch window (current-first order, bounded size, supersession on shuffle,
-  cache-hit display, no full-resolution requests).
 - **Recent verification (M13)** — after unifying the Image Cleanup session, the full unit
   suite reported **843 tests in 83 suites, 0 failures** (the pre-existing
   `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged), plus one clean
@@ -1101,34 +833,6 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   claimed for a physical device; the Simulator timing above is not representative, and
   device-profiled timing of the unified session (Time Profiler + thermal + hitches) has not
   been performed.
-- **Swipe frame readiness is validated structurally, not by device timing (M14/M15)** —
-  the frame window (two local-only renditions, warmed through the shared bounded cache
-  ahead of the cursor) is validated by unit tests (cache-to-display reuse, rendition-key
-  match, no loading state over warm pixels, low-res replaced by the final, stale-callback
-  and wrong-asset guards at pixel level, bounded requests, never full-resolution) and
-  Simulator interaction only. Perceived swipe latency on a real iPhone was **not**
-  profiled, and no latency improvement is claimed numerically — the fix removes the
-  per-swipe uncached network-enabled request from the display path, which is a structural
-  change, not a measured one. The same applies to the video inventory's update timing.
-- **Physical-device checks still outstanding (M15/M15-R1)** — replaying the original
-  recordings' flows on an iPhone (swipe through a deck incl. iCloud-backed photos and
-  their download/retry states; open Video Cleanup after a scan and after a review) is the
-  remaining validation; the regression causes and fixes are covered deterministically in
-  tests, but the end-to-end device feel was not re-recorded.
-- **Public-API limits on exact video sizes (M15-R1)** — iOS 17 exposes no metadata-only
-  exact byte count for a video resource (`PHAssetResource.dataSize` is not available on
-  this OS version), so sizes are the exact bytes of real locally-stored files, obtained
-  without downloading anything. For an *edited* video the measured file is the stored
-  original (what deletion frees, minus the small adjustment record) because the current
-  version is a composition with no file. A cloud-only video reports "could not be
-  measured" — never a guess, never zero — and can only gain a size by the user
-  downloading it in Photos first.
-- **Repository note (M14)** — `Netto.xcodeproj/project.pbxproj` carried an unrelated,
-  pre-existing regeneration diff at the start of this work and was deliberately left
-  unstaged/uncommitted alongside these changes. No source files were added or removed in
-  M14 (every change lives in existing files), so the project file needs no update and the
-  uncommitted diff is inert — but it is still sitting in the working tree and should be
-  reconciled separately.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the
