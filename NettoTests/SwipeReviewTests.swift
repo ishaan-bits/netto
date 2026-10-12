@@ -1,3 +1,4 @@
+import Combine
 import CoreGraphics
 import Foundation
 import Testing
@@ -1129,8 +1130,10 @@ struct SwipeReviewTests {
         #expect(negative.isEmpty)
     }
 
-    /// The prefetcher walks the window through the shared store — current photo first —
-    /// at the instant-frame size only, never the large preview's full resolution.
+    /// The prefetcher walks the window through the shared store in priority order — the
+    /// current photo first — with two local-only tiers (M15): the low-resolution frame for
+    /// the whole window, and the screen-sized final for the current photo and the next few.
+    /// Never the large preview's network path, never full-resolution.
     @Test func thePrefetcherWarmsTheWindowThroughTheStoreCurrentFirst() async {
         let log = PrefetchCallLog()
         let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
@@ -1139,17 +1142,46 @@ struct SwipeReviewTests {
 
         prefetcher.warm(order: ids, store: store)
 
+        let expected = ids.count * 2 // every id: low-res then screen-sized (within sharp count)
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while log.requestedIDs().count < ids.count, ContinuousClock.now < deadline {
+        while log.requestedIDs().count < expected, ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(5))
         }
-        // Priority order survives the walk: the on-screen photo is requested first.
-        #expect(log.requestedIDs() == ids)
-        // Every request is the lightweight instant-frame size — the large preview's
-        // target is never touched by the prefetcher.
-        #expect(log.pixelSizes.allSatisfy { $0 == SwipeReviewPresentation.swipeThumbnailPixelSize })
+        // Priority order survives the walk: per asset the fast low-resolution frame lands
+        // first and the screen-sized final follows, the on-screen photo leading.
+        let expectedIDs = ids.flatMap { [$0, $0] }
+        let expectedSizes = ids.flatMap { _ in
+            [SwipeReviewPresentation.swipeThumbnailLowResPixelSize,
+             SwipeReviewPresentation.swipeThumbnailPixelSize]
+        }
+        #expect(log.requestedIDs() == expectedIDs)
+        #expect(log.pixelSizes == expectedSizes)
+        // Neither tier is the large preview's target; routine swipes never fetch it.
         #expect(SwipeReviewPresentation.swipeThumbnailPixelSize
             < SimilarPhotosPresentation.previewTargetPixelSize)
+        #expect(log.pixelSizes.allSatisfy { $0 <= SwipeReviewPresentation.swipeThumbnailPixelSize })
+    }
+
+    /// Beyond the "next few", only the low-resolution tier is warmed — the screen-sized
+    /// tier stays bounded to the prioritized head of the window (M15).
+    @Test func theScreenSizedTierIsBoundedToThePrioritizedHeadOfTheWindow() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
+        let prefetcher = SwipeThumbnailPrefetcher()
+        let ids = (0..<10).map { "p-\($0)" }
+
+        prefetcher.warm(order: ids, store: store)
+
+        let expected = ids.count + SwipeReviewPresentation.swipeSharpPrefetchCount
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while log.requestedIDs().count < expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(log.requestedIDs().count == expected)
+        let sharpRequests = zip(log.requestedIDs(), log.pixelSizes)
+            .filter { $0.1 == SwipeReviewPresentation.swipeThumbnailPixelSize }
+        // Exactly the current photo and the next few get the sharp tier, in order.
+        #expect(sharpRequests.map(\.0) == Array(ids.prefix(SwipeReviewPresentation.swipeSharpPrefetchCount)))
     }
 
     /// A new window (cursor advance, Shuffle, Start New Pass) supersedes the old walk:
@@ -1176,25 +1208,102 @@ struct SwipeReviewTests {
         #expect(!requested.contains("old-5"))
     }
 
-    /// A warmed frame is a cache hit: the card's own read of the same key never reaches
-    /// PhotoKit again.
-    @Test func aWarmedFrameIsACacheHitNotASecondLoad() async {
+    /// Cache-to-display integration (M15): a prefetched thumbnail is reused by the display
+    /// path — the card's frame resolves from the warmed store without a second load, and
+    /// without ever presenting a loading state over available pixels.
+    @Test func aPrefetchedThumbnailIsReusedByTheDisplayPath() async {
         let log = PrefetchCallLog()
         let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
         let prefetcher = SwipeThumbnailPrefetcher()
+        let model = SwipeCardFrameModel()
 
         prefetcher.warm(order: ["warm-me"], store: store)
         let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while log.requestedIDs().isEmpty, ContinuousClock.now < deadline {
+        while log.requestedIDs().count < 2, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        let loadsAfterWarm = log.requestedIDs().count
+
+        model.prepare(assetID: "warm-me", store: store)
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while model.phase.isDisplayable == false, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
 
-        // The card's instant-frame read of the same key (same size) — no second load.
+        guard case .final = model.phase else {
+            Issue.record("expected the warmed frame to display, got \(model.phase)")
+            return
+        }
+        // The display path hit the cache: no further PhotoKit requests.
+        #expect(log.requestedIDs().count == loadsAfterWarm)
+    }
+
+    /// A warm screen-sized key renders without entering a loading state at all (M15):
+    /// "Loading photo…" never covers pixels that are already available.
+    @Test func aCachedNextImageDoesNotEnterAnUnnecessaryLoadingState() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
+        let prefetcher = SwipeThumbnailPrefetcher()
+        let model = SwipeCardFrameModel()
+        prefetcher.warm(order: ["next"], store: store)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while log.requestedIDs().count < 2, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        var seen: [SwipeCardFrameModel.Phase] = [model.phase]
+        let subscription = model.$phase.sink { seen.append($0) }
+        defer { subscription.cancel() }
+
+        model.prepare(assetID: "next", store: store)
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        guard case .final = model.phase else {
+            Issue.record("expected final, got \(model.phase)")
+            return
+        }
+        #expect(!seen.contains(.loading))
+    }
+
+    /// A low-resolution preview is only ever a temporary stand-in (M15): it shows while
+    /// the screen-sized thumbnail prepares and is replaced by it the moment it lands.
+    @Test func aLowResolutionPreviewIsReplacedByTheFinalThumbnail() async {
+        let log = PrefetchCallLog()
+        let loader = RecordingPrefetchLoader(log: log, delayNanoseconds: 20_000_000)
+        let store = ThumbnailStore(loader: loader, capacity: 96)
+        let model = SwipeCardFrameModel()
+
+        // Only the low-resolution tier warm (the screen-sized load will take ~20 ms).
         _ = try? await store.image(
-            for: "warm-me",
-            targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
+            for: "soft",
+            targetPixelSize: SwipeReviewPresentation.swipeThumbnailLowResPixelSize
         )
-        #expect(log.requestedIDs() == ["warm-me"])
+
+        var seen: [SwipeCardFrameModel.Phase] = [model.phase]
+        let subscription = model.$phase.sink { seen.append($0) }
+        defer { subscription.cancel() }
+
+        model.prepare(assetID: "soft", store: store)
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while ContinuousClock.now < settle {
+            if case .final = model.phase { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        guard case .final = model.phase else {
+            Issue.record("expected the final screen-sized thumbnail, got \(model.phase)")
+            return
+        }
+        // The temporary low-resolution frame appeared and was replaced — it never stood
+        // as the final sharp image.
+        let sawTemporary = seen.contains { phase in
+            if case .temporary = phase { return true }
+            return false
+        }
+        #expect(sawTemporary)
     }
 
     /// Stopping the prefetcher (the screen is going away) ends the walk; the store keeps
@@ -1215,6 +1324,205 @@ struct SwipeReviewTests {
         let requested = log.requestedIDs()
         // The walk stopped at cancellation — never the whole window.
         #expect(requested.count < ids.count)
+    }
+
+    // MARK: Frame identity & staleness (M15)
+
+    /// Fast consecutive swipes never display an image belonging to the wrong asset: the
+    /// frame model tags every phase with its asset, and each card's pixels carry their
+    /// asset's identity.
+    @Test func fastConsecutiveSwipesNeverDisplayAnotherAssetsFrame() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
+        let model = SwipeCardFrameModel()
+
+        model.prepare(assetID: "asset-a", store: store)
+        model.prepare(assetID: "asset-b", store: store) // the swipe lands before A settles
+
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        #expect(model.assetID == "asset-b")
+        guard case .final(let frame) = model.phase else {
+            Issue.record("expected a final frame for asset-b, got \(model.phase)")
+            return
+        }
+        #expect(pixelTone(frame) == referenceTone(for: "asset-b"))
+        #expect(pixelTone(frame) != referenceTone(for: "asset-a"))
+    }
+
+    /// A stale callback from a previous cursor or deck generation can never overwrite the
+    /// currently selected photo (M15): the late frame is discarded, not displayed.
+    @Test func aStaleCallbackCannotOverwriteTheCurrentCursor() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(
+            loader: RecordingPrefetchLoader(log: log, delayNanoseconds: 40_000_000),
+            capacity: 96
+        )
+        let model = SwipeCardFrameModel()
+
+        model.prepare(assetID: "slow-old", store: store)
+        try? await Task.sleep(for: .milliseconds(5))
+        model.prepare(assetID: "quick-new", store: store)
+
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        // Both loads have landed by now; the old one's late completion must be a no-op.
+        try? await Task.sleep(for: .milliseconds(60))
+
+        #expect(model.assetID == "quick-new")
+        guard case .final(let frame) = model.phase else {
+            Issue.record("expected a final frame for quick-new, got \(model.phase)")
+            return
+        }
+        #expect(pixelTone(frame) == referenceTone(for: "quick-new"))
+    }
+
+    /// Shuffle, Undo, and session restoration keep the prefetch window aligned with the
+    /// cursor (M15): the window always starts at the photo on screen, forward only.
+    @Test func shuffleUndoAndRestorationKeepThePrefetchWindowAligned() {
+        let deck = libraryDeck(count: 8)
+        let ids = deck.map(\.assetID)
+        let model = SwipeReviewModel(items: deck)
+        var selection = PhotoSelectionModel()
+
+        // Advance twice, then Undo: the window follows the cursor back.
+        model.decide(.keep, selection: &selection)
+        model.decide(.keep, selection: &selection)
+        model.undo(selection: &selection)
+        let afterUndo = SwipeReviewPresentation.prefetchOrder(around: model.cursor, in: ids)
+        #expect(afterUndo.first == model.currentItem?.assetID)
+        #expect(!afterUndo.dropFirst().contains(model.items[model.cursor - 1].assetID))
+
+        // Shuffle re-orders only the unreviewed tail — the window still leads with the
+        // current photo and still walks forward through the *new* order.
+        var generator = SeededGenerator(seed: 42)
+        model.shuffleRemaining(using: &generator)
+        let afterShuffle = SwipeReviewPresentation.prefetchOrder(around: model.cursor, in: model.items.map(\.assetID))
+        #expect(afterShuffle.first == model.currentItem?.assetID)
+
+        // A restored session lands at its saved cursor — the window starts there.
+        let restored = SwipeReviewModel(items: [])
+        restored.restore(from: SwipeReviewSessionSnapshot(
+            items: deck,
+            cursor: 5,
+            history: [],
+            decisions: [:]
+        ))
+        let afterRestore = SwipeReviewPresentation.prefetchOrder(around: restored.cursor, in: ids)
+        #expect(afterRestore.first == ids[5])
+    }
+
+    /// Request count and concurrent decoding stay bounded (M15): the walk issues exactly
+    /// the window's two-tier requests, sequentially — one PhotoKit request at a time.
+    @Test func theWalkKeepsRequestCountAndDecodingBounded() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(
+            loader: RecordingPrefetchLoader(log: log, delayNanoseconds: 2_000_000),
+            capacity: 96
+        )
+        let prefetcher = SwipeThumbnailPrefetcher()
+        let ids = (0..<12).map { "b-\($0)" }
+
+        prefetcher.warm(order: ids, store: store)
+        let expected = ids.count + SwipeReviewPresentation.swipeSharpPrefetchCount
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while log.requestedIDs().count < expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        #expect(log.requestedIDs().count == expected)
+        #expect(log.maxConcurrentRequests == 1)
+    }
+
+    /// A failed or unavailable image request does not stall the deck (M15): the card
+    /// settles into an honest unavailable state and the next card prepares normally.
+    @Test func aFailedRequestDoesNotStallTheDeck() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(
+            loader: RecordingPrefetchLoader(log: log, failingAssetIDs: ["broken"]),
+            capacity: 96
+        )
+        let model = SwipeCardFrameModel()
+
+        model.prepare(assetID: "broken", store: store)
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .unavailable = model.phase else {
+            Issue.record("expected an honest unavailable state, got \(model.phase)")
+            return
+        }
+
+        // The deck keeps working: the next card is a fresh generation and displays.
+        model.prepare(assetID: "healthy", store: store)
+        let settleNext = ContinuousClock.now.advanced(by: .seconds(5))
+        while ContinuousClock.now < settleNext {
+            if case .final = model.phase { break }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .final = model.phase else {
+            Issue.record("expected the next card to display, got \(model.phase)")
+            return
+        }
+    }
+
+    /// The prefetch window remains capped and routine swipe display never requests
+    /// full-resolution images (M15): the window is bounded, and every request the swipe
+    /// path makes is a screen-sized (or smaller) local rendition.
+    @Test func theWindowStaysCappedAndNeverRequestsFullResolutionImages() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
+        let prefetcher = SwipeThumbnailPrefetcher()
+        let ids = (0..<200).map { "f-\($0)" }
+
+        let order = SwipeReviewPresentation.prefetchOrder(around: 0, in: ids)
+        #expect(order.count == SwipeReviewPresentation.swipePrefetchWindowCount)
+
+        prefetcher.warm(order: order, store: store)
+        let expected = order.count + SwipeReviewPresentation.swipeSharpPrefetchCount
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while log.requestedIDs().count < expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        #expect(log.requestedIDs().count == expected)
+        #expect(log.pixelSizes.allSatisfy { $0 <= SwipeReviewPresentation.swipeThumbnailPixelSize })
+        #expect(log.pixelSizes.allSatisfy { $0 < SimilarPhotosPresentation.previewTargetPixelSize })
+    }
+
+    /// Cache keys match between prefetch and display (M15): both go through the store at
+    /// the same two rendition sizes — a warmed key is *the* key the card reads, and no
+    /// third rendition is ever requested for routine swipe display.
+    @Test func prefetchAndDisplayRequestTheSameRenditions() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(loader: RecordingPrefetchLoader(log: log), capacity: 96)
+        let prefetcher = SwipeThumbnailPrefetcher()
+        let model = SwipeCardFrameModel()
+
+        prefetcher.warm(order: ["shared"], store: store)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while log.requestedIDs().count < 2, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        model.prepare(assetID: "shared", store: store)
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        let renditions = Set(log.requests.map { $0.1 })
+        let allShared = log.requests.allSatisfy { $0.0 == "shared" }
+        #expect(renditions == [
+            SwipeReviewPresentation.swipeThumbnailLowResPixelSize,
+            SwipeReviewPresentation.swipeThumbnailPixelSize
+        ])
+        #expect(allShared)
     }
 }
 
@@ -1495,20 +1803,36 @@ private final class RecordingCleanupDeletionService: PhotoDeleting, @unchecked S
     }
 }
 
-// MARK: - Thumbnail prefetch helpers (M14)
+// MARK: - Thumbnail prefetch helpers (M14/M15)
 
-/// Request recorder shared with the prefetch loader: asset IDs in request order, and the
-/// exact target pixel size each request asked for (the no-full-resolution proof).
+/// Request recorder shared with the prefetch loader: asset IDs in request order, the exact
+/// target pixel size each request asked for (the no-full-resolution proof), and a
+/// concurrency gauge (the bounded-decoding proof).
 private final class PrefetchCallLog: @unchecked Sendable {
     private let lock = NSLock()
     private var ids: [String] = []
     private var sizes: [Int] = []
+    private var active = 0
+    private var peakActive = 0
 
     func record(assetID: String, targetPixelSize: Int) {
         lock.lock()
         defer { lock.unlock() }
         ids.append(assetID)
         sizes.append(targetPixelSize)
+    }
+
+    func beginRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        active += 1
+        peakActive = max(peakActive, active)
+    }
+
+    func endRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        active -= 1
     }
 
     func requestedIDs() -> [String] {
@@ -1522,11 +1846,26 @@ private final class PrefetchCallLog: @unchecked Sendable {
         defer { lock.unlock() }
         return sizes
     }
+
+    /// The (assetID, pixelSize) pairs in request order — the cache-key match proof.
+    var requests: [(String, Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(zip(ids, sizes))
+    }
+
+    /// The most requests ever in flight at once — the bounded-decoding proof.
+    var maxConcurrentRequests: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peakActive
+    }
 }
 
 private struct RecordingPrefetchLoader: PhotoThumbnailLoading {
     let log: PrefetchCallLog
     var delayNanoseconds: UInt64 = 0
+    var failingAssetIDs: Set<String> = []
 
     func thumbnail(
         for assetID: String,
@@ -1534,13 +1873,30 @@ private struct RecordingPrefetchLoader: PhotoThumbnailLoading {
         mode: PhotoThumbnailRequestMode
     ) async throws -> CGImage {
         log.record(assetID: assetID, targetPixelSize: targetPixelSize)
+        log.beginRequest()
+        defer { log.endRequest() }
         if delayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: delayNanoseconds)
         }
-        return Self.solidImage(side: targetPixelSize)
+        if failingAssetIDs.contains(assetID) {
+            throw PhotoContentError.unavailable
+        }
+        return Self.tonedImage(side: targetPixelSize, tone: Self.tone(for: assetID))
     }
 
-    static func solidImage(side: Int) -> CGImage {
+    /// A deterministic per-asset gray level — the frame's identity. Two assets' frames
+    /// are distinguishable by `pixelTone`, so "which photo is on screen" is assertable.
+    /// FNV-1a over the identifier (String.hashValue is per-process random).
+    static func tone(for assetID: String) -> CGFloat {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in assetID.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return CGFloat(hash % 200 + 20) / 255.0
+    }
+
+    static func tonedImage(side: Int, tone: CGFloat) -> CGImage {
         let dimension = max(1, side)
         guard let context = CGContext(
             data: nil,
@@ -1553,11 +1909,28 @@ private struct RecordingPrefetchLoader: PhotoThumbnailLoading {
         ) else {
             preconditionFailure("test image context must be creatable")
         }
-        context.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.9, alpha: 1))
+        context.setFillColor(CGColor(red: tone, green: tone, blue: tone, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: dimension, height: dimension))
         guard let image = context.makeImage() else {
             preconditionFailure("test image must render")
         }
         return image
     }
+}
+
+/// Reads a test frame's gray level — the per-asset identity used to prove the card shows
+/// the right photo's pixels (and never a stale callback's).
+private func pixelTone(_ image: CGImage) -> UInt8? {
+    guard let data = image.dataProvider?.data as Data? else { return nil }
+    return data.first
+}
+
+/// The expected identity byte for an asset's frame, compared through the *same render
+/// path* the loader uses — so the assertion is immune to color-conversion rounding.
+private func referenceTone(for assetID: String) -> UInt8? {
+    let reference = RecordingPrefetchLoader.tonedImage(
+        side: 2,
+        tone: RecordingPrefetchLoader.tone(for: assetID)
+    )
+    return pixelTone(reference)
 }

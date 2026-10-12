@@ -85,6 +85,21 @@ actor ThumbnailStore {
         }
     }
 
+    /// The resident frame for a key, if one is already cached — **without** starting a
+    /// load (M15). A hit promotes the entry like a full read; a miss (or a cached failure)
+    /// answers `nil` and loads nothing, so a display path can decide whether it has
+    /// something to show *before* it ever presents a loading state. Never returns a
+    /// negatively-cached failure as an image.
+    func peekCached(assetID: String, targetPixelSize: Int) -> CGImage? {
+        let key = Self.key(assetID: assetID, targetPixelSize: targetPixelSize)
+        guard let cached = entries[key] else { return nil }
+        touch(key)
+        if case .hit(let image) = cached {
+            return image
+        }
+        return nil
+    }
+
     /// Deletion invalidation: drops every rendition (all sizes) of the named assets from the
     /// cache, so a deleted photo's pixels can never outlive it in the review UI. Bounded
     /// work: at most `capacity` keys are examined. Safe to call for assets this store has

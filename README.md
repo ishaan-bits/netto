@@ -69,11 +69,15 @@ Beyond the core cleanup loop:
 - **Swipe Keep/Delete review mode** — a Tinder-style swipe session over the photo
   library (similarity deck or the whole library from the dashboard card): swipe to keep
   or mark for cleanup, with Undo and a persistent bottom bar showing the session's live
-  Delete-mark count and a **Review Cleanup** handoff. Each card opens instantly on a
-  prefetched lightweight thumbnail (M14: a bounded window of ~20 local-only thumbnails
-  warmed ahead of the cursor through the shared bounded cache) while the large preview
-  loads and crossfades in — never full-resolution prefetching, never pixels in the
-  persisted session. Shuffle re-orders only the photos
+  Delete-mark count and a **Review Cleanup** handoff. Each card's image is the
+  **screen-sized local thumbnail** from the shared bounded cache (M15): a bounded window
+  of ~20 photos is warmed ahead of the cursor (a fast low-resolution frame for the whole
+  window, the sharp screen-sized one for the current photo and the next few), so a warm
+  card renders with no loading state and reaches full sharpness immediately. The
+  low-resolution frame is only ever a temporary stand-in, never the final image; routine
+  swipes never fetch full-resolution originals or download cloud-only photos (a photo
+  with no local rendition shows an honest unavailable state), and no pixels ever enter
+  the persisted session. Shuffle re-orders only the photos
   you have not reviewed yet (no repeats within a pass; **Start New Pass** on the
   completion screen resets position and keeps every decision), the session itself —
   deck order, position, undo history, and the decision log — persists through
@@ -593,7 +597,10 @@ entirely and restores genuinely concurrent, independent scans.
   prefetch is local-only and never full-resolution; Shuffle / Start New Pass re-walk the
   window, deletion invalidates the store as before, and no pixels ever enter the
   persisted session snapshot. (Before M14 every swipe waited on one uncached large
-  preview request — the per-card latency this removes.)
+  preview request — the per-card latency this removes. **M15 supersedes the frame
+  hierarchy below:** the 480 px stand-in proved too soft as a final and the "large
+  preview" wait was itself the latency — the card's final image is now the screen-sized
+  local thumbnail, see [Swipe readiness & video size truth](#swipe-readiness--video-size-truth-m15).)
 - **Deletion reconciliation survives concurrent admission** — starting the second pass
   over a running pass's catalog never clears that pass's recorded mid-run removals
   (`deletionsDuringRunningPasses` is only reset when *no* other pass is running), so a
@@ -601,6 +608,55 @@ entirely and restores genuinely concurrent, independent scans.
 - **Honesty unchanged** — no fabricated counts, no forced downloads, no private APIs;
   the Simulator-only validation caveat stands (see Testing & verification and Known
   limitations).
+
+### Swipe readiness & video size truth (M15)
+
+Two physical-device regressions from the October 12 recordings. M14's tests passing did
+not prevent either, and both were fixed at the confirmed root cause, not papered over.
+
+- **Swipe cards were soft and slow (confirmed cause)** — the card's *final* image was the
+  uncached, network-enabled `previewImage` path (Photo Details' explicit-open request at
+  1 400 px), while the prefetched cache was warmed at only 480 px and merely stood in
+  underneath. Every swipe therefore waited on a fresh opportunistic PhotoKit request
+  (the loader's own docs record ~2.5 s per non-local asset on that path), and the frame
+  the user saw first was a 2.1× upscale of the 480 px stand-in — visibly soft. Fix: the
+  card's final image is now the **screen-sized local thumbnail** (1 080 px — the 340 pt
+  box at 3x), the same rendition the prefetcher warms, at the same cache key
+  (`ThumbnailStore.peekCached` + `image`): a warm card renders with **no loading state at
+  all**, and the low-resolution thumbnail of the same photo is only a *temporary*
+  stand-in while the screen-sized one prepares — it is replaced the moment it lands and
+  never left on screen as though it were sharp. The prefetch window is two-tier and
+  prioritized: the low-resolution frame covers the whole 20-photo window, the
+  screen-sized tier covers the current photo and the next five, sequentially issued
+  (bounded, deduplicated through the store's in-flight coalescing). Routine swipes never
+  use the network-enabled preview path and never fetch full-resolution originals; a
+  photo with no local rendition shows the honest unavailable state with retry. Every
+  frame is tagged with its asset and generation-guarded (`SwipeCardFrameModel`), so fast
+  swipes, Shuffle, Undo, and session restore can never show one photo's pixels for
+  another. Keep/Delete, Undo, Shuffle, Start New Pass, session persistence, and the
+  deletion handoff are untouched.
+- **Video inventory never showed sizes the review had (confirmed cause)** — two defects:
+  (1) leaving Video Cleanup cancelled the measurement into a settled-partial state, but
+  re-entering only *started* from `.idle`, so a settled-partial was stranded forever
+  (M14's removal of the "Measure Sizes" button had removed the manual escape); (2) the
+  review flow resolves sizes at plan time through the size provider — an authoritative
+  measurement — but those results were never published into `videoSizeResolution`, the
+  inventory's size state. The review could therefore show a size the inventory labelled
+  "not measured". Fix: **one measurement source of truth**. Plan-time resolutions are
+  merged into `videoSizeResolution` (`recordResolvedVideoSizes`), keyed by stable asset
+  identity and the catalog dataset signature, validated against the live record's
+  modification date, never mixed across datasets, and never allowed to overwrite a
+  currently running measurement pass (whose own batches cover those assets anyway).
+  Screen entry now *resumes* a settled-partial measurement automatically — reusing every
+  byte already measured and continuing only the unknowns — with no manual action. The
+  inventory and review read the same shared state: the same measured result is visible
+  in both, without a second measurement pass and without remeasuring on navigation.
+- **Honest unknown sizes are now distinguished** — the measurement model tracks *which*
+  videos were attempted and honestly unavailable (`unavailableIDs`, not just a count), so
+  rows say "Size not measured yet" versus "Size unavailable — could not be measured".
+  Unknown sizes still sort below every measured size, are never ranked as zero, and no
+  video is ever labelled iCloud-only without evidence. Newly measured sizes republish the
+  sorted list live, without resetting selection.
 
 ## Privacy
 
@@ -747,6 +803,28 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M15)** — focused Swipe Cleanup and Video Cleanup suites first
+  (fixing failures before any full run), then the complete suite: **885 passed, 0 failed**
+  (the pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is
+  unchanged; 5 UI cases included), plus one clean app build with **no warnings** and a
+  clean `git diff --check`. New deterministic tests use a controllable image provider and
+  the real cache-to-display path: a prefetched thumbnail is reused by the display without
+  a second load, prefetch and display request exactly the same two renditions (cache keys
+  match), a warm card never enters a loading state, the low-resolution preview is
+  replaced by the screen-sized final, fast consecutive swipes and stale callbacks can
+  never show another asset's frame (per-asset frame identity is asserted pixel-level),
+  shuffle/undo/restoration keep the prefetch window aligned with the cursor, the walk
+  stays request-bounded and single-flight, a failed request never stalls the deck, and
+  the window never requests full-resolution images. Video cases drive the real dataset
+  and view-model mapping: the inventory renders before measurement completes, a plan-time
+  resolution lands in the inventory without review navigation, the same measured result
+  is visible in inventory and review, new sizes re-sort largest-first without resetting
+  selection, unknowns stay below and never become zero, a later success removes a video
+  from the unavailable category, settled measurements are reused and continued on
+  navigation (never remeasured), stale prior-catalog answers are dropped, and totals stay
+  correct with unavailable sizes. **No latency or thermal figure is claimed** — the fixes
+  are structural (a cache-hit display path replacing an uncached network-enabled request
+  per swipe), and device timing was not measured.
 - **Recent verification (M14)** — after restoring concurrent scans and unifying the
   destinations, a full-suite run reported **863 unit tests in 86 suites + 5 UI tests:
   867 passed, 0 failed** (the pre-existing `cancellationPropagatesOutOfTheLoader`
@@ -949,12 +1027,20 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   claimed for a physical device; the Simulator timing above is not representative, and
   device-profiled timing of the unified session (Time Profiler + thermal + hitches) has not
   been performed.
-- **Swipe-prefetch performance is unmeasured on a physical device (M14)** — the
-  instant-frame window (20 local-only thumbnails at 480 px, warmed through the shared
-  bounded cache ahead of the cursor) is validated by unit tests (bounded, current-first,
-  superseded on shuffle, cache-hit display, never full-resolution) and Simulator
-  interaction only. Perceived swipe latency on a real device was not profiled; no
-  wall-clock improvement figure is claimed.
+- **Swipe frame readiness is validated structurally, not by device timing (M14/M15)** —
+  the frame window (two local-only renditions, warmed through the shared bounded cache
+  ahead of the cursor) is validated by unit tests (cache-to-display reuse, rendition-key
+  match, no loading state over warm pixels, low-res replaced by the final, stale-callback
+  and wrong-asset guards at pixel level, bounded requests, never full-resolution) and
+  Simulator interaction only. Perceived swipe latency on a real iPhone was **not**
+  profiled, and no latency improvement is claimed numerically — the fix removes the
+  per-swipe uncached network-enabled request from the display path, which is a structural
+  change, not a measured one. The same applies to the video inventory's update timing.
+- **Physical-device checks still outstanding (M15)** — replaying the original recordings'
+  flows on an iPhone (swipe through a warmed deck; open Video Cleanup after a scan and
+  after a review) is the remaining validation for both fixes; the two regression causes
+  and their fixes are covered deterministically in tests, but the end-to-end device feel
+  was not re-recorded.
 - **Repository note (M14)** — `Netto.xcodeproj/project.pbxproj` carried an unrelated,
   pre-existing regeneration diff at the start of this work and was deliberately left
   unstaged/uncommitted alongside these changes. No source files were added or removed in

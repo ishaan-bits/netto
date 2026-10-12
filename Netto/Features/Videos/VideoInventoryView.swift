@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// One row of the unified video inventory (M14): poster thumbnail, duration, resolution and
-/// date, an honest size — measured bytes, or "not measured locally" — and the selection
+/// One row of the unified video inventory (M14/M15): poster thumbnail, duration, resolution and
+/// date, an honest size — measured bytes, "not measured yet" (never attempted), or
+/// "could not be measured" (attempted and honestly unavailable) — and the selection
 /// check. Tapping the row opens the video preview.
 ///
 /// There is no source split anywhere in this file: the inventory lists every video the
@@ -11,6 +12,9 @@ import SwiftUI
 /// its deletion-safety guarantees are exactly the ones every other video surface uses.
 struct VideoInventoryRow: View {
     let record: PhotoAssetRecord
+    /// Whether the shared measurement *attempted* this video and honestly could not
+    /// measure it (M15) — distinct from a video nobody has tried yet.
+    let isKnownUnavailable: Bool
     let isSelected: Bool
     let store: ThumbnailStore
     let onPreview: () -> Void
@@ -102,18 +106,22 @@ struct VideoInventoryRow: View {
         return "\(resolution) · \(date.formatted(date: .abbreviated, time: .omitted))"
     }
 
-    /// The honest size line: measured bytes, or an explicit "not measured locally" — never
-    /// a guessed zero, and never a claim about *why* a size is unknown (iCloud residency is
-    /// not evidence this screen holds).
+    /// The honest size line (M15): measured bytes, or an explicit distinction between
+    /// "not measured yet" (never attempted) and "could not be measured" (attempted and
+    /// honestly unavailable) — never a guessed zero, and never a claim about *why* a size
+    /// is unknown (iCloud residency is not evidence this screen holds).
     private var sizeText: String {
         if let bytes = record.sizeInBytes {
             return ByteFormat.string(bytes)
         }
-        return "Size unavailable — not measured locally"
+        return isKnownUnavailable
+            ? "Size unavailable — could not be measured"
+            : "Size not measured yet"
     }
 
     private var previewAccessibilityLabel: String {
-        let size = record.sizeInBytes.map(ByteFormat.string) ?? "size not measured locally"
+        let size = record.sizeInBytes.map(ByteFormat.string)
+            ?? (isKnownUnavailable ? "size could not be measured" : "size not measured yet")
         return "Video, \(VideosPresentation.durationText(record.duration)), \(size)"
     }
 }

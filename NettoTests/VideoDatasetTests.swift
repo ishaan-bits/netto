@@ -306,7 +306,7 @@ struct VideoDatasetTests {
             datasetSignature: fixtureSignature,
             bytes: ["video-01": 1],
             total: 6,
-            unavailableCount: 2
+            unavailableIDs: ["video-05", "video-06"]
         )
         let phase = VideosPresentation.phase(
             permission: .authorized,
@@ -434,7 +434,7 @@ struct VideoDatasetTests {
                 datasetSignature: fixtureSignature,
                 bytes: ["video-01": 1],
                 total: 6,
-                unavailableCount: 2
+                unavailableIDs: ["video-05", "video-06"]
             )
         )
         let text = VideosPresentation.statusText(

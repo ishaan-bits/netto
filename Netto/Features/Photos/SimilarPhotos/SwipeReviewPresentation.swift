@@ -312,24 +312,38 @@ enum SwipeReviewPresentation {
         return items
     }
 
-    // MARK: Thumbnail prefetch (M14)
+    // MARK: Thumbnail prefetch (M14/M15)
 
-    /// The swipe card's instant frame: a lightweight, local-only thumbnail warmed ahead of
-    /// the swipe and shown the moment a card appears, while the large preview loads and
-    /// then crossfades over it. 480 px on the longest side — the card is ~350 pt wide, so
-    /// this is a crisp first frame — and never full-resolution pixels.
-    static let swipeThumbnailPixelSize = 480
+    /// The swipe card's **final** frame: the screen-sized local thumbnail (M15). The card
+    /// box is 340 pt tall and a screen-width box is ~353 pt wide, so 1 080 px on the
+    /// longest side covers the rendered size at 3x — the photo on screen is this
+    /// rendition, never an upscale of something smaller, and never the full-resolution
+    /// original (never a network fetch either: local rendition or an honest unavailable).
+    static let swipeThumbnailPixelSize = 1_080
 
-    /// How many upcoming photos to warm: the current one plus the forward window. 20 keeps
-    /// the window's pixels (~18 MB at 480 px) inside the shared `ThumbnailStore` budget
-    /// (48 MB) alongside the strip's other entries, while covering the next several swipes.
+    /// The temporary, low-resolution frame (M15): shown only while the screen-sized
+    /// thumbnail for the same photo is still being prepared, and replaced by it the moment
+    /// it lands. Never treated as the final sharp image. Prefetched ahead for the whole
+    /// window because it is small (~0.9 MB) and arrives fastest.
+    static let swipeThumbnailLowResPixelSize = 480
+
+    /// How many upcoming photos get their **screen-sized** thumbnail warmed ahead of the
+    /// cursor — "the current image and the next few images" — on top of the low-resolution
+    /// tier that covers the whole window. Five at ~3.5–4.5 MB keeps the two tiers together
+    /// inside the shared `ThumbnailStore`'s byte budget (48 MB) alongside the strip's
+    /// entries; farther cards show their (warm) low-resolution frame while their
+    /// screen-sized thumbnail loads on demand, still local-only.
+    static let swipeSharpPrefetchCount = 5
+
+    /// How many upcoming photos to warm at all: the current one plus this forward window.
+    /// The low-resolution tier covers every one of them; the screen-sized tier covers the
+    /// first `swipeSharpPrefetchCount`. Bounds the request count per window re-walk.
     static let swipePrefetchWindowCount = 20
 
     /// The warm-up order for a swipe at `index`: the current photo first (it is on screen
-    /// *now*), then up to `swipePrefetchWindowCount - 1` photos ahead. Never backward —
-    /// reviewed photos sit behind the cursor and only Undo returns there, and the store's
-    /// LRU keeps recently shown frames anyway. Clamps at both ends; an empty deck is an
-    /// empty order.
+    /// now), then the forward window. Never backward — reviewed photos sit behind the
+    /// cursor and only Undo returns there, and the store's LRU keeps recently shown frames
+    /// anyway. Clamps at both ends; an empty deck is an empty order.
     static func prefetchOrder(around index: Int, in assetIDs: [String]) -> [String] {
         guard !assetIDs.isEmpty, index >= 0 else { return [] }
         let start = min(index, assetIDs.count - 1)

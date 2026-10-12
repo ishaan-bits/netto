@@ -2014,6 +2014,10 @@ final class AppEnvironment {
                 partial[record.localIdentifier] = bytes
             }
             guard self.isCurrentPlanBuild(generation) else { return }
+            // One measurement source of truth (M15): these sizes are authoritative —
+            // publish them into the shared video-size state so the inventory shows and
+            // sorts by the same numbers this review will show.
+            self.recordResolvedVideoSizes(resolvedRecords)
 
             // Fresh authorization at the moment the plan is stamped.
             let authorization = self.photoPermission.currentStatus()
@@ -2604,10 +2608,16 @@ final class AppEnvironment {
 
     // MARK: - Video size resolution (measure once, largest-first honestly)
 
-    /// Starts measuring the current video dataset from scratch. Only starts from `.idle` —
-    /// an in-flight or already-settled measurement is left exactly as it is.
+    /// Ensures the current video dataset is measuring (M15): starts from `.idle` and
+    /// **resumes** a settled-partial measurement — a cancelled or interrupted run keeps
+    /// every byte it already measured and continues only the unknowns. An in-flight run
+    /// and a fully measured dataset are left exactly as they are.
+    ///
+    /// This is the screen-appear entry: the inventory never depends on a separate
+    /// "Measure Sizes" action (M14 removed that button), so re-opening the screen after a
+    /// yield, a cancellation on disappear, or a heavy pass finishing always reuses and
+    /// continues the shared measurement instead of stranding it.
     func startVideoSizeResolution() {
-        guard case .idle = videoSizeResolution else { return }
         resumeVideoSizeMeasurement()
     }
 
@@ -2690,7 +2700,7 @@ final class AppEnvironment {
             guard let self else { return }
             let batchSize = VideoSizeResolution.measurementBatchSize
             var pending = Array(targets)
-            var unavailableCount = 0
+            var unavailableIDs: Set<String> = []
             var lastPublish = ContinuousClock.now
             while !pending.isEmpty {
                 let batch = Array(pending.prefix(batchSize))
@@ -2709,7 +2719,7 @@ final class AppEnvironment {
                         measuredBytes[identifier] = size
                     case .unavailable, nil:
                         // Never counted as measured, never zero — only as attempted.
-                        unavailableCount += 1
+                        unavailableIDs.insert(identifier)
                     }
                 }
                 // Coalesced publishes: a cloud-only library resolves batches in
@@ -2723,7 +2733,7 @@ final class AppEnvironment {
                             datasetSignature: signature,
                             bytes: measuredBytes,
                             total: total,
-                            unavailableCount: unavailableCount
+                            unavailableIDs: unavailableIDs
                         )
                     )
                 }
@@ -2734,7 +2744,7 @@ final class AppEnvironment {
                     datasetSignature: signature,
                     bytes: measuredBytes,
                     total: total,
-                    unavailableCount: unavailableCount
+                    unavailableIDs: unavailableIDs
                 )
             )
             self.videoSizeTask = nil
@@ -2754,6 +2764,72 @@ final class AppEnvironment {
         videoSizeTask = nil
         if case .measuring(let measurement) = videoSizeResolution {
             videoSizeResolution = .settled(measurement)
+        }
+    }
+
+    /// Publishes plan-time size resolutions into the shared video-size state (M15): the
+    /// inventory and the review flow read **one** measurement source of truth, so a size
+    /// the review can show is a size the inventory shows and sorts by — without a second
+    /// measurement pass and without remeasuring the same asset on navigation.
+    ///
+    /// Rules, all about never letting a stale answer win:
+    /// - Only the **current** video dataset's assets are recorded, and only while the
+    ///   asset is byte-identical to what was measured (same modification date) — a
+    ///   resolution that raced a catalog change can never overwrite current results.
+    /// - A measurement stamped with another dataset's signature is never mixed into.
+    /// - A run that is currently measuring owns the state (it will measure those assets
+    ///   itself, and its next publish would overwrite a merge anyway) — the merge waits.
+    /// - A record that resolved to no bytes was *attempted* and honestly failed: it joins
+    ///   `unavailableIDs`, never a zero.
+    func recordResolvedVideoSizes(_ resolvedRecords: [PhotoAssetRecord]) {
+        guard !resolvedRecords.isEmpty else { return }
+        guard case .completed(let catalog) = catalogState else { return }
+        var current: [String: PhotoAssetRecord] = [:]
+        for record in VideoDataset.records(in: catalog) {
+            current[record.localIdentifier] = record
+        }
+        var measured: [String: Int64] = [:]
+        var unavailable: Set<String> = []
+        for record in resolvedRecords {
+            guard let live = current[record.localIdentifier],
+                  live.modificationDate == record.modificationDate
+            else { continue }
+            if let bytes = record.sizeInBytes {
+                measured[record.localIdentifier] = bytes
+            } else {
+                unavailable.insert(record.localIdentifier)
+            }
+        }
+        guard !measured.isEmpty || !unavailable.isEmpty else { return }
+        let signature = videoDatasetSignature
+        let total = current.count
+        switch videoSizeResolution {
+        case .measuring:
+            // The running pass owns the state; its own batches cover these assets.
+            return
+        case .idle:
+            videoSizeResolution = .settled(VideoSizeResolution.Measurement(
+                datasetSignature: signature,
+                bytes: measured,
+                total: total,
+                unavailableIDs: unavailable
+            ))
+        case .settled(let measurement):
+            guard measurement.datasetSignature == signature else { return }
+            var mergedBytes = measurement.bytes
+            for (assetID, bytes) in measured where mergedBytes[assetID] == nil {
+                mergedBytes[assetID] = bytes
+            }
+            // An asset measured now is no longer "could not be measured".
+            var mergedUnavailable = measurement.unavailableIDs
+            mergedUnavailable.subtract(measured.keys)
+            mergedUnavailable.formUnion(unavailable)
+            videoSizeResolution = .settled(VideoSizeResolution.Measurement(
+                datasetSignature: measurement.datasetSignature,
+                bytes: mergedBytes,
+                total: measurement.total,
+                unavailableIDs: mergedUnavailable
+            ))
         }
     }
 

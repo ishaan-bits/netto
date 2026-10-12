@@ -289,6 +289,8 @@ struct VideosView: View {
     private func row(for record: PhotoAssetRecord) -> some View {
         VideoInventoryRow(
             record: record,
+            isKnownUnavailable: env.videoSizeResolution.measurement?
+                .unavailableIDs.contains(record.localIdentifier) ?? false,
             isSelected: env.videoSelection.isSelected(record.localIdentifier),
             store: env.thumbnails,
             onPreview: { previewedVideo = record },
