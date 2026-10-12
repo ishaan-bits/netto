@@ -1,103 +1,368 @@
 import SwiftUI
 
-/// The Video Cleanup hub — one screen grouping the two source-filtered video destinations.
+/// The Video Cleanup screen — every video in the library in **one** list, sorted by
+/// measured size, largest first (the Large Files shape, applied to videos).
 ///
-/// It starts no size measurement on appear. Both destinations read the shared video
-/// inventory and the existing measurement state; classification is by source evidence only.
+/// - **Measured first.** Videos whose exact local file size is known are listed largest
+///   first. Sizes come only from the shared size provider: nothing is inferred from
+///   dimensions, duration, thumbnails, or any fabricated estimate.
+/// - **Size unavailable below.** A video whose bytes could not be measured locally (it
+///   has no file on this iPhone — typically it lives in iCloud) is listed in its own
+///   clearly-labelled section after every measured video — never ranked as zero.
+/// - **Scans automatically, keeps its results.** Measurement starts when the screen
+///   appears and continues from whatever is already measured — opening the screen never
+///   re-measures known sizes, and the completed sizes are persisted (checkpoint) so they
+///   survive leaving the screen and relaunching the app. Only the **Rescan** button
+///   discards them and measures everything again, exactly like the Contacts screen's
+///   Rescan.
+///
+/// Deletion goes through the existing review → confirmation → verification pipeline via
+/// the `.videos` source, which is exactly the selection model this screen writes into —
+/// nothing on this screen deletes anything.
 struct VideoCleanupView: View {
     @Environment(AppEnvironment.self) private var env: AppEnvironment
 
-    var body: some View {
-        CleanupHubScreen(
-            title: "Video Cleanup",
-            intro: VideoCleanupDestination.hubIntro(
-                permission: env.photoPermissionState,
-                catalog: env.catalogState,
-                resolution: env.videoSizeResolution,
-                videoSignature: env.videoDatasetSignature,
-                videoRecords: env.videoRecordsForDisplay,
-                otherVideoCount: env.otherVideosCount
-            )
-        ) {
-            unclassifiedNote
-
-            ForEach(VideoCleanupDestination.allCases, id: \.self) { destination in
-                CleanupDestinationRow(
-                    title: destination.title,
-                    subtitle: destination.subtitle,
-                    icon: destination.icon,
-                    status: status(for: destination),
-                    accessibilityIdentifier: destination.accessibilityIdentifier
-                ) {
-                    VideoInventoryView(source: destination.classification)
-                }
-            }
-        }
-        .onAppear { env.refreshPermissions() }
-    }
-
-    /// The unclassified count is shown as its own honest line — never folded into either
-    /// bucket, and absent entirely when every video's source was established.
-    @ViewBuilder
-    private var unclassifiedNote: some View {
-        let other = env.otherVideosCount
-        if other > 0 {
-            HStack(spacing: NettoLayout.Spacing.sm) {
-                NettoIcon(name: "questionmark.circle", size: NettoIconSize.row, weight: .semibold, tint: NettoColor.warning)
-                Text("\(other) \(other == 1 ? "video" : "videos") with an unconfirmed source")
-                    .font(NettoType.caption)
-                    .foregroundStyle(NettoColor.textSecondary)
-                Spacer(minLength: 0)
-            }
-            .padding(NettoLayout.Spacing.md)
-            .nettoSurface(.elevated, cornerRadius: NettoLayout.Radius.card)
-            .accessibilityElement(children: .combine)
-            .accessibilityIdentifier("unclassifiedVideosNote")
-        }
-    }
-
-    private func status(for destination: VideoCleanupDestination) -> CleanupDestinationStatus {
-        let records: [PhotoAssetRecord]
-        switch destination.classification {
-        case .recorded: records = env.recordedVideosForDisplay
-        case .downloaded: records = env.downloadedVideosForDisplay
-        case .other: records = []
-        }
-        let phase = VideosPresentation.phase(
+    private var phase: VideosPhase {
+        VideosPresentation.phase(
             permission: env.photoPermissionState,
             catalog: env.catalogState,
             resolution: env.videoSizeResolution,
             datasetSignature: env.videoDatasetSignature,
             settledRecords: env.videoRecordsForDisplay
         )
+    }
+
+    private var phaseID: String {
+        switch phase {
+        case .permissionRequired: return "permissionRequired"
+        case .permissionDenied: return "permissionDenied"
+        case .buildingCatalog: return "buildingCatalog"
+        case .paused: return "paused"
+        case .scanRequired: return "scanRequired"
+        case .failed: return "failed"
+        case .empty: return "empty"
+        case .measuringVideos: return "measuringVideos"
+        case .results: return "results"
+        }
+    }
+
+    var body: some View {
+        content
+            .background(NettoColor.background.ignoresSafeArea())
+            .navigationTitle("Video Cleanup")
+            .nettoAppear()
+            .nettoStateTransition(phaseID)
+            .onAppear {
+                env.refreshPermissions()
+                env.synchronizeVideoDataset()
+                env.startVideoSizeResolution()
+            }
+            .onChange(of: env.catalogState) { _, _ in
+                env.synchronizeVideoDataset()
+                env.startVideoSizeResolution()
+            }
+            .onChange(of: env.photoPermissionState) { _, _ in
+                env.startVideoSizeResolution()
+            }
+            // Measurement yields to a heavy pass and resumes when it finishes — kept
+            // honest here so a scan finishing while this screen is open restarts the
+            // measurement without any user action.
+            .onChange(of: env.analysisState.isRunning) { _, running in
+                if !running { env.resumeVideoSizeMeasurement() }
+            }
+            .onChange(of: env.blurAnalysisState.isRunning) { _, running in
+                if !running { env.resumeVideoSizeMeasurement() }
+            }
+            // Deliberately no cancel-on-disappear: the bounded measurement keeps filling
+            // the shared size state while other screens are open (app backgrounding still
+            // checkpoint-cancels it, and the next visit continues from what is measured).
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    switch phase {
+                    case .measuringVideos, .results:
+                        Button("Rescan") { env.rescanVideoSizes() }
+                            .accessibilityIdentifier("videoRescanButton")
+                    default:
+                        EmptyView()
+                    }
+                }
+            }
+    }
+
+    // MARK: Phase dispatch
+
+    @ViewBuilder
+    private var content: some View {
         switch phase {
         case .permissionRequired:
-            return .unavailable(reason: "Allow Photos access to continue.")
+            PhaseMessage(
+                systemImage: "internaldrive",
+                title: "Photos access needed",
+                message: "Netto reads your library's metadata on this iPhone and measures video sizes locally to list your largest videos. Nothing is deleted until you confirm it on the review screen.",
+                buttonTitle: "Allow Photos Access"
+            ) { Task { await env.requestPhotoAccess() } }
+
         case .permissionDenied:
-            return .unavailable(reason: "Photos access is off — enable it in Settings.")
+            PhaseMessage(
+                systemImage: "lock.fill",
+                title: "Photos access is off",
+                message: "Netto needs Photos access to measure your video sizes. Enable it in Settings to continue.",
+                buttonTitle: "Open Settings"
+            ) { openSettings() }
+
         case .scanRequired:
-            return .unknownCount("Not scanned yet")
-        case .buildingCatalog:
-            return .progress(message: "Reading library…", fraction: nil)
-        case .paused:
-            return .paused("Scan paused")
+            PhaseMessage(
+                systemImage: "internaldrive",
+                title: "Find your largest videos",
+                message: "Netto reads your library's metadata on this iPhone, measures video sizes locally, and shows everything largest first. Nothing is deleted until you confirm it on the review screen.",
+                buttonTitle: "Build Catalog"
+            ) { env.startCatalogBuild() }
+
+        case .buildingCatalog(let progress):
+            NettoProgressPanel(
+                message: progress.totalCount > 0
+                    ? "Reading \(progress.enumeratedCount) of \(progress.totalCount) assets…"
+                    : "Counting assets…",
+                fraction: progress.totalCount > 0 ? progress.fraction : nil,
+                cancel: { env.cancelCatalogBuild() }
+            )
+
+        case .paused(let stage):
+            PhaseMessage(
+                systemImage: "pause.circle",
+                title: "Scan paused",
+                message: "\(stage) Nothing was changed — resume to continue where it stopped.",
+                buttonTitle: "Resume"
+            ) { env.resumeInterruptedWork() }
+
         case .failed(let message):
-            return .failed(message)
+            PhaseMessage(
+                systemImage: "exclamationmark.triangle",
+                title: "Scan failed",
+                message: message,
+                buttonTitle: "Try Again"
+            ) { env.startCatalogBuild() }
+
         case .empty:
-            return .empty("No videos found")
-        case .measuringVideos:
-            return .measurement(VideosPresentation.statusText(
-                permission: env.photoPermissionState,
-                catalog: env.catalogState,
-                resolution: env.videoSizeResolution,
-                datasetSignature: env.videoDatasetSignature,
-                settledRecords: env.videoRecordsForDisplay
-            ))
-        case .results:
-            return records.isEmpty
-                ? .empty("None found")
-                : .count(records.count)
+            PhaseMessage(
+                systemImage: "checkmark.seal",
+                title: "No videos found",
+                message: env.photoPermissionState == .limited
+                    ? "None of the photos you granted Netto are videos. If you granted limited access, add more in Settings."
+                    : "Nothing in your library is a video."
+            )
+
+        case .measuringVideos(let measured, let total, let unavailable):
+            // Enumeration is already complete: the full list renders immediately and the
+            // measurement only fills sizes in — the screen never waits on it.
+            inventoryContent(
+                records: env.videoRecordsForDisplay,
+                measured: measured,
+                total: total,
+                unavailable: unavailable
+            )
+
+        case .results(let records):
+            let measurement = env.videoSizeResolution.measurement
+            inventoryContent(
+                records: records,
+                measured: measurement?.measuredCount ?? records.count,
+                total: measurement?.total ?? records.count,
+                unavailable: measurement?.unavailableCount ?? 0
+            )
         }
+    }
+
+    // MARK: Inventory (list first; measurement fills sizes in)
+
+    private func inventoryContent(
+        records: [PhotoAssetRecord],
+        measured: Int,
+        total: Int,
+        unavailable: Int
+    ) -> some View {
+        // `records` already carries the dataset's order: known sizes largest-first, then
+        // the unknowns (never zero, never ranked). The two sections below only label that
+        // order — the counts all come from the same list.
+        let known = records.filter(\.isSizeKnown)
+        let unknown = records.filter { !$0.isSizeKnown }
+        return ScrollView {
+            VStack(alignment: .leading, spacing: NettoLayout.Spacing.lg) {
+                if VideosPresentation.showsLimitedAccessNotice(permission: env.photoPermissionState) {
+                    limitedNotice
+                }
+                summaryHeader(known: known, unknown: unknown)
+
+                if env.videoSizeResolution.isMeasuring {
+                    NettoProgressPanel(
+                        message: VideosPresentation.measuringMessage(
+                            measured: measured,
+                            total: total,
+                            unavailable: unavailable,
+                            isActive: true
+                        ),
+                        fraction: total > 0 ? Double(measured + unavailable) / Double(total) : nil,
+                        cancel: { env.cancelVideoSizeResolution() }
+                    )
+                }
+
+                if !known.isEmpty {
+                    section("Largest first", records: known, unknownSize: false)
+                }
+                if !unknown.isEmpty {
+                    section("iCloud / size unavailable", records: unknown, unknownSize: true)
+                    cloudNote
+                }
+            }
+            .padding(NettoLayout.Spacing.lg)
+        }
+        .safeAreaInset(edge: .bottom) { selectionBar }
+    }
+
+    private var limitedNotice: some View {
+        Label(
+            "Only the photos you selected for Netto are shown.",
+            systemImage: "info.circle"
+        )
+        .font(.caption)
+        .foregroundStyle(NettoColor.warning)
+    }
+
+    /// Honest scope note for the unavailable group: Netto measures only what is stored on
+    /// this iPhone, never downloads a video just to read its size, and names iCloud as the
+    /// typical reason without claiming it as proven for every asset.
+    private var cloudNote: some View {
+        Text("Netto measures only videos stored on this iPhone — it never downloads a video just to read its size. These typically live in iCloud.")
+            .font(NettoType.caption)
+            .foregroundStyle(NettoColor.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func summaryHeader(known: [PhotoAssetRecord], unknown: [PhotoAssetRecord]) -> some View {
+        let totalBytes = known.reduce(Int64(0)) { $0 + ($1.sizeInBytes ?? 0) }
+        return VStack(alignment: .leading, spacing: NettoLayout.Spacing.xxs) {
+            Text("\(known.count + unknown.count) videos")
+                .font(NettoType.metricNumber)
+                .monospacedDigit()
+                .foregroundStyle(NettoColor.textPrimary)
+            Text("\(ByteFormat.string(totalBytes)) measured · \(unknown.count) size unavailable")
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("videoCleanupSummary")
+    }
+
+    private func section(_ title: String, records: [PhotoAssetRecord], unknownSize: Bool) -> some View {
+        VStack(alignment: .leading, spacing: NettoLayout.Spacing.sm) {
+            Text(title)
+                .font(NettoType.sectionTitle)
+                .foregroundStyle(NettoColor.textPrimary)
+            LazyVStack(spacing: NettoLayout.Spacing.sm) {
+                ForEach(records, id: \.localIdentifier) { record in
+                    VideoCleanupRow(
+                        record: record,
+                        unknownSize: unknownSize,
+                        isSelected: env.videoSelection.isSelected(record.localIdentifier),
+                        store: env.thumbnails,
+                        toggle: {
+                            env.mutateVideoSelection { $0.toggle(record.localIdentifier) }
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: Bottom bar
+
+    private var selectionBar: some View {
+        HStack(spacing: NettoLayout.Spacing.md) {
+            VStack(alignment: .leading, spacing: 0) {
+                Text("\(env.videoSelection.selectedCount) of \(env.videoSelection.datasetCount) selected")
+                    .font(.subheadline.weight(.semibold))
+                    .monospacedDigit()
+                Text("Nothing is deleted yet")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.Palette.secondaryLabel)
+            }
+            Spacer()
+            NavigationLink {
+                ReviewSelectionView(source: .videos)
+            } label: {
+                Text("Review").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(NettoPrimaryButtonStyle())
+            .disabled(env.videoSelection.selectedCount == 0)
+            .opacity(env.videoSelection.selectedCount == 0 ? 0.45 : 1)
+        }
+        .nettoFloatingBar()
+    }
+
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+    }
+}
+
+/// One video row: thumbnail, duration, honest size, and the selection check. A measured
+/// size shows its exact bytes; an unmeasurable one says so plainly and is never zero.
+private struct VideoCleanupRow: View {
+    let record: PhotoAssetRecord
+    let unknownSize: Bool
+    let isSelected: Bool
+    let store: ThumbnailStore
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: NettoLayout.Spacing.md) {
+                PhotoThumbnailView(
+                    assetID: record.localIdentifier,
+                    pointSize: 72,
+                    store: store
+                )
+                .frame(width: 72, height: 72)
+                .clipShape(RoundedRectangle(cornerRadius: NettoLayout.Radius.control, style: .continuous))
+
+                VStack(alignment: .leading, spacing: NettoLayout.Spacing.xxs) {
+                    Text(VideosPresentation.durationText(record.duration))
+                        .font(NettoType.secondaryBody.weight(.semibold))
+                        .foregroundStyle(NettoColor.textPrimary)
+                    Text(sizeText)
+                        .font(NettoType.caption)
+                        .foregroundStyle(unknownSize ? NettoColor.warning : NettoColor.textSecondary)
+                    if let date = record.creationDate {
+                        Text(date.formatted(date: .abbreviated, time: .omitted))
+                            .font(NettoType.caption)
+                            .foregroundStyle(NettoColor.textTertiary)
+                    }
+                }
+
+                Spacer(minLength: NettoLayout.Spacing.md)
+
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? NettoColor.brandIndicator : NettoColor.textTertiary)
+            }
+            .padding(NettoLayout.Spacing.md)
+            .nettoSurface(.elevated, cornerRadius: NettoLayout.Radius.card)
+            .overlay {
+                RoundedRectangle(cornerRadius: NettoLayout.Radius.card, style: .continuous)
+                    .stroke(isSelected ? NettoColor.brandIndicator : .clear, lineWidth: 2)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Video, \(VideosPresentation.durationText(record.duration))")
+        .accessibilityValue(isSelected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+
+    private var sizeText: String {
+        if let bytes = record.sizeInBytes {
+            return ByteFormat.string(bytes)
+        }
+        return "Size unavailable — not stored locally"
     }
 }
 

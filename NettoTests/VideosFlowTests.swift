@@ -614,7 +614,11 @@ struct VideosFlowTests {
         #expect(afterGrace.isPartial)
     }
 
-    @Test func resumeOnlyMeasuresWhatIsStillUnknown() async {
+    /// A finished pass is authoritative: the one unmeasurable video is *not* re-attempted
+    /// on every visit (re-poking a cloud-heavy library's thousands of unknowns each entry
+    /// is exactly the re-scan the Video Cleanup contract forbids). Re-checking is the
+    /// Rescan button's job; the unknown stays honestly unknown — never zero.
+    @Test func aFinishedPassDoesNotRePokeTheUnmeasurableVideoOnResume() async {
         let provider = RecordingSizeProvider(sizes: VideosFixture.measuredBytes) // never knows video-06
         let env = makeVideoEnv(sizeProvider: provider).env
 
@@ -629,26 +633,81 @@ struct VideosFlowTests {
         env.resumeVideoSizeMeasurement()
         await waitForSettled(env)
 
-        #expect(provider.callCount == firstCalls + 1)
-        #expect(provider.batches.last == ["video-06"]) // only the unknown one
+        #expect(provider.callCount == firstCalls) // video-06 is not attempted again
         guard case .settled(let stillPartial) = env.videoSizeResolution else {
             Issue.record("expected settled, got \(env.videoSizeResolution)")
             return
         }
         #expect(stillPartial.measuredCount == 5)
         #expect(stillPartial.bytes["video-06"] == nil)
+        #expect(stillPartial.isPartial) // still honest about the unknown
     }
 
-    @Test func startFromSettledDoesNothingWithoutExplicitResume() async {
+    /// The Video Cleanup contract (Large-Files shape): opening the screen reuses what is
+    /// already measured. A settled measurement is kept as-is — re-entering never re-scans
+    /// and never re-pokes the videos that could not be measured.
+    @Test func reEnteringReusesMeasuredSizesAndNeverRescans() async {
         let provider = RecordingSizeProvider(sizes: VideosFixture.measuredBytes)
         let env = makeVideoEnv(sizeProvider: provider).env
         env.startVideoSizeResolution()
         await waitForSettled(env)
         let callsAfterSettle = provider.callCount
+        #expect(callsAfterSettle > 0)
 
-        env.startVideoSizeResolution() // settled → no-op by design
-        #expect(provider.callCount == callsAfterSettle)
+        env.startVideoSizeResolution() // the screen was opened again
+
+        #expect(provider.callCount == callsAfterSettle) // nothing measured twice
         #expect(env.videoSizeResolution.isMeasuring == false)
+    }
+
+    /// A partial measurement continues on re-entry: the sizes already known are kept and
+    /// only the unmeasured remainder is attempted.
+    @Test func aPartialMeasurementContinuesOnlyTheUnknownsOnReEntry() async {
+        let provider = RecordingSizeProvider(sizes: VideosFixture.measuredBytes)
+        let (env, _) = makeVideoEnv(sizeProvider: provider)
+        // An interrupted run that knew two sizes.
+        env.videoSizeResolution = .settled(VideoSizeResolution.Measurement(
+            datasetSignature: env.videoDatasetSignature,
+            bytes: ["video-01": 111, "video-02": 222],
+            total: VideosFixture.videos.count
+        ))
+
+        env.startVideoSizeResolution()
+        await waitForSettled(env)
+
+        // Only the unknown remainder reached the provider.
+        let asked = Set(provider.batches.flatMap { $0 })
+        #expect(!asked.contains("video-01"))
+        #expect(!asked.contains("video-02"))
+        guard case .settled(let measurement) = env.videoSizeResolution else {
+            Issue.record("expected settled, got \(env.videoSizeResolution)")
+            return
+        }
+        // The kept sizes win; the rest were measured.
+        #expect(measurement.bytes["video-01"] == 111)
+        #expect(measurement.bytes["video-02"] == 222)
+        #expect(measurement.measuredCount == VideosFixture.measuredBytes.count)
+    }
+
+    /// Rescan is the only path that discards measured data: everything is measured again
+    /// from scratch (the Contacts screen's Rescan contract).
+    @Test func rescanDiscardsAndMeasuresEverythingAgain() async {
+        let provider = RecordingSizeProvider(sizes: VideosFixture.measuredBytes)
+        let (env, _) = makeVideoEnv(sizeProvider: provider)
+        env.startVideoSizeResolution()
+        await waitForSettled(env)
+        let callsAfterFirst = provider.callCount
+        #expect(callsAfterFirst > 0)
+
+        env.rescanVideoSizes()
+        await waitForSettled(env)
+
+        #expect(provider.callCount > callsAfterFirst) // a fresh pass over the dataset
+        guard case .settled(let measurement) = env.videoSizeResolution else {
+            Issue.record("expected settled after rescan, got \(env.videoSizeResolution)")
+            return
+        }
+        #expect(measurement.measuredCount == VideosFixture.measuredBytes.count)
     }
 
     @Test func measurementNeverStartsWithoutPermissionOrVideos() {
@@ -1140,7 +1199,22 @@ struct VideoCheckpointFlowTests {
         // The seeded ids were never handed to the provider — only the remainder was.
         let asked = Set(provider.batches.flatMap { $0 })
         #expect(asked.isDisjoint(with: Set(seeded.keys)))
-        #expect(checkpointStore.load() == nil)
+        // A completed measurement is kept as persisted scan data (not cleared): a
+        // relaunch reuses it instead of re-scanning.
+        #expect(checkpointStore.load() != nil)
+
+        // Relaunch: a fresh environment over the same store sees the kept sizes.
+        let relaunchProvider = RecordingSizeProvider(sizes: syntheticSizes(count: 10))
+        let (relaunched, _) = makeVideoEnv(
+            catalog: makeCatalog(records),
+            sizeProvider: relaunchProvider,
+            checkpointStore: checkpointStore
+        )
+        await relaunched.bootstrap()
+        relaunched.resumeVideoSizeMeasurement()
+        await waitForSettled(relaunched)
+        let relaunchAsked = Set(relaunchProvider.batches.flatMap { $0 })
+        #expect(relaunchAsked.isDisjoint(with: Set(seeded.keys))) // kept sizes never re-measured
     }
 
     @Test func expirationCheckpointsAPartialMeasurementAndForegroundFinishesOnlyTheRemainder()
@@ -1205,7 +1279,12 @@ struct VideoCheckpointFlowTests {
         let newIDs = Set(provider.batches.dropFirst(batchesBefore).flatMap { $0 })
         #expect(newIDs.count == records.count - partial.measuredCount)
         #expect(newIDs.isDisjoint(with: Set(partial.bytes.keys)))
-        #expect(checkpointStore.load() == nil)
+        // The finished measurement is *kept* as persisted scan data (M11-shape contract):
+        // the next session reuses these sizes instead of re-scanning — only Rescan
+        // discards them.
+        let kept = try #require(checkpointStore.load())
+        #expect(kept.kind == .videoSizes)
+        #expect(kept.videoSizes.count == records.count)
         #expect(!background.isHolding)
     }
 

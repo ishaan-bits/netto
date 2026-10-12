@@ -485,7 +485,7 @@ enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
         case .imageCleanup:
             return "Duplicates, similar shots, blur, old screenshots"
         case .videoCleanup:
-            return "Recorded and downloaded videos, by size"
+            return "All your videos, largest first"
         case .duplicateContacts:
             return "Likely-duplicate contact entries"
         case .swipeCleanup:
@@ -616,15 +616,10 @@ enum DashboardCleanupPresentation {
                 )
             )
         case .results(let records):
+            // One unified inventory (M11-era Large Files shape, restored): the count is
+            // every video the catalog holds — no source split, no source figures.
             let total = records.count
-            let unclassified = otherVideoCount
-            let line = "\(total) videos"
-            guard unclassified == 0 else {
-                return .unknownCount(line + " · \(unclassified) unknown source")
-            }
-            let recorded = recordedVideos.count
-            let downloaded = downloadedVideos.count
-            if recorded == 0, downloaded == 0 {
+            guard total > 0 else {
                 return .empty("No videos found")
             }
             return .count(total)

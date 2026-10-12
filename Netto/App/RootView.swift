@@ -2597,10 +2597,25 @@ final class AppEnvironment {
 
     // MARK: - Video size resolution (measure once, largest-first honestly)
 
-    /// Starts measuring the current video dataset from scratch. Only starts from `.idle` —
-    /// an in-flight or already-settled measurement is left exactly as it is.
+    /// Ensures the video dataset is measured — the Video Cleanup screen's entry point.
+    /// Starts from `.idle`, and **continues** a settled measurement (keeping every size it
+    /// already measured and re-checking only the unknowns), so opening the screen never
+    /// re-measures what it already knows. An in-flight run and a fully measured dataset
+    /// are left exactly as they are: revisiting costs no provider calls at all.
     func startVideoSizeResolution() {
-        guard case .idle = videoSizeResolution else { return }
+        guard !videoSizeResolution.isMeasuring else { return }
+        resumeVideoSizeMeasurement()
+    }
+
+    /// The user-initiated Rescan (mirrors the Contacts screen's Rescan): discards the
+    /// measured sizes and their persisted checkpoint and measures the dataset fresh. This
+    /// is the only path that throws measured data away — ordinary entry reuses it.
+    func rescanVideoSizes() {
+        videoSizeGeneration += 1
+        videoSizeTask?.cancel()
+        videoSizeTask = nil
+        videoSizeResolution = .idle
+        clearVideoCheckpointIfOwned()
         resumeVideoSizeMeasurement()
     }
 
@@ -2626,6 +2641,16 @@ final class AppEnvironment {
         }
 
         let signature = videoDatasetSignature
+        let total = videos.count
+        // A settled run that already attempted the whole dataset is authoritative: a
+        // revisit does nothing at all — it keeps every measured size and never re-pokes
+        // the videos that could not be measured. (A partial run continues below.)
+        if videoSizeResolution.isCurrent(for: signature),
+           let existing = videoSizeResolution.measurement,
+           existing.total == total,
+           existing.resolvedCount >= existing.total {
+            return
+        }
         var measuredBytes: [String: Int64]
         if videoSizeResolution.isCurrent(for: signature) {
             measuredBytes = videoSizeResolution.bytes // resume: keep what this dataset already measured
@@ -2650,7 +2675,6 @@ final class AppEnvironment {
                 measuredBytes[entry.assetID] = entry.bytes
             }
         }
-        let total = videos.count
         let targets = videos.lazy.map(\.localIdentifier).filter { measuredBytes[$0] == nil }
 
         guard !targets.isEmpty else {
@@ -2661,8 +2685,10 @@ final class AppEnvironment {
                     total: total
                 )
             )
-            // The dataset is fully measured: its checkpoint has served its purpose.
-            clearVideoCheckpointIfOwned()
+            // Fully measured: persist the sizes as kept scan data (not clear them), so a
+            // relaunch and every later visit reuse them instead of re-measuring. Only the
+            // user's Rescan discards them.
+            writeVideoSizeCheckpoint()
             syncBackgroundTask()
             return
         }
@@ -2731,8 +2757,10 @@ final class AppEnvironment {
                 )
             )
             self.videoSizeTask = nil
-            // Fully measured: release the checkpoint that carried the run this far.
-            self.clearVideoCheckpointIfOwned()
+            // Fully measured: keep what this run measured as the persisted scan data the
+            // next session reuses — the checkpoint is no longer just interrupted-run
+            // evidence, it is the kept result. Only Rescan clears it.
+            self.writeVideoSizeCheckpoint()
             self.syncBackgroundTask()
         }
         syncBackgroundTask()
@@ -2821,7 +2849,13 @@ final class AppEnvironment {
     /// synchronous bounded write at the pause transition: determinism matters more than a
     /// few milliseconds there, and this is never a per-asset or per-batch write.
     private func writeVideoSizeCheckpoint() {
-        guard case .measuring(let measurement) = videoSizeResolution else { return }
+        let measurement: VideoSizeResolution.Measurement
+        switch videoSizeResolution {
+        case .measuring(let running), .settled(let running):
+            measurement = running
+        case .idle:
+            return
+        }
         guard case .completed(let catalog) = catalogState else { return }
         let videos = VideoDataset.records(in: catalog)
         guard !videos.isEmpty, !measurement.bytes.isEmpty else { return }
