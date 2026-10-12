@@ -273,11 +273,20 @@ final class ScanValidationUITests: XCTestCase {
         let sectionText = section.exists ? labelTree(of: section) : ""
         print("VALIDATE image-cleanup section: \(sectionText)")
         attach("image cleanup section: \(sectionText)", name: "results-card")
+        // M13 runs the similarity and sharpness pipelines concurrently over one catalog, so
+        // the scan card reaches `.finished` (similarity done — asserted above) while the
+        // sharpness pass is *still running* and honestly reports "Checking sharpness: N of M"
+        // on its row. Before M13 the sharpness row always read "Not analyzed yet" (blur was
+        // never part of the dashboard scan), so the terminal phrases below were the only
+        // state the section could show. Under M13 the live in-progress sharpness message is
+        // an equally valid, honest section state once the similarity side has completed.
+        let sectionLower = sectionText.lowercased()
         XCTAssertTrue(
-            sectionText.lowercased().contains("ready to review")
-                || sectionText.lowercased().contains("no duplicate")
-                || sectionText.lowercased().contains("no groups")
-                || sectionText.lowercased().contains("not analyzed"),
+            sectionLower.contains("ready to review")
+                || sectionLower.contains("no duplicate")
+                || sectionLower.contains("no groups")
+                || sectionLower.contains("not analyzed")
+                || sectionLower.contains("checking sharpness"),
             "results did not reach the image cleanup section: \(sectionText)"
         )
 

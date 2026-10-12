@@ -102,7 +102,7 @@ struct DashboardView: View {
             status: scanStatus,
             onAllowPhotos: { showPhotoPrePrompt = true },
             onOpenSettings: openSettings,
-            onAnalyze: { env.startSimilarityAnalysis() },
+            onAnalyze: { env.startImageAnalysis() },
             onCancel: cancelScan,
             onResume: { env.resumeInterruptedWork() },
             isLimitedAccess: env.photoPermissionState == .limited
@@ -115,8 +115,17 @@ struct DashboardView: View {
     }
 
     private func cancelScan() {
-        if case .running = env.analysisState {
-            env.cancelSimilarityAnalysis()
+        // The unified session runs both pipelines over one shared read (M13), and the
+        // dashboard card is the one control that owns the whole scan — so its cancel must
+        // stop both. Cancelling only similarity would orphan the sharpness pass, and the
+        // next Analyze would then be treated as a queued request behind that orphan instead
+        // of a fresh scan. When neither pipeline is running but a standalone catalog build
+        // is, cancel that instead.
+        let similarityRunning = env.analysisState.isRunning
+        let blurRunning = env.blurAnalysisState.isRunning
+        if similarityRunning || blurRunning {
+            if blurRunning { env.cancelBlurAnalysis() }
+            if similarityRunning { env.cancelSimilarityAnalysis() }
         } else {
             env.cancelCatalogBuild()
         }

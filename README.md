@@ -458,6 +458,50 @@ The animation is a pure function of real state, so it cannot out-say the app.
   and thermal behaviour were not profiled on device; validation is Simulator and code
   inspection only.
 
+### Unified Image Cleanup session (M13)
+
+The duplicate/similar and sharpness analyses now run as **one user-visible session over
+one photo catalog**: a single Analyze tap starts both pipelines **concurrently**, each
+with its own honest progress, results, and lifecycle. Before M13 the two were separate
+runs that queued behind each other, so a scan only ever advanced one of them.
+
+- **One tap, two pipelines, one catalog** — `startImageAnalysis()` is the single entry
+  every Analyze button calls. With both pipelines idle it claims both checkpoint channels,
+  enumerates the library **once**, then launches the similarity and sharpness passes
+  **concurrently** over the same snapshot. With exactly one pipeline still running (the
+  other failed or was cancelled mid-session) it starts only the idle one through that
+  pipeline's own entry point, which queues it behind the running pass rather than racing
+  it. Repeated taps are idempotent for the active session.
+- **The shared read outlives a single cancel** — the one `PHAsset.fetchAssets`
+  enumeration lives in `catalogTask`, not either pipeline's task, so cancelling one
+  pipeline's *work* leaves the read standing for the other. The read is only abandoned
+  when the whole session is (pause, deletion, a superseding session). Similarity may reach
+  `.completed` and become reviewable while the sharpness pass is still running — completion,
+  failure, or cancellation of one never touches the other.
+- **Bounded shared worker budget** — both engines report how many heavy passes are active
+  through `AnalysisConcurrencyBudget`, and `ScanConcurrencyPolicy.sharedWidth` splits the
+  thermal-scaled worker width between them. One pass keeps its full width; two concurrent
+  passes each get half (floor of 1), so the pair never does more concurrent work than one
+  pass used to alone — no doubled thermal load on a phone.
+- **Per-kind checkpoints** — each pipeline owns its own checkpoint file
+  (`checkpoint-similarity.json`, `checkpoint-blur.json`), writer, and accumulator
+  (`CheckpointChannels`), so an interruption to one is resumable without the other, and a
+  relaunch restores *every* interrupted pass. Resume re-runs the two together when both
+  were interrupted, or routes a single one to the pass that owns it.
+- **Deletion preserves unrelated in-flight work** — deleting assets while a pass is
+  running no longer cancels it. The confirmed removals are recorded and reconciled out of
+  the result the moment it lands (`removingAssets`), so work for every *surviving* asset
+  is kept and the pass never reports a just-deleted asset as removed. Only a standalone
+  catalog read is still abandoned (it would complete with pre-mutation records). The
+  dashboard's cancel stops **both** pipelines — cancelling only similarity would orphan
+  the sharpness pass, and the next Analyze would queue behind that orphan.
+- **Performance is honest, not claimed** — because the primary scan now includes the
+  sharpness pass, it fully settles noticeably longer on a large library than the old
+  similarity-only scan (the scan card reaches "Finished" once similarity completes, while
+  the sharpness row keeps reporting real counted progress). No wall-clock figure is
+  claimed for a physical device; the Simulator end-to-end validation is the only timing
+  evidence, and it is not representative of device performance.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
@@ -603,6 +647,23 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M13)** — after unifying the Image Cleanup session, the full unit
+  suite reported **843 tests in 83 suites, 0 failures** (the pre-existing
+  `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged), plus one clean
+  app build with **no warnings**. Five new unit cases pin the M13 contracts: one Analyze
+  tap starts both pipelines concurrently, cancelling one leaves the other running, the
+  concurrency budget is idempotent per kind, the shared width halves across two passes,
+  and a relaunch restores both interrupted pipelines independently. Real-library UI
+  validation (Simulator, ~42k photos) was run against the M12 baseline for a non-regression
+  comparison: the cancel-and-restart flow and the full scan reaching a terminal state both
+  pass, with two findings folded in — the dashboard's cancel now stops both pipelines
+  (previously it orphaned the sharpness pass), and the full-scan case accepts the sharpness
+  row's honest in-progress message once the similarity side has completed (the sharpness
+  pass is now part of the primary scan and outlasts it). The scan card reaches "Finished"
+  when similarity completes (~143 s on the 42k Simulator library, vs ~86 s for the old
+  similarity-only scan); the sharpness pass then continues for several more minutes — a real
+  cost of running both, reported here rather than dressed up as a device claim.
+
 - **Recent verification (M12)** — after removing Large Files and adding the scan-core
   animation, a full-suite run reported **838 tests in 83 suites, 0 failures** (the
   pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged),
@@ -762,6 +823,16 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   tasks — a reasoned basis for expecting it to be cheap, but not a measurement. Real-device
   validation of the scan animation, like the rest of the device matrix, has not been
   performed.
+- **The unified session's real-device cost is unmeasured (M13)** — the primary scan now
+  runs the similarity and sharpness pipelines concurrently, so it fully settles noticeably
+  longer on a large library than the old similarity-only scan (the scan card reaches
+  "Finished" when similarity completes, while the sharpness row keeps reporting real
+  counted progress for several more minutes on a ~42k Simulator library). The shared worker
+  budget keeps the *combined* concurrency at or below what one pass used alone, which bounds
+  thermal load but does not make the added sharpness work free. No wall-clock figure is
+  claimed for a physical device; the Simulator timing above is not representative, and
+  device-profiled timing of the unified session (Time Profiler + thermal + hitches) has not
+  been performed.
 - **One skipped test** — `cancellationPropagatesOutOfTheLoader` in
   `PhotoKitThumbnailLoaderTests` reports as cancelled when executed in the full-suite
   context but passes when run alone; the behaviour predates Phase B (reproduced on the

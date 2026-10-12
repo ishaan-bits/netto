@@ -3,9 +3,10 @@ import Foundation
 
 struct BlurAnalysisConfiguration: Sendable, Equatable {
     /// Fixed worker width. Never one task per asset: peak memory (bounded thumbnails) and
-    /// CPU utilization stay fixed regardless of library size. Job coordination keeps the
-    /// sharpness pass from *overlapping* the similarity pass (see `startBlurAnalysis`);
-    /// within a run the width is further scaled down by the thermal policy.
+    /// CPU utilization stay fixed regardless of library size. When the similarity pass runs
+    /// concurrently the shared budget halves both passes' effective width (M13, see
+    /// `AnalysisConcurrencyBudget`); within a run the width is further scaled down by the
+    /// thermal policy.
     var maxConcurrentWorkers: Int = 4
     /// Longest thumbnail side requested from PhotoKit — the local-only, bounded analysis
     /// rendition (same pixel budget as the similarity engine's verification pass).
@@ -18,6 +19,11 @@ struct BlurAnalysisConfiguration: Sendable, Equatable {
     /// Where the run reads the device's thermal state (`ScanConcurrencyPolicy`). A policy
     /// source, not a tuning value — excluded from `==` (see below).
     var thermalState: @Sendable () -> ProcessInfo.ThermalState = { ProcessInfo.processInfo.thermalState }
+    /// How many heavy analysis pipelines are running concurrently right now — the shared
+    /// budget (M13). A policy source, not a tuning value (excluded from `==`). Default 1:
+    /// a standalone pass keeps its full configured width; the unified Image Cleanup session
+    /// reports 2 so both pipelines split the budget (see `AnalysisConcurrencyBudget`).
+    var concurrentPasses: @Sendable () -> Int = { 1 }
 
     init() {}
 
@@ -183,9 +189,13 @@ struct BlurAnalysisEngine: Sendable {
             return seed
         }()
         // Thermal-adaptive width (see `ScanConcurrencyPolicy`): the configured bound above,
-        // scaled by the current thermal state; recorded below as the effective width.
+        // scaled by the current thermal state and shared across any concurrently active
+        // heavy passes (M13); recorded below as the effective width.
         let thermalPolicy = ScanConcurrencyPolicy(thermalState: config.thermalState)
-        let workerWidth = thermalPolicy.width(base: config.maxConcurrentWorkers)
+        let workerWidth = thermalPolicy.sharedWidth(
+            base: config.maxConcurrentWorkers,
+            activePasses: config.concurrentPasses()
+        )
         let runStarted = DispatchTime.now().uptimeNanoseconds
         // Failure-code tally is per run: one summary must never include a previous run's
         // failures (the validation harness runs cancel-then-full in one process).

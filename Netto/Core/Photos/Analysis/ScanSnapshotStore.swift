@@ -147,11 +147,17 @@ struct ScanCheckpoint: Codable, Equatable, Sendable {
 
     /// Which pass the checkpoint belongs to. Also the priority order for writes: a single
     /// file can hold only one, and the heavier pass's resume info wins over video sizes.
-    enum Kind: String, Codable, Sendable {
+    enum Kind: String, Codable, Sendable, CaseIterable {
         case catalog
         case similarity
         case blur
         case videoSizes
+
+        /// Heavier pass first: when only one consumer asks for "the" checkpoint and several
+        /// kinds are stored, the most expensive interrupted work wins the resume slot. A
+        /// static on the enum (not the store protocol) so every caller — including ones
+        /// holding only an `any ScanCheckpointStore` — can reach it.
+        static let priorityOrder: [Kind] = [.similarity, .blur, .catalog, .videoSizes]
     }
 
     /// Entries accumulated before the next flush triggers — large enough that a 40k-library
@@ -214,19 +220,39 @@ struct ScanCheckpoint: Codable, Equatable, Sendable {
 
 /// Persistence seam for `ScanCheckpoint` — same injection rule as `ScanSnapshotStore`:
 /// tests use temporary storage instead of the app's real file.
+///
+/// Kind-addressed (M13): the similarity and sharpness pipelines now run concurrently, so each
+/// pass kind owns its own stored checkpoint. `save` routes by the checkpoint's own `kind`.
 protocol ScanCheckpointStore: Sendable {
     func save(_ checkpoint: ScanCheckpoint) throws
-    /// The stored checkpoint, or `nil` when none exists, the data is corrupt, or the schema
-    /// is incompatible. Must never throw and never crash.
+    /// The stored checkpoint for a single-slot consumer. When several kinds are stored at
+    /// once, returns the highest-priority resumable one (heavier pass first) — never nil
+    /// merely because other kinds also have checkpoints.
     func load() -> ScanCheckpoint?
+    /// Removes every stored kind.
     func clear()
+    /// The stored checkpoint for one pass kind, or `nil` when that kind has none.
+    func load(kind: ScanCheckpoint.Kind) -> ScanCheckpoint?
+    /// Removes only one pass kind's checkpoint, leaving every other kind intact.
+    func clear(kind: ScanCheckpoint.Kind)
+    /// Every stored checkpoint, one per kind that has one. Bootstrap uses this so a relaunch
+    /// restores *every* interrupted pass, not just one of them.
+    func loadAll() -> [ScanCheckpoint]
 }
 
-/// File-backed store: `<Application Support>/ScanState/checkpoint.json`, written atomically
-/// (same directory and write rules as the completed-scan snapshot).
-struct FileScanCheckpointStore: ScanCheckpointStore {
-    private static let fileName = "checkpoint.json"
+extension ScanCheckpointStore {
+    /// Heavier pass first (see `ScanCheckpoint.Kind.priorityOrder`, the single definition).
+    static var priorityOrder: [ScanCheckpoint.Kind] {
+        ScanCheckpoint.Kind.priorityOrder
+    }
+}
 
+/// File-backed store: one file per pass kind under `<Application Support>/ScanState/`
+/// (`checkpoint-similarity.json`, `checkpoint-blur.json`, …), each written atomically.
+///
+/// Application Support is the app-private Foundation location for per-app documents; no path
+/// is hard-coded — the directory comes from `FileManager.url(for:in:appropriateFor:create:)`.
+struct FileScanCheckpointStore: ScanCheckpointStore {
     /// Test seam: an explicit directory (e.g. a temporary one) instead of Application Support.
     private let directoryOverride: URL?
 
@@ -238,12 +264,12 @@ struct FileScanCheckpointStore: ScanCheckpointStore {
         try ScanStateDirectory.url(override: directoryOverride)
     }
 
-    private func fileURL() throws -> URL {
-        try directoryURL().appendingPathComponent(Self.fileName)
+    private func fileURL(for kind: ScanCheckpoint.Kind) throws -> URL {
+        try directoryURL().appendingPathComponent("checkpoint-\(kind.rawValue).json")
     }
 
     func save(_ checkpoint: ScanCheckpoint) throws {
-        let url = try fileURL()
+        let url = try fileURL(for: checkpoint.kind)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -253,19 +279,120 @@ struct FileScanCheckpointStore: ScanCheckpointStore {
     }
 
     func load() -> ScanCheckpoint? {
-        guard let url = try? fileURL() else { return nil }
+        for kind in Self.priorityOrder {
+            if let checkpoint = load(kind: kind) { return checkpoint }
+        }
+        return nil
+    }
+
+    func load(kind: ScanCheckpoint.Kind) -> ScanCheckpoint? {
+        guard let url = try? fileURL(for: kind) else { return nil }
         guard let data = try? Data(contentsOf: url) else { return nil }
         guard let checkpoint = try? JSONDecoder().decode(ScanCheckpoint.self, from: data) else {
             return nil
         }
-        // Wrong/future schema: ignore safely — fall back to "no checkpoint", never resume.
-        guard checkpoint.schemaVersion == ScanCheckpoint.currentSchemaVersion else { return nil }
+        // Wrong/future schema, or a file that no longer matches its kind: ignore safely —
+        // fall back to "no checkpoint", never resume.
+        guard checkpoint.schemaVersion == ScanCheckpoint.currentSchemaVersion,
+              checkpoint.kind == kind
+        else { return nil }
         return checkpoint
     }
 
+    func loadAll() -> [ScanCheckpoint] {
+        ScanCheckpoint.Kind.allCases.compactMap { load(kind: $0) }
+    }
+
     func clear() {
-        guard let url = try? fileURL() else { return }
+        for kind in ScanCheckpoint.Kind.allCases {
+            clear(kind: kind)
+        }
+    }
+
+    func clear(kind: ScanCheckpoint.Kind) {
+        guard let url = try? fileURL(for: kind) else { return }
         try? FileManager.default.removeItem(at: url)
+    }
+}
+
+/// Presents one pass kind's slice of a shared multi-kind store as a single-slot store, so
+/// each concurrent pass owns an independent `ScanCheckpointWriter` (with its own write
+/// ordering) while still persisting through the one injected seam. Without this, two
+/// concurrent writers sharing a store would order-guard each other's flushes away.
+struct KindScopedCheckpointStore: ScanCheckpointStore {
+    private let base: any ScanCheckpointStore
+    private let kind: ScanCheckpoint.Kind
+
+    init(base: any ScanCheckpointStore, kind: ScanCheckpoint.Kind) {
+        self.base = base
+        self.kind = kind
+    }
+
+    func save(_ checkpoint: ScanCheckpoint) throws {
+        // The base routes by the checkpoint's own kind; a scoped store never rewrites it.
+        try base.save(checkpoint)
+    }
+
+    func load() -> ScanCheckpoint? {
+        base.load(kind: kind)
+    }
+
+    func clear() {
+        base.clear(kind: kind)
+    }
+
+    func load(kind requested: ScanCheckpoint.Kind) -> ScanCheckpoint? {
+        requested == kind ? base.load(kind: kind) : nil
+    }
+
+    func clear(kind requested: ScanCheckpoint.Kind) {
+        guard requested == kind else { return }
+        base.clear(kind: kind)
+    }
+
+    func loadAll() -> [ScanCheckpoint] {
+        base.load(kind: kind).map { [$0] } ?? []
+    }
+}
+
+/// Per-kind checkpoint channels (M13): every pass kind owns its own writer and accumulator,
+/// so the similarity and sharpness pipelines can run — and be interrupted — concurrently
+/// without contending for a single checkpoint slot. Each channel persists through the one
+/// injected store seam, scoped to its own kind.
+final class CheckpointChannels: @unchecked Sendable {
+    private var writers: [ScanCheckpoint.Kind: ScanCheckpointWriter] = [:]
+    private var accumulators: [ScanCheckpoint.Kind: ScanCheckpointAccumulator] = [:]
+
+    /// - Parameters:
+    ///   - store: the injected persistence seam; each channel scopes it to its own kind.
+    ///   - restored: every checkpoint a relaunch restored, so each channel's writer learns
+    ///     its own kind's ordering before any new run claims the file.
+    init(store: any ScanCheckpointStore, restored: [ScanCheckpoint] = []) {
+        for kind in ScanCheckpoint.Kind.allCases {
+            let scoped = KindScopedCheckpointStore(base: store, kind: kind)
+            let writer = ScanCheckpointWriter(
+                store: scoped,
+                adopting: restored.first { $0.kind == kind }
+            )
+            writers[kind] = writer
+            accumulators[kind] = ScanCheckpointAccumulator(writer: writer)
+        }
+    }
+
+    func writer(for kind: ScanCheckpoint.Kind) -> ScanCheckpointWriter {
+        // `allCases` populated every kind; the fallback keeps the accessor non-optional.
+        writers[kind] ?? ScanCheckpointWriter(store: KindScopedCheckpointStore(base: FileScanCheckpointStore(), kind: kind))
+    }
+
+    func accumulator(for kind: ScanCheckpoint.Kind) -> ScanCheckpointAccumulator {
+        accumulators[kind] ?? ScanCheckpointAccumulator(writer: writer(for: kind))
+    }
+
+    /// Teaches one kind's writer what its file already holds, so a kind-aware clear still
+    /// works across a relaunch (e.g. a video-size settle must not remove a restored
+    /// heavy pass's file — they are separate files, but the ordering seed matters).
+    func adopt(_ checkpoint: ScanCheckpoint) {
+        writer(for: checkpoint.kind).adopt(checkpoint)
     }
 }
 

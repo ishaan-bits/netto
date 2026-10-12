@@ -134,7 +134,7 @@ struct PotentiallyBlurryView: View {
                 message: "Netto measures the sharpness of every photo in your scanned library on this iPhone. Photos that look blurry or soft show up here for review — nothing is preselected, and nothing is deleted until you confirm it.",
                 buttonTitle: "Analyze Sharpness"
             ) {
-                env.startBlurAnalysis()
+                env.startImageAnalysis()
             }
 
         case .queuedBehindSimilarity:
@@ -178,7 +178,7 @@ struct PotentiallyBlurryView: View {
                 message: "The sharpness check stopped before it finished. Nothing was changed.",
                 buttonTitle: "Analyze Again"
             ) {
-                env.startBlurAnalysis()
+                env.startImageAnalysis()
             }
 
         case .failed(let message):
@@ -188,7 +188,7 @@ struct PotentiallyBlurryView: View {
                 message: message,
                 buttonTitle: "Try Again"
             ) {
-                env.startBlurAnalysis()
+                env.startImageAnalysis()
             }
 
         case .emptyLibrary:

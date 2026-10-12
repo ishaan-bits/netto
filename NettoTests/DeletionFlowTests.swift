@@ -536,12 +536,17 @@ struct DeletionFlowTests {
         #expect(env.deletionState == .deleting(plan))
     }
 
-    /// D1: a confirmed deletion during an in-flight analysis used to strand the state at
-    /// `.running` forever — the run is cancelled and generation-superseded, but no terminal
-    /// state was ever written, and both scan entry points refuse to start over `.running`,
-    /// bricking the feature until relaunch. The mutation now lands `.cancelled`, the same
-    /// terminal write the sharpness pass already gets.
-    @Test func deletionDuringAnAnalysisCancelsItInsteadOfStrandingIt() async {
+    /// D1 (M13 behavior change, justified): a confirmed deletion during an in-flight analysis
+    /// used to cancel and generation-supersede the run, stranding the state at `.running`
+    /// forever (both scan entry points refuse to start over `.running`, bricking the feature
+    /// until relaunch). The old fix wrote `.cancelled`. M13 instead *preserves* the running
+    /// pass: its work for every asset that survived the mutation is valid, so cancelling it
+    /// would throw that away and force a full re-run. The pass keeps its generation and runs
+    /// to completion; the confirmed removals are reconciled out of its result when it lands
+    /// (`deletionsDuringRunningPasses`), so it can never strand and never describes a deleted
+    /// asset. Immediately after the deletion the state is therefore still `.running` — not
+    /// `.cancelled`, not stranded (a real in-flight task completes it).
+    @Test func deletionDuringAnAnalysisPreservesItInsteadOfStrandingOrCancelling() async {
         let (env, _) = makeEnv()
         env.analysisState = .running(PhotoAnalysisProgress(
             stage: .comparing, completedUnits: 1, totalUnits: 4
@@ -561,7 +566,14 @@ struct DeletionFlowTests {
             Issue.record("expected succeeded, got \(env.deletionState)")
             return
         }
-        #expect(env.analysisState == .cancelled)
+        // The pass was neither cancelled nor stranded: it is still running (M13 lets it
+        // finish and reconcile), and it was never flipped to a terminal state by the
+        // deletion — which is exactly what used to brick the feature.
+        guard case .running(let progress) = env.analysisState else {
+            Issue.record("expected the running pass to be preserved, got \(env.analysisState)")
+            return
+        }
+        #expect(progress.stage == .comparing)
     }
 
     @Test func reviewDidAppearDuringADeletionIsANoOp() {
@@ -656,6 +668,88 @@ struct DeletionFlowTests {
         #expect(service.callCount == 0)
     }
 
+    // MARK: M13 — unified session coordination and shared worker budget
+
+    /// The single Analyze tap starts both pipelines as one session (M13): immediately after
+    /// `startImageAnalysis()`, similarity reports `.running` (its `preparing` stage, over the
+    /// shared enumeration) and the sharpness pass reports `.running` too. Neither waits for
+    /// the other to be admitted.
+    @Test func oneAnalyzeTapStartsBothPipelinesConcurrently() {
+        let (env, _) = makeEnv()
+        env.startImageAnalysis()
+
+        guard case .running(let progress) = env.analysisState else {
+            Issue.record("expected similarity running, got \(env.analysisState)")
+            return
+        }
+        #expect(progress.stage == .preparing)
+        guard case .running = env.blurAnalysisState else {
+            Issue.record("expected sharpness pass running, got \(env.blurAnalysisState)")
+            return
+        }
+        // Repeated taps are idempotent for the active session: starting over would discard
+        // in-flight work.
+        env.startImageAnalysis()
+        guard case .running(let sameProgress) = env.analysisState else {
+            Issue.record("expected similarity still running after a repeat tap, got \(env.analysisState)")
+            return
+        }
+        #expect(sameProgress.stage == .preparing)
+        env.cancelSimilarityAnalysis()
+        env.cancelBlurAnalysis()
+    }
+
+    /// Cancelling one pipeline of a unified session never touches the other (M13): the
+    /// cancelled surface flips to `.cancelled` while the other stays `.running`. The two
+    /// pipelines are independent tasks over one catalog, not a serialized queue.
+    @Test func cancellingOnePipelineLeavesTheOtherRunning() {
+        let (env, _) = makeEnv()
+        env.startImageAnalysis()
+
+        env.cancelSimilarityAnalysis()
+        #expect(env.analysisState == .cancelled)
+        guard case .running = env.blurAnalysisState else {
+            Issue.record("cancelling similarity must not touch the sharpness pass, got \(env.blurAnalysisState)")
+            return
+        }
+
+        env.cancelBlurAnalysis()
+        #expect(env.blurAnalysisState == .cancelled)
+    }
+
+    /// The shared worker-width budget counts each heavy pass once and is idempotent per kind
+    /// (M13): a duplicate `begin` for the same pass never double-counts, and a duplicate `end`
+    /// never drives the count negative. Terminal flips (which call `end`) can therefore fire
+    /// freely without corrupting the combined-width calculation.
+    @Test func concurrencyBudgetIsIdempotentPerKind() {
+        let budget = AnalysisConcurrencyBudget()
+        #expect(budget.activePassCount == 0)
+
+        budget.begin(.similarity)
+        budget.begin(.similarity) // idempotent — a progress tick must not double-count
+        #expect(budget.activePassCount == 1)
+
+        budget.begin(.blur)
+        #expect(budget.activePassCount == 2)
+
+        budget.end(.blur)
+        budget.end(.blur) // idempotent — a terminal flip may fire more than once
+        #expect(budget.activePassCount == 1)
+
+        budget.end(.similarity)
+        #expect(budget.activePassCount == 0)
+    }
+
+    /// Two concurrent passes split the effective worker width so their combined footprint
+    /// never exceeds what one pass used alone (M13). One pass keeps the full thermal width;
+    /// two each get half.
+    @Test func sharedWidthHalvesTheBudgetAcrossTwoPasses() {
+        let policy = ScanConcurrencyPolicy(thermalState: { .nominal })
+        #expect(policy.sharedWidth(base: 4, activePasses: 1) == 4)
+        #expect(policy.sharedWidth(base: 4, activePasses: 2) == 2)
+        #expect(policy.sharedWidth(base: 4, activePasses: 3) == 1) // floor of 1
+    }
+
     // MARK: Helpers
 
     private func makeEnv(
@@ -667,7 +761,8 @@ struct DeletionFlowTests {
             remainingIDs: []
         )),
         result: PhotoAnalysisResult = DeletionFlowFixtures.result,
-        snapshotStore: InMemoryScanSnapshotStore = InMemoryScanSnapshotStore()
+        snapshotStore: InMemoryScanSnapshotStore = InMemoryScanSnapshotStore(),
+        checkpointStore: any ScanCheckpointStore = InMemoryScanCheckpointStore()
     ) -> (env: AppEnvironment, service: RecordingDeletionService) {
         let service = RecordingDeletionService(outcome: outcome)
         let env = AppEnvironment(
@@ -678,6 +773,9 @@ struct DeletionFlowTests {
             deletionService: service,
             // Completions in this suite must never touch the app's real persisted snapshot.
             scanSnapshotStore: snapshotStore,
+            // The M13 unified-session tests actually start analyses, which claim checkpoint
+            // channels; keep those writes in memory, never in the app's real support dir.
+            checkpointStore: checkpointStore,
             sessionToken: "session-1"
         )
         env.photoPermissionState = .authorized

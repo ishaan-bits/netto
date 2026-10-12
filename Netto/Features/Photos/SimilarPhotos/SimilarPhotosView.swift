@@ -75,7 +75,7 @@ struct SimilarPhotosView: View {
                 message: "Analysis runs entirely on this iPhone: exact copies by content hash, near-duplicates by visual similarity. Nothing is deleted until you confirm it on the final review screen.",
                 buttonTitle: "Analyze Photo Library"
             ) {
-                env.startSimilarityAnalysis()
+                env.startImageAnalysis()
             }
 
         case .buildingCatalog(let progress):
@@ -118,7 +118,7 @@ struct SimilarPhotosView: View {
                 message: "No results were produced. You can start again whenever you like.",
                 buttonTitle: "Start Again"
             ) {
-                env.startSimilarityAnalysis()
+                env.startImageAnalysis()
             }
 
         case .failed(let message):
@@ -128,7 +128,7 @@ struct SimilarPhotosView: View {
                 message: message,
                 buttonTitle: "Try Again"
             ) {
-                env.startSimilarityAnalysis()
+                env.startImageAnalysis()
             }
 
         case .emptyLibrary:
@@ -338,7 +338,7 @@ struct SimilarPhotosView: View {
                 message: SimilarPhotosPresentation.noDuplicatesMessage(result: result),
                 buttonTitle: "Analyze Again"
             ) {
-                env.startSimilarityAnalysis()
+                env.startImageAnalysis()
             }
         }
     }

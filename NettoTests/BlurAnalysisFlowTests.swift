@@ -1245,6 +1245,66 @@ struct BlurCheckpointFlowTests {
         #expect(store.load() == checkpoint)
     }
 
+    /// M13: a relaunch restores *every* interrupted pass, each from its own checkpoint file.
+    /// The two concurrent pipelines own independent channels, so a similarity interruption
+    /// and a sharpness interruption survive together — both surfaces present paused, and the
+    /// stored files stay kind-addressed (one does not clobber the other).
+    @Test func aRelaunchRestoresBothInterruptedPipelinesIndependently() async throws {
+        let similarity = ScanCheckpoint(
+            runSequence: 1,
+            kind: .similarity,
+            startedAt: Date(),
+            updatedAt: Date(),
+            stage: PhotoAnalysisStage.fingerprinting.rawValue,
+            completedUnits: 3,
+            totalUnits: 10
+        )
+        let blur = try await capturedBlurCheckpoint()
+        let store = InMemoryScanCheckpointStore()
+        try store.save(similarity)
+        try store.save(blur)
+
+        let probe = BlurProbe()
+        let env = AppEnvironment(
+            storageProvider: FakeStorage(),
+            photoPermission: FakePermissionService(.authorized),
+            contactsPermission: BlurCheckpointContactsPermissionService(),
+            makePhotoLibrary: { FakeLibrary(records: blurFixtureRecords) },
+            thumbnailLoader: BlurEngineThumbnails(probe: probe, images: blurCheckpointImages),
+            sizeProvider: FakeSizeProvider(sizes: [:]),
+            deletionService: RecordingDeletionService(outcome: .succeeded(DeletionSuccess(
+                plannedCount: 1,
+                verifiedRemovedCount: 1,
+                remainingIDs: []
+            ))),
+            scanSnapshotStore: InMemoryScanSnapshotStore(),
+            checkpointStore: store,
+            sessionToken: "session-1"
+        )
+        env.photoPermissionState = .authorized
+        env.blurAnalysisClock = { blurScanDate }
+
+        await env.bootstrap()
+
+        // Each surface is paused from its own file — neither restore cancels or overwrites
+        // the other.
+        guard case .paused(let similarityProgress) = env.analysisState else {
+            Issue.record("expected paused similarity, got \(env.analysisState)")
+            return
+        }
+        #expect(similarityProgress.stage == .fingerprinting)
+        #expect(similarityProgress.completedUnits == 3)
+        guard case .paused(let blurProgress) = env.blurAnalysisState else {
+            Issue.record("expected paused sharpness pass, got \(env.blurAnalysisState)")
+            return
+        }
+        #expect(blurProgress.completedUnits == blur.completedUnits)
+        #expect(probe.requestCount == 0)
+        // Both files are still present and kind-addressed after the restore.
+        #expect(store.load(kind: .similarity) == similarity)
+        #expect(store.load(kind: .blur) == blur)
+    }
+
     @Test func resumeReusesSavedVerdictsAndCompletesWithoutRequestingThem() async throws {
         let baseline = await freshBlurBaseline()
         #expect(baseline.requests == 8)

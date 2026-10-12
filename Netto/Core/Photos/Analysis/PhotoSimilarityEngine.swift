@@ -30,6 +30,11 @@ struct PhotoAnalysisConfiguration: Sendable, Equatable {
     /// source, not a tuning value — excluded from `==` (see below). Tests pin it to a fixed
     /// state; production reads `ProcessInfo` fresh at every decision.
     var thermalState: @Sendable () -> ProcessInfo.ThermalState = { ProcessInfo.processInfo.thermalState }
+    /// How many heavy analysis pipelines are running concurrently right now — the shared
+    /// budget (M13). A policy source, not a tuning value (excluded from `==`). Default 1:
+    /// a standalone pass keeps its full configured width; the unified Image Cleanup session
+    /// reports 2 so both pipelines split the budget (see `AnalysisConcurrencyBudget`).
+    var concurrentPasses: @Sendable () -> Int = { 1 }
 
     init() {}
 
@@ -192,10 +197,14 @@ struct PhotoSimilarityEngine: Sendable {
         let reporter = AnalysisProgressReporter(observer: engine.stageObserver, report: report)
         let config = engine.configuration
         // Thermal-adaptive widths: the configured bounds above, scaled by the device's
-        // current thermal state (nominal → unchanged). Read once for the width decisions;
-        // the per-item `waitWhileCritical` calls below re-read it for pausing.
+        // current thermal state (nominal → unchanged) and shared across any concurrently
+        // active heavy passes (M13). Read once for the width decisions; the per-item
+        // `waitWhileCritical` calls below re-read thermal state for pausing.
         let thermalPolicy = ScanConcurrencyPolicy(thermalState: config.thermalState)
-        let workerWidth = thermalPolicy.width(base: config.maxConcurrentWorkers)
+        let workerWidth = thermalPolicy.sharedWidth(
+            base: config.maxConcurrentWorkers,
+            activePasses: config.concurrentPasses()
+        )
 
         // Stage 1: preparing — index records by id (first occurrence wins; ids are unique from
         // PhotoKit, but a hostile input must not trap).
@@ -285,7 +294,10 @@ struct PhotoSimilarityEngine: Sendable {
         let byteKeys = LockedBox<[String: ContentByteKey]>(seed.byteKeys)
         let fingerprintWidth = max(
             workerWidth,
-            thermalPolicy.width(base: config.fingerprintThumbnailConcurrency)
+            thermalPolicy.sharedWidth(
+                base: config.fingerprintThumbnailConcurrency,
+                activePasses: config.concurrentPasses()
+            )
         )
         try await BoundedWorkers.run(items: cheapWork, width: fingerprintWidth) { work in
             guard !Task.isCancelled else { return }
@@ -923,6 +935,54 @@ struct ScanConcurrencyPolicy: Sendable {
         while isCriticallyPressed {
             try await Task.sleep(for: pollInterval)
         }
+    }
+
+    /// The effective width when `activePasses` heavy pipelines share the machine: the
+    /// thermal-scaled width divided evenly between them (floor of 1). One pass keeps the
+    /// full thermal width; two concurrent passes each get half, so the combined footprint
+    /// never exceeds what a single pass used alone — bounded work, no doubled thermal load.
+    func sharedWidth(base: Int, activePasses: Int) -> Int {
+        let passes = max(1, activePasses)
+        return max(1, width(base: base) / passes)
+    }
+}
+
+/// Shared worker-width budget for the concurrent image-analysis pipelines (M13).
+///
+/// Both engines consult it fresh at every width decision through their configuration's
+/// `concurrentPasses` closure. When only one heavy pass is active it keeps the full
+/// configured width; while both run concurrently the budget halves each pass's effective
+/// width (see `ScanConcurrencyPolicy.sharedWidth(base:activePasses:)`), so the two
+/// pipelines together never do more concurrent work than one pipeline used to alone.
+///
+/// Transitions are tracked **per pass kind** and are idempotent: calling `begin` twice for
+/// the same kind, or `end` after it already ended, never double-counts. The lock makes the
+/// counter safe to read from engine worker threads while the main actor mutates it.
+final class AnalysisConcurrencyBudget: @unchecked Sendable {
+    enum Pass: Hashable, Sendable {
+        case similarity
+        case blur
+    }
+
+    private let lock = NSLock()
+    private var active: Set<Pass> = []
+
+    func begin(_ pass: Pass) {
+        lock.lock()
+        active.insert(pass)
+        lock.unlock()
+    }
+
+    func end(_ pass: Pass) {
+        lock.lock()
+        active.remove(pass)
+        lock.unlock()
+    }
+
+    var activePassCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return active.count
     }
 }
 

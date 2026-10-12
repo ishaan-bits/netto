@@ -694,10 +694,11 @@ struct ScanCheckpointAccumulatorTests {
 // MARK: - Shared in-memory checkpoint store for the test module
 
 /// Hermetic `ScanCheckpointStore`: tests seed the checkpoint a relaunch would find, and
-/// assert what a run persisted — never the app's real `checkpoint.json`.
+/// assert what a run persisted — never the app's real `checkpoint-*.json`. Kind-addressed
+/// (M13) so concurrent passes persist independently through the same seam.
 final class InMemoryScanCheckpointStore: ScanCheckpointStore, @unchecked Sendable {
     private let lock = NSLock()
-    private var stored: ScanCheckpoint?
+    private var stored: [ScanCheckpoint.Kind: ScanCheckpoint] = [:]
     private var saves = 0
     private var clears = 0
 
@@ -716,21 +717,44 @@ final class InMemoryScanCheckpointStore: ScanCheckpointStore, @unchecked Sendabl
     func save(_ checkpoint: ScanCheckpoint) throws {
         lock.lock()
         defer { lock.unlock() }
-        stored = checkpoint
+        stored[checkpoint.kind] = checkpoint
         saves += 1
     }
 
     func load() -> ScanCheckpoint? {
         lock.lock()
         defer { lock.unlock() }
-        return stored
+        for kind in ScanCheckpoint.Kind.priorityOrder {
+            if let checkpoint = stored[kind] { return checkpoint }
+        }
+        return nil
     }
 
     func clear() {
         lock.lock()
         defer { lock.unlock() }
-        stored = nil
-        clears += 1
+        clears += stored.count
+        stored.removeAll()
+    }
+
+    func load(kind: ScanCheckpoint.Kind) -> ScanCheckpoint? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored[kind]
+    }
+
+    func clear(kind: ScanCheckpoint.Kind) {
+        lock.lock()
+        defer { lock.unlock() }
+        if stored.removeValue(forKey: kind) != nil {
+            clears += 1
+        }
+    }
+
+    func loadAll() -> [ScanCheckpoint] {
+        lock.lock()
+        defer { lock.unlock() }
+        return ScanCheckpoint.Kind.allCases.compactMap { stored[$0] }
     }
 }
 

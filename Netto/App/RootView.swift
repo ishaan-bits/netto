@@ -134,6 +134,14 @@ final class AppEnvironment {
     }
     var analysisState: PhotoAnalysisState = .notStarted {
         didSet {
+            // Shared worker-width budget (M13): the similarity pass is active exactly while
+            // its state is running. Idempotent per-kind, so progress ticks, pause, resume,
+            // and every terminal flip are all safe.
+            if analysisState.isRunning {
+                analysisConcurrencyBudget.begin(.similarity)
+            } else if oldValue.isRunning {
+                analysisConcurrencyBudget.end(.similarity)
+            }
             // A running pass releasing the pipeline (completion, failure, or cancel) is
             // exactly when a queued pass may start (M10). Paused is not running but still
             // owns the slot — `drivePendingAnalysis` refuses while a pause stands.
@@ -157,6 +165,13 @@ final class AppEnvironment {
     var blurAnalysisState: BlurAnalysisState = .notStarted {
         didSet {
             blurDatasetGeneration &+= 1
+            // Shared worker-width budget (M13): the sharpness pass is active exactly while
+            // its state is running — same idempotent per-kind contract as `analysisState`.
+            if blurAnalysisState.isRunning {
+                analysisConcurrencyBudget.begin(.blur)
+            } else if oldValue.isRunning {
+                analysisConcurrencyBudget.end(.blur)
+            }
             // Same coordination hook as `analysisState` (M10): a terminal flip may hand
             // the pipeline to the queued pass.
             if oldValue.isRunning, !blurAnalysisState.isRunning {
@@ -214,6 +229,25 @@ final class AppEnvironment {
     private var analysisTask: Task<Void, Never>?
     /// In-flight sharpness pass, if any.
     private var blurAnalysisTask: Task<Void, Never>?
+    /// True while a unified session's shared catalog enumeration is in flight (M13). The
+    /// read lives in `catalogTask` so cancelling or pausing one pipeline's *work* cannot
+    /// abort the read the other still needs; because the enumeration reports through
+    /// similarity's `preparing` stage rather than `catalogState`, the pause/cancel paths
+    /// need this flag to recognize the read as in-flight.
+    private var sharedEnumerationInFlight = false
+    /// Shared worker-width budget for the concurrent image-analysis pipelines (M13). Both
+    /// engines read it at every width decision; while both pipelines run their combined
+    /// width never exceeds what one pipeline used alone. Idempotent per-kind begin/end, so
+    /// terminal transitions and cancel paths can call `end` freely.
+    private let analysisConcurrencyBudget = AnalysisConcurrencyBudget()
+    /// Confirmed asset removals that landed while a pipeline was still running (M13). A
+    /// running pass sampled the pre-mutation catalog, so its result may still describe
+    /// assets that no longer exist. Cancelling the pass would throw away the valid work it
+    /// did for every asset that *survived*; instead the confirmed removals are recorded
+    /// here and reconciled out of the result the moment it lands (see
+    /// `reconcileDeletionDuringRun`). Cleared once no pipeline is running, so a later run
+    /// never inherits a stale set.
+    private var deletionsDuringRunningPasses: Set<String> = []
     /// Bumped on every sharpness start and cancel. An in-flight run compares it before
     /// each state write, so a cancelled run can never overwrite a newer one's state.
     private var blurAnalysisGeneration = 0
@@ -391,20 +425,19 @@ final class AppEnvironment {
     /// Persistence seam for interrupted-run checkpoints. Injected so tests use temporary
     /// storage instead of the app's real file (same rule as `scanSnapshotStore`).
     let checkpointStore: any ScanCheckpointStore
-    /// Orders checkpoint writes (a superseded run's late flush can never overwrite a newer
-    /// checkpoint) and gates kind-conditional clears. Injected indirectly through the store.
-    private let checkpointWriter: ScanCheckpointWriter
-    /// In-memory batch for the active run's evidence; flushed in bounded batches, never
-    /// per asset, never on the main actor during a run.
-    private let checkpointAccumulator: ScanCheckpointAccumulator
+    /// Per-kind checkpoint channels (M13): one writer + accumulator per pass kind, so the
+    /// similarity and sharpness pipelines run — and are interrupted — concurrently without
+    /// contending for a single checkpoint slot. Each scopes the injected store to its kind.
+    private let checkpointChannels: CheckpointChannels
     /// Background-task seam: tests drive expiration deterministically instead of racing
     /// the system clock.
     private let backgroundTasks: any BackgroundTaskScheduling
 
-    /// The checkpoint that exists to be resumed: loaded at bootstrap, or written by an
-    /// in-session interruption. Carried into the accumulator when a run resumes, and read
-    /// by the video-size seed (which resumes without beginning an accumulator run).
-    private var resumableCheckpoint: ScanCheckpoint?
+    /// The checkpoints that exist to be resumed: loaded at bootstrap (one per interrupted
+    /// pass kind), or written by an in-session interruption. Each is carried into its own
+    /// channel's accumulator when that pass resumes; the video-size seed reads its entry
+    /// directly (it resumes without beginning an accumulator run).
+    private var resumableCheckpoints: [ScanCheckpoint.Kind: ScanCheckpoint] = [:]
     /// A resume waiting for the catalog rebuild its seed needs (blur and video sizes both
     /// require fresh records to reconcile against).
     private var pendingResume: ScanCheckpoint?
@@ -454,9 +487,7 @@ final class AppEnvironment {
         self.contactMutationService = contactMutationService
         self.scanSnapshotStore = scanSnapshotStore
         self.checkpointStore = checkpointStore
-        let writer = ScanCheckpointWriter(store: checkpointStore)
-        self.checkpointWriter = writer
-        self.checkpointAccumulator = ScanCheckpointAccumulator(writer: writer)
+        self.checkpointChannels = CheckpointChannels(store: checkpointStore)
         self.backgroundTasks = backgroundTasks
         self.widgetSummaryStore = widgetSummaryStore
         self.swipeSessionStore = swipeSessionStore
@@ -646,26 +677,39 @@ final class AppEnvironment {
         flowState = .dashboard
     }
 
-    /// Loads the interrupted-run checkpoint and represents it as the paused state the UI
-    /// shows. Best-effort by design: an unusable checkpoint is cleared, never crashed on,
-    /// and never resumed.
+    /// Loads every interrupted-run checkpoint a relaunch would find and represents each as
+    /// the paused state its surface shows (M13: concurrent passes restore independently).
+    /// Best-effort by design: an unusable checkpoint is cleared, never crashed on, never
+    /// resumed.
     private func restoreInterruptedCheckpoint() async {
         let store = checkpointStore
-        let checkpoint = await Task.detached(priority: .utility) { store.load() }.value
-        guard let checkpoint else { return }
-        // Future writes from this session must order after the file's run even if the
-        // checkpoint turns out to be unusable below.
-        nextRunSequence = max(nextRunSequence, checkpoint.runSequence + 1)
-        checkpointWriter.adopt(checkpoint)
-        if checkpoint.kind == .similarity, PhotoAnalysisStage(rawValue: checkpoint.stage) == nil {
-            // A similarity checkpoint without a recognizable stage cannot be shown or
-            // resumed honestly — drop it rather than present a dead paused card.
-            let writer = checkpointWriter
-            let sequence = checkpoint.runSequence
-            await Task.detached(priority: .utility) { writer.clear(through: sequence) }.value
-            return
+        let restored = await Task.detached(priority: .utility) { store.loadAll() }.value
+        guard !restored.isEmpty else { return }
+        // Future writes from this session must order after every restored file's run, even
+        // if a checkpoint turns out to be unusable below.
+        for checkpoint in restored {
+            nextRunSequence = max(nextRunSequence, checkpoint.runSequence + 1)
+            checkpointChannels.adopt(checkpoint)
         }
-        resumableCheckpoint = checkpoint
+        for checkpoint in restored {
+            if checkpoint.kind == .similarity, PhotoAnalysisStage(rawValue: checkpoint.stage) == nil {
+                // A similarity checkpoint without a recognizable stage cannot be shown or
+                // resumed honestly — drop it rather than present a dead paused card.
+                let writer = checkpointChannels.writer(for: .similarity)
+                let sequence = checkpoint.runSequence
+                await Task.detached(priority: .utility) { writer.clear(through: sequence) }.value
+                continue
+            }
+            resumableCheckpoints[checkpoint.kind] = checkpoint
+            representInterrupted(checkpoint)
+        }
+    }
+
+    /// Represents one restored or deferred checkpoint as the paused state its surface shows.
+    /// A video-size checkpoint has no paused surface (its seed applies the next time
+    /// measurement starts, reconciled against the fresh catalog then), so it is stored as
+    /// resumable but never represented.
+    private func representInterrupted(_ checkpoint: ScanCheckpoint) {
         switch checkpoint.kind {
         case .similarity:
             let stage = PhotoAnalysisStage(rawValue: checkpoint.stage) ?? .preparing
@@ -685,9 +729,6 @@ final class AppEnvironment {
                 totalUnits: checkpoint.totalUnits
             ))
         case .videoSizes:
-            // Sizes have no paused surface: the seed is applied the next time measurement
-            // starts (the Videos screen's own flow), and reconciled against the fresh
-            // catalog then.
             break
         }
     }
@@ -892,7 +933,7 @@ final class AppEnvironment {
                                 isComplete: progress.isComplete
                            ) {
                             self.catalogState = .running(progress)
-                            self.checkpointAccumulator.setProgress(
+                            self.checkpointChannels.accumulator(for: .catalog).setProgress(
                                 kind: .catalog,
                                 stage: "catalog",
                                 completed: progress.enumeratedCount,
@@ -938,9 +979,11 @@ final class AppEnvironment {
     }
 
     func cancelCatalogBuild() {
-        // An explicit cancel abandons resumable work too: state and file stay consistent
-        // (nothing paused, nothing to resume).
-        discardInterruptedCheckpoint()
+        // An explicit cancel abandons this build's own resumable state: its file goes, and
+        // a paused catalog surface returns to "not started". Scoped to `.catalog` (M13) —
+        // a concurrently paused analysis or sharpness checkpoint is not this build's to
+        // abandon; each pass owns its own channel.
+        discardInterruptedCheckpoint(kinds: [.catalog])
         catalogTask?.cancel()
         catalogTask = nil
         catalogGeneration += 1
@@ -1011,6 +1054,11 @@ final class AppEnvironment {
     /// library would only double the work). Starting a new analysis also invalidates any
     /// prepared deletion review: plans are bound to the dataset they were built from.
     ///
+    /// This is the **standalone, single-pass** entry point (retry, resume, and the legacy
+    /// queue): it keeps its serialized admission so an explicit one-pass request never races
+    /// the other. The unified Image Cleanup session — what every Analyze button calls — is
+    /// `startImageAnalysis`, which shares one enumeration across both pipelines.
+    ///
     /// `resuming` carries an interrupted run's checkpoint: its evidence seeds the cheap
     /// pass (already-hashed and already-keyed assets cost no request) and its progress
     /// display survives the interruption. Enumeration (Stage A) still restarts — catalog
@@ -1018,10 +1066,9 @@ final class AppEnvironment {
     /// checkpoints deliberately never do.
     func startSimilarityAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !analysisState.isRunning else { return }
-        // The sharpness pass owns the pipeline (each pass snapshots the catalog it started
-        // with, and both contend for the same thumbnail pipeline and cores). Queue the
-        // request — visible on the Similar Photos screen, started automatically when the
-        // pass releases the pipeline — never a silent drop (M10).
+        // Serialized admission for the standalone entry point (M10): one explicit one-pass
+        // request queues — visibly, never a silent drop — and starts when the running pass
+        // releases the pipeline. The unified session bypasses this by owning the catalog.
         if blurAnalysisState.isRunning {
             pendingAnalysisRequest = .similarity
             return
@@ -1034,18 +1081,169 @@ final class AppEnvironment {
             analysisState = .failed(.underlying("Photos access is required to read your library."))
             return
         }
+        prepareSimilarityRun()
+        let generation = analysisGeneration
+        // Claim this pass's checkpoint channel: a resumed run adopts the carried payload, a
+        // fresh run discards whatever interrupted state existed for this kind (design: an
+        // explicit new run supersedes resumable work).
+        let runSequence = beginCheckpointRun(kind: .similarity, carrying: checkpoint)
+        let engine = Self.makeSimilarityEngine(
+            thumbnailLoader: thumbnailLoader,
+            accumulator: checkpointChannels.accumulator(for: .similarity),
+            runSequence: runSequence,
+            budget: analysisConcurrencyBudget
+        )
+        analysisTask = Task { [weak self] in
+            guard let self else { return }
+            guard let catalog = await self.enumerateSharedCatalog(generation: generation, unified: false) else {
+                return
+            }
+            await self.runSimilarityStageB(
+                catalog: catalog,
+                generation: generation,
+                checkpoint: checkpoint,
+                engine: engine
+            )
+        }
+        syncBackgroundTask()
+    }
+
+    /// The single user-facing Analyze action (M13): one shared catalog enumeration, then the
+    /// similarity and sharpness pipelines launched **concurrently** over the same snapshot.
+    ///
+    /// This is what every Analyze button calls. With both pipelines idle it starts the
+    /// unified session; with exactly one still running (the other failed or was cancelled
+    /// mid-session) it starts only the idle one through its own entry point, which queues it
+    /// behind the running pipeline rather than dropping the tap — a retry of one pipeline
+    /// never restarts or cancels work that is still in flight. Repeated taps are idempotent
+    /// for the active session (while both run, the request is already satisfied).
+    ///
+    /// Neither pipeline waits for the other to finish: similarity may reach `.completed` and
+    /// become reviewable while the sharpness pass is still running, and completion, failure,
+    /// or cancellation of one never touches the other. They coordinate only through the
+    /// shared `AnalysisConcurrencyBudget` so their combined worker width never exceeds one
+    /// pass's alone.
+    ///
+    /// One `PHAsset.fetchAssets` enumeration feeds both pipelines. It lives in `catalogTask`
+    /// — not either pipeline's task — so an explicit cancel of one pipeline's *work* leaves
+    /// the shared read standing for the other: cancelling similarity mid-enumeration still
+    /// lets the sharpness pass get its catalog, and vice versa. The read is only abandoned
+    /// when the whole session is (pause, deletion, a superseding session), because then both
+    /// pipelines are interrupted together. Both checkpoint channels are claimed at setup so
+    /// an interruption during the shared read resumes both from their own files; the
+    /// sharpness pass's own evidence is only seeded once its pass actually begins.
+    ///
+    /// `resuming` seeds each pipeline from its own interrupted checkpoint without starting a
+    /// pass that was not interrupted.
+    func startImageAnalysis(
+        resuming similarityCheckpoint: ScanCheckpoint? = nil,
+        blurCheckpoint: ScanCheckpoint? = nil
+    ) {
+        // Idempotent for the active session: while both pipelines run, this tap's intent is
+        // already being served — starting over would discard in-flight work.
+        guard !(analysisState.isRunning && blurAnalysisState.isRunning) else { return }
+        // Never rebuild datasets underneath an in-flight Photos mutation.
+        guard !deletionState.isDeleting else { return }
+        // The unified session owns admission; a queued single-pass request is spent here and
+        // may be re-set by the single-pipeline fallback below.
+        pendingAnalysisRequest = nil
+        guard photoPermissionState.isUsable else {
+            if !analysisState.isRunning { analysisState = .failed(.underlying("Photos access is required to read your library.")) }
+            if !blurAnalysisState.isRunning { blurAnalysisState = .failed(.underlying("Photos access is required to read your library.")) }
+            return
+        }
+
+        // Exactly one pipeline still running: start only the idle one. Its own entry point
+        // queues it behind the running pipeline (M10) instead of racing it, so a retry of
+        // one screen never disturbs the pass that is still doing work.
+        if analysisState.isRunning {
+            startBlurAnalysis(resuming: blurCheckpoint)
+            return
+        }
+        if blurAnalysisState.isRunning {
+            startSimilarityAnalysis(resuming: similarityCheckpoint)
+            return
+        }
+
+        // Both idle: the unified session — one shared enumeration, two concurrent pipelines.
+        prepareSimilarityRun()
+        prepareBlurRun()
+        let similarityGeneration = analysisGeneration
+        let blurGeneration = blurAnalysisGeneration
+
+        // Both channels are claimed at setup (M13): an interruption during the shared read
+        // produces a resumable file for each pipeline, and a pass that never got to start
+        // resumes as a fresh pass with no evidence (its seed refuses an empty calibration).
+        let similaritySequence = beginCheckpointRun(kind: .similarity, carrying: similarityCheckpoint)
+        let blurSequence = beginCheckpointRun(kind: .blur, carrying: blurCheckpoint)
+        let engine = Self.makeSimilarityEngine(
+            thumbnailLoader: thumbnailLoader,
+            accumulator: checkpointChannels.accumulator(for: .similarity),
+            runSequence: similaritySequence,
+            budget: analysisConcurrencyBudget
+        )
+
+        // The shared enumeration runs in `catalogTask` — deliberately not either pipeline's
+        // task — so cancelling similarity leaves the read standing for blur, and vice versa.
+        // Both pipelines launch over its result, each still guarded by its own generation.
+        sharedEnumerationInFlight = true
+        catalogTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.sharedEnumerationInFlight = false }
+            guard let catalog = await self.enumerateSharedCatalog(generation: self.catalogGeneration, unified: true) else {
+                return
+            }
+            // Catalog stands: launch whatever is still running, concurrently. Either
+            // pipeline may have been cancelled during the shared read — that cancel was
+            // about *its* work, so only that pipeline is skipped; the other proceeds.
+            if self.blurAnalysisState.isRunning {
+                self.blurAnalysisTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.runBlurPass(
+                        catalog: catalog,
+                        generation: blurGeneration,
+                        checkpoint: blurCheckpoint,
+                        runSequence: blurSequence
+                    )
+                }
+            } else {
+                // Blur was cancelled or paused during the shared read: release the channel
+                // its setup claimed so a later run finds it free.
+                self.finishCheckpointRun(kind: .blur)
+            }
+            if self.analysisState.isRunning {
+                self.analysisTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.runSimilarityStageB(
+                        catalog: catalog,
+                        generation: similarityGeneration,
+                        checkpoint: similarityCheckpoint,
+                        engine: engine
+                    )
+                }
+            }
+        }
+        syncBackgroundTask()
+    }
+
+    /// Common setup for a similarity run: yields nonessential work, supersedes any prepared
+    /// plan, claims a fresh generation and selection, resets the progress display, and moves
+    /// `analysisState` to `.running(.preparing)`. Leaves `catalogTask` cancelled so this run
+    /// owns the single library enumeration.
+    private func prepareSimilarityRun() {
         // Video sizes are nonessential detail work: a run about to own the thumbnail
         // pipeline and the cores yields the measurement (its progress is kept as a settled,
         // partial state and resumes when the run finishes — see VideosView's observers).
         cancelVideoSizeResolution()
-
         // A fresh analysis supersedes any prepared plan.
         planBuildGeneration += 1
         applyDeletion(.noSelection)
+        // A fresh run enumerates the *current* catalog, so any removals recorded against a
+        // previous, superseded run are not this run's to reconcile (M13).
+        deletionsDuringRunningPasses = []
 
         analysisTask?.cancel()
         analysisGeneration += 1
-        let generation = analysisGeneration
         selection = PhotoSelectionModel()
 
         catalogTask?.cancel()
@@ -1066,23 +1264,254 @@ final class AppEnvironment {
         analysisState = .running(
             PhotoAnalysisProgress(stage: .preparing, completedUnits: 0, totalUnits: 0)
         )
-        // Claim the single checkpoint slot: a resumed run adopts the carried payload, a
-        // fresh run discards whatever interrupted state existed before it (design: an
-        // explicit new run supersedes resumable work).
-        let runSequence = beginCheckpointRun(kind: .similarity, carrying: checkpoint)
-        let accumulator = checkpointAccumulator
+    }
+
+    /// Common setup for a sharpness run: supersedes any prepared plan, claims a fresh
+    /// generation and an empty selection, and moves `blurAnalysisState` to `.running`. The
+    /// state flip happens here (at admission) so the Potentially Blurry screen shows the
+    /// session immediately; its first real counts arrive when the pass begins.
+    private func prepareBlurRun() {
+        cancelVideoSizeResolution()
+        planBuildGeneration += 1
+        applyDeletion(.noSelection)
+        // A fresh pass measures the *current* catalog, so any removals recorded against a
+        // previous, superseded run are not this pass's to reconcile (M13).
+        deletionsDuringRunningPasses = []
+        blurAnalysisGeneration += 1
+        blurSelection = PhotoSelectionModel()
+        blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 0, totalUnits: 0))
+    }
+
+    /// Stage A: enumerates the permitted photo catalog exactly once for this run, reporting
+    /// progress through `analysisState`'s `preparing` stage and the similarity checkpoint.
+    /// Stores the result in `catalogState` when it completes. Returns the catalog, or `nil`
+    /// when the read was superseded, cancelled, or failed (the failure is surfaced through
+    /// the similarity pipeline, and in a unified session through the sharpness pipeline too
+    /// — a shared read that fails leaves neither pipeline a catalog to stand on).
+    ///
+    /// `generation` is the survival key: a standalone run guards on the similarity
+    /// generation (cancelling the run aborts its own read), a unified session guards on the
+    /// catalog generation (cancelling one pipeline's *work* does not abort the shared read
+    /// the other still needs — see `startImageAnalysis`). Progress is only written while the
+    /// similarity surface still wants it, so a cancelled pipeline never receives a late tick.
+    private func enumerateSharedCatalog(generation: Int, unified: Bool) async -> CatalogScanResult? {
+        let factory = makePhotoLibrary
+        let builder = PhotoCatalogBuilder()
+        var built: CatalogScanResult?
+        do {
+            // The reader is created off the main actor — a `PHAsset.fetchAssets` round trip
+            // over the whole library costs no main-thread time either way.
+            let reading = try await Task.detached(priority: .userInitiated) {
+                try factory()
+            }.value
+            for try await event in builder.makeScanStream(reading: reading) {
+                guard unified ? isCurrentCatalog(generation) : isCurrentAnalysis(generation) else { return nil }
+                switch event {
+                case .progress(let progress):
+                    // Coalesced under the catalog policy (see `shouldApplyCatalogProgress`):
+                    // the enumeration phase no longer writes observed storage once per event,
+                    // which for a 40k library is thousands of unneeded writes.
+                    // Only while the similarity surface still wants it: a pipeline cancelled
+                    // during a unified shared read stops receiving ticks — the read itself
+                    // survives for the other pipeline.
+                    guard analysisState.isRunning,
+                          shouldApplyCatalogProgress(
+                            totalCount: progress.totalCount,
+                            isComplete: progress.isComplete
+                          )
+                    else { break }
+                    analysisState = .running(PhotoAnalysisProgress(
+                        stage: .preparing,
+                        completedUnits: progress.enumeratedCount,
+                        totalUnits: progress.totalCount
+                    ))
+                    // Stage A of an analysis *is* a catalog build — feed the estimator the
+                    // same standalone build does, or the dashboard's countdown sat
+                    // un-updated for the whole enumeration phase.
+                    scanETAEstimator.record(
+                        stage: "catalog",
+                        completed: progress.enumeratedCount,
+                        total: progress.totalCount,
+                        at: ScanETAEstimator.monotonicNow()
+                    )
+                    // Tagged `.similarity`: this run owns that channel, and its stage A is
+                    // the stage a resume would restore.
+                    checkpointChannels.accumulator(for: .similarity).setProgress(
+                        kind: .similarity,
+                        stage: PhotoAnalysisStage.preparing.rawValue,
+                        completed: progress.enumeratedCount,
+                        total: progress.totalCount
+                    )
+                case .completed(let result):
+                    built = result
+                    noteCatalogCompleted(result)
+                }
+            }
+        } catch is CancellationError {
+            finishSharedEnumerationFailure(.cancelled, unified: unified)
+            return nil
+        } catch let failure as CatalogScanFailure {
+            finishSharedEnumerationFailure(
+                failure == .cancelled ? .cancelled : .failed(.underlying(failure.userMessage)),
+                unified: unified
+            )
+            return nil
+        } catch let failure as PhotoLibraryReadError {
+            finishSharedEnumerationFailure(.failed(Self.analysisFailure(for: failure)), unified: unified)
+            return nil
+        } catch {
+            finishSharedEnumerationFailure(
+                .failed(.underlying("Photos access is required to read your library.")),
+                unified: unified
+            )
+            return nil
+        }
+
+        // The stream can finish without `.completed` when it was cancelled mid-read.
+        guard let built else {
+            finishSharedEnumerationFailure(.cancelled, unified: unified)
+            return nil
+        }
+        guard unified ? isCurrentCatalog(generation) : isCurrentAnalysis(generation) else { return nil }
+        return built
+    }
+
+    /// Surfaces a shared enumeration that ended without a catalog. In a unified session the
+    /// sharpness pass depended on the same read, so it is failed/cancelled alongside the
+    /// similarity pipeline — never left "running" with no catalog to stand on. In a
+    /// standalone run only the similarity pipeline is touched.
+    private func finishSharedEnumerationFailure(_ state: PhotoAnalysisState, unified: Bool) {
+        finishAnalysis(analysisGeneration, as: state)
+        guard unified, blurAnalysisState.isRunning else { return }
+        switch state {
+        case .cancelled:
+            finishBlurAnalysis(blurAnalysisGeneration, as: .cancelled)
+        case .failed(let failure):
+            finishBlurAnalysis(
+                blurAnalysisGeneration,
+                as: .failed(.underlying(Self.blurFailureMessage(for: failure)))
+            )
+        default:
+            break
+        }
+    }
+
+    /// The sharpness pass's user-facing message for a similarity failure. The shared read
+    /// failed, so both surfaces show an honest, independent explanation.
+    private static func blurFailureMessage(for failure: PhotoAnalysisFailure) -> String {
+        switch failure {
+        case .cancelled:
+            return "Sharpness analysis could not finish. Please try again."
+        case .underlying(let detail):
+            return detail
+        }
+    }
+
+    /// A catalog's records indexed by asset ID — the lookup `removingAssets(_:catalogRecords:)`
+    /// uses to re-score a group whose recommended KEEP was deleted.
+    private static func recordsByID(_ catalog: CatalogScanResult) -> [String: PhotoAssetRecord] {
+        Dictionary(
+            catalog.records.map { ($0.localIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
+    /// Drops the shared deletion-reconciliation set once no pipeline is running (M13). At
+    /// that point every result that could have been affected has already been reconciled,
+    /// and a later run must never inherit a stale set.
+    private func clearDeletionReconciliationIfIdle() {
+        guard !analysisState.isRunning, !blurAnalysisState.isRunning else { return }
+        deletionsDuringRunningPasses = []
+    }
+
+    /// Stage B (similarity): runs the engine over a catalog the caller has already built and
+    /// stands in `catalogState`. Reports through `analysisState`, releases the similarity
+    /// checkpoint on success, and persists the completed result. The caller owns admission
+    /// and must already have set `.running` and claimed the checkpoint run.
+    private func runSimilarityStageB(
+        catalog: CatalogScanResult,
+        generation: Int,
+        checkpoint: ScanCheckpoint?,
+        engine: PhotoSimilarityEngine
+    ) async {
+        // Seeded with whatever the interrupted run already earned (entries whose asset still
+        // exists with the exact recorded modification date; deleted or changed assets
+        // recompute).
+        var sawCompletion = false
+        let seed = Self.fingerprintSeed(from: checkpoint, records: catalog.records)
+        do {
+            for try await event in engine.makeAnalysisStream(
+                records: catalog.records,
+                seed: seed
+            ) {
+                guard isCurrentAnalysis(generation) else { return }
+                switch event {
+                case .progress(let progress):
+                    applyAnalysisProgress(progress)
+                case .completed(let result):
+                    sawCompletion = true
+                    // The channel is released *before* the terminal state write: the flip
+                    // may hand a queued single-pass request its slot (M10), which must find
+                    // the checkpoint free.
+                    finishCheckpointRun(kind: .similarity)
+                    // Reconcile confirmed removals that landed while this pass ran (M13):
+                    // the pass sampled the pre-mutation catalog, so its result may still
+                    // describe assets that no longer exist. Only the removed IDs leave —
+                    // the work for every surviving asset stands, so a deletion never
+                    // forces a full re-run.
+                    let reconciled = result.removingAssets(
+                        deletionsDuringRunningPasses,
+                        catalogRecords: Self.recordsByID(catalog)
+                    )
+                    selection = PhotoSelectionModel(result: reconciled)
+                    analysisState = .completed(reconciled)
+                    clearDeletionReconciliationIfIdle()
+                    let completedAt = await persistCompletedScan(reconciled)
+                    await writeWidgetSummaryAfterScanCompleted(at: completedAt)
+                }
+            }
+            if !sawCompletion {
+                finishAnalysis(generation, as: .cancelled)
+            }
+        } catch is CancellationError {
+            finishAnalysis(generation, as: .cancelled)
+        } catch let failure as PhotoAnalysisFailure {
+            finishAnalysis(
+                generation,
+                as: failure == .cancelled ? .cancelled : .failed(failure)
+            )
+        } catch {
+            // PhotoKit/underlying error descriptions never reach the user verbatim.
+            finishAnalysis(
+                generation,
+                as: .failed(.underlying("Similarity analysis could not finish. Please try again."))
+            )
+        }
+    }
+
+    /// Builds the similarity engine with its checkpoint sink bound to the given run sequence
+    /// and its worker width bound to the shared cross-pipeline budget (M13).
+    private static func makeSimilarityEngine(
+        thumbnailLoader: any PhotoThumbnailLoading,
+        accumulator: ScanCheckpointAccumulator,
+        runSequence: Int,
+        budget: AnalysisConcurrencyBudget
+    ) -> PhotoSimilarityEngine {
+        var configuration = PhotoAnalysisConfiguration()
+        // A policy source, not a tuning value: the engine reads the live active-pass count
+        // at every width decision, so both pipelines halve their width while concurrent and
+        // each keeps the full width when it is the only heavy pass running.
+        configuration.concurrentPasses = { budget.activePassCount }
         let checkpointSink: (@Sendable (CheckpointEvidence) -> Void)? = { evidence in
             accumulator.record(evidence, runSequence: runSequence)
         }
-
-        let builder = PhotoCatalogBuilder()
         #if DEBUG
         // M4B validation hook: `NETTO_SCAN_METRICS=1` injects the signpost observer and the
         // metrics recorder so an end-to-end run can be measured from `log stream`. Production
         // never sets the variable; without it the engine is exactly as before (no telemetry).
-        let engine: PhotoSimilarityEngine
         if ProcessInfo.processInfo.environment["NETTO_SCAN_METRICS"] == "1" {
-            engine = PhotoSimilarityEngine(
+            return PhotoSimilarityEngine(
+                configuration: configuration,
                 // The shared loader (and its shared asset-reference cache): the
                 // perceptual/verification/sharpness passes reuse resolved references
                 // instead of re-fetching them per stage.
@@ -1091,143 +1520,19 @@ final class AppEnvironment {
                 metrics: AnalysisMetrics(),
                 checkpointSink: checkpointSink
             )
-        } else {
-            engine = PhotoSimilarityEngine(
-                thumbnailLoader: thumbnailLoader,
-                checkpointSink: checkpointSink
-            )
         }
+        return PhotoSimilarityEngine(
+            configuration: configuration,
+            thumbnailLoader: thumbnailLoader,
+            checkpointSink: checkpointSink
+        )
         #else
-        let engine = PhotoSimilarityEngine(
+        return PhotoSimilarityEngine(
+            configuration: configuration,
             thumbnailLoader: thumbnailLoader,
             checkpointSink: checkpointSink
         )
         #endif
-
-        analysisTask = Task { [weak self] in
-            guard let self else { return }
-            let factory = self.makePhotoLibrary
-
-            // Stage A — metadata catalog read, reported as `preparing`.
-            var built: CatalogScanResult?
-            do {
-                // The reader is created off the main actor — a `PHAsset.fetchAssets`
-                // round trip over the whole library costs no main-thread time either way.
-                let reading = try await Task.detached(priority: .userInitiated) {
-                    try factory()
-                }.value
-                for try await event in builder.makeScanStream(reading: reading) {
-                    guard self.isCurrentAnalysis(generation) else { return }
-                    switch event {
-                    case .progress(let progress):
-                        // Coalesced under the catalog policy (see `shouldApplyCatalogProgress`):
-                        // the enumeration phase no longer writes observed storage once per
-                        // event, which for a 40k library is thousands of unneeded writes.
-                        guard self.shouldApplyCatalogProgress(
-                            totalCount: progress.totalCount,
-                            isComplete: progress.isComplete
-                        ) else { break }
-                        self.analysisState = .running(PhotoAnalysisProgress(
-                            stage: .preparing,
-                            completedUnits: progress.enumeratedCount,
-                            totalUnits: progress.totalCount
-                        ))
-                        // Stage A of an analysis *is* a catalog build — feed the
-                        // estimator the same standalone build does, or the dashboard's
-                        // countdown sat un-updated for the whole enumeration phase.
-                        self.scanETAEstimator.record(
-                            stage: "catalog",
-                            completed: progress.enumeratedCount,
-                            total: progress.totalCount,
-                            at: ScanETAEstimator.monotonicNow()
-                        )
-                        // Tagged `.similarity`: this run owns the checkpoint slot, and its
-                        // stage A is the stage a resume would restore.
-                        self.checkpointAccumulator.setProgress(
-                            kind: .similarity,
-                            stage: PhotoAnalysisStage.preparing.rawValue,
-                            completed: progress.enumeratedCount,
-                            total: progress.totalCount
-                        )
-                    case .completed(let result):
-                        built = result
-                        self.noteCatalogCompleted(result)
-                    }
-                }
-            } catch is CancellationError {
-                self.finishAnalysis(generation, as: .cancelled)
-                return
-            } catch let failure as CatalogScanFailure {
-                self.finishAnalysis(
-                    generation,
-                    as: failure == .cancelled
-                        ? .cancelled
-                        : .failed(.underlying(failure.userMessage))
-                )
-                return
-            } catch let failure as PhotoLibraryReadError {
-                self.finishAnalysis(generation, as: .failed(Self.analysisFailure(for: failure)))
-                return
-            } catch {
-                self.finishAnalysis(
-                    generation,
-                    as: .failed(.underlying("Photos access is required to read your library."))
-                )
-                return
-            }
-
-            // The stream can finish without `.completed` when it was cancelled mid-read.
-            guard let built else {
-                self.finishAnalysis(generation, as: .cancelled)
-                return
-            }
-            guard self.isCurrentAnalysis(generation) else { return }
-
-            // Stage B — similarity analysis over the catalog, seeded with whatever the
-            // interrupted run already earned (entries whose asset still exists with the
-            // exact recorded modification date; deleted or changed assets recompute).
-            var sawCompletion = false
-            let seed = Self.fingerprintSeed(from: checkpoint, records: built.records)
-            do {
-                for try await event in engine.makeAnalysisStream(
-                    records: built.records,
-                    seed: seed
-                ) {
-                    guard self.isCurrentAnalysis(generation) else { return }
-                    switch event {
-                    case .progress(let progress):
-                        self.applyAnalysisProgress(progress)
-                    case .completed(let result):
-                        sawCompletion = true
-                        // The slot is released *before* the terminal state write: the
-                        // flip may hand the pipeline to a queued pass (M10), which must
-                        // find the checkpoint free.
-                        self.finishCheckpointRun(kind: .similarity)
-                        self.selection = PhotoSelectionModel(result: result)
-                        self.analysisState = .completed(result)
-                        let completedAt = await self.persistCompletedScan(result)
-                        await self.writeWidgetSummaryAfterScanCompleted(at: completedAt)
-                    }
-                }
-                if !sawCompletion {
-                    self.finishAnalysis(generation, as: .cancelled)
-                }
-            } catch is CancellationError {
-                self.finishAnalysis(generation, as: .cancelled)
-            } catch let failure as PhotoAnalysisFailure {
-                self.finishAnalysis(
-                    generation,
-                    as: failure == .cancelled ? .cancelled : .failed(failure)
-                )
-            } catch {
-                // PhotoKit/underlying error descriptions never reach the user verbatim.
-                self.finishAnalysis(
-                    generation,
-                    as: .failed(.underlying("Similarity analysis could not finish. Please try again."))
-                )
-            }
-        }
-        syncBackgroundTask()
     }
 
     /// Cancels the in-flight run. The generation bump makes any late write from the old run a
@@ -1238,9 +1543,9 @@ final class AppEnvironment {
         analysisTask = nil
         // The checkpoint is abandoned before the state flip: cancelling a running pass is
         // a terminal transition, and the flip may drive a queued pass (M10) that claims
-        // the slot. State and file stay consistent either way (nothing paused, nothing
-        // to resume).
-        discardInterruptedCheckpoint()
+        // its slot. Scoped to this kind (M13): a concurrently running sharpness pass keeps
+        // its own channel, its own file, and its own progress.
+        discardInterruptedCheckpoint(kinds: [.similarity])
         if analysisState.isRunning {
             analysisState = .cancelled
         }
@@ -1267,7 +1572,7 @@ final class AppEnvironment {
         analysisState = .running(progress)
         // Same cadence as the state write: the checkpoint's saved stage never runs ahead of
         // or behind what the UI was told, and a pause saves exactly the progress on screen.
-        checkpointAccumulator.setProgress(
+        checkpointChannels.accumulator(for: .similarity).setProgress(
             kind: .similarity,
             stage: progress.stage.rawValue,
             completed: progress.completedUnits,
@@ -1339,14 +1644,16 @@ final class AppEnvironment {
     /// Runs the sharpness pass over the images of the *already completed* catalog.
     ///
     /// Read-only and local-only: it measures bounded thumbnails through the same loader
-    /// seam every other pass uses and never touches the photo library. The two passes are
-    /// admitted symmetrically — a sharpness pass refuses to start while similarity analysis
-    /// is running, and a similarity run refuses while sharpness is running (each pass
-    /// snapshots the catalog it was started with, and both contend for the same thumbnail
-    /// pipeline and cores; one heavy pass at a time is the coordination rule). Starting
-    /// it also invalidates any prepared deletion review — plans are bound to the dataset
-    /// they were built from — and resets the blur selection, so a fresh run always opens
-    /// with nothing marked.
+    /// seam every other pass uses and never touches the photo library. Starting it also
+    /// invalidates any prepared deletion review — plans are bound to the dataset they were
+    /// built from — and resets the blur selection, so a fresh run always opens with
+    /// nothing marked.
+    ///
+    /// This is the **standalone, single-pass** entry point (retry, resume, and the legacy
+    /// queue): it keeps its serialized admission so an explicit one-pass request never races
+    /// the other, and it requires the catalog to already stand. The unified Image Cleanup
+    /// session — what every Analyze button calls — is `startImageAnalysis`, which builds the
+    /// catalog once and launches this pass concurrently with similarity.
     ///
     /// `resuming` carries an interrupted pass's checkpoint: already-classified assets are
     /// tallied without a request (only under the exact thresholds they were classified
@@ -1354,9 +1661,9 @@ final class AppEnvironment {
     /// continues.
     func startBlurAnalysis(resuming checkpoint: ScanCheckpoint? = nil) {
         guard !blurAnalysisState.isRunning else { return }
-        // Symmetric admission (M10): the similarity pass owns the analysis machinery while
-        // it runs. Queue the request — visible on the Potentially Blurry screen, started
-        // automatically when the run releases the pipeline — never a silent drop.
+        // Serialized admission for the standalone entry point (M10): the request queues —
+        // visible, never a silent drop — and starts when the running pass releases the
+        // pipeline. The unified session bypasses this by owning the shared catalog.
         if analysisState.isRunning {
             pendingAnalysisRequest = .blur
             return
@@ -1373,128 +1680,159 @@ final class AppEnvironment {
             blurAnalysisState = .failed(.underlying("Your library scan has not finished. Build your catalog, then try again."))
             return
         }
-        // Yield nonessential work to the incoming pass (see `startSimilarityAnalysis`).
-        cancelVideoSizeResolution()
-
-        // A fresh pass supersedes any prepared plan.
-        planBuildGeneration += 1
-        applyDeletion(.noSelection)
-
-        blurAnalysisGeneration += 1
+        prepareBlurRun()
         let generation = blurAnalysisGeneration
-        blurSelection = PhotoSelectionModel()
-
-        blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 0, totalUnits: 0))
-
-        // Claim the checkpoint slot for this pass (adopting the carried payload on resume;
-        // discarding superseded interrupted state on a fresh start) and stamp the
-        // calibration the verdicts will be classified under.
+        // Claim this pass's channel (adopting the carried payload on resume; discarding
+        // superseded interrupted state of this kind on a fresh start).
         let runSequence = beginCheckpointRun(kind: .blur, carrying: checkpoint)
-        let configuration = BlurAnalysisConfiguration()
-        checkpointAccumulator.noteBlurThresholds(configuration.thresholds)
-        let accumulator = checkpointAccumulator
+        blurAnalysisTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runBlurPass(
+                catalog: catalog,
+                generation: generation,
+                checkpoint: checkpoint,
+                runSequence: runSequence
+            )
+        }
+        syncBackgroundTask()
+    }
+
+    /// The sharpness pass over a catalog the caller has already built and stands in
+    /// `catalogState`. Reports through `blurAnalysisState`, releases the blur checkpoint on
+    /// success, and synchronizes the blur dataset so candidates become markable. Admission,
+    /// the `.running` state, and the claimed checkpoint run are the caller's — this is the
+    /// body both the standalone entry point and the unified session share.
+    private func runBlurPass(
+        catalog: CatalogScanResult,
+        generation: Int,
+        checkpoint: ScanCheckpoint?,
+        runSequence: Int
+    ) async {
+        let engine = Self.makeBlurEngine(
+            thumbnailLoader: thumbnailLoader,
+            accumulator: checkpointChannels.accumulator(for: .blur),
+            runSequence: runSequence,
+            clock: blurAnalysisClock,
+            budget: analysisConcurrencyBudget
+        )
+        let records = catalog.records
+        // Verdicts the interrupted run already earned, reconciled against the fresh catalog
+        // (deleted or re-exported assets re-measure) — nil when the calibration differs,
+        // which the engine also refuses, so a mismatch is always a full pass. Built off the
+        // main actor: the seed walks every catalog record and saved verdict, work that used
+        // to stall the tap-to-start path on a large library before the first thumbnail was
+        // ever requested.
+        let seedCheckpoint = checkpoint
+        let seedRecords = records
+        let seedThresholds = engine.configuration.thresholds
+        let seed = await Task.detached(priority: .userInitiated) {
+            Self.blurSeed(
+                from: seedCheckpoint,
+                records: seedRecords,
+                thresholds: seedThresholds
+            )
+        }.value
+
+        var sawCompletion = false
+        do {
+            for try await event in engine.makeAnalysisStream(
+                records: records,
+                seed: seed
+            ) {
+                guard isCurrentBlurAnalysis(generation) else { return }
+                switch event {
+                case .progress(let progress):
+                    blurAnalysisState = .running(progress)
+                    // Single-stage pass: counts only, tagged `.blur` so a chained catalog
+                    // rebuild can never rewrite this run's saved progress.
+                    checkpointChannels.accumulator(for: .blur).setProgress(
+                        kind: .blur,
+                        stage: "",
+                        completed: progress.completedUnits,
+                        total: progress.totalUnits
+                    )
+                case .completed(let result):
+                    sawCompletion = true
+                    // The channel is released *before* the terminal state write: the flip
+                    // may hand a queued single-pass request its slot (M10), which must find
+                    // the checkpoint free.
+                    finishCheckpointRun(kind: .blur)
+                    // Reconcile confirmed removals that landed while this pass ran (M13):
+                    // the pass sampled the pre-mutation catalog, so its result may still
+                    // describe assets that no longer exist. Only the removed IDs leave —
+                    // the work for every surviving asset stands.
+                    let reconciled = result.removingAssets(deletionsDuringRunningPasses)
+                    blurAnalysisState = .completed(reconciled)
+                    clearDeletionReconciliationIfIdle()
+                    // Admission only: candidates become markable, nothing is marked.
+                    synchronizeBlurDataset()
+                }
+            }
+            if !sawCompletion {
+                finishBlurAnalysis(generation, as: .cancelled)
+            }
+        } catch is CancellationError {
+            finishBlurAnalysis(generation, as: .cancelled)
+        } catch let failure as BlurAnalysisFailure {
+            finishBlurAnalysis(
+                generation,
+                as: failure == .cancelled ? .cancelled : .failed(failure)
+            )
+        } catch {
+            // PhotoKit/underlying error descriptions never reach the user verbatim.
+            finishBlurAnalysis(
+                generation,
+                as: .failed(.underlying("Sharpness analysis could not finish. Please try again."))
+            )
+        }
+    }
+
+    /// Builds the sharpness engine with its checkpoint sink bound to the given run sequence
+    /// and its worker width bound to the shared cross-pipeline budget (M13), stamping the
+    /// calibration the verdicts will be classified under into the accumulator first (so an
+    /// interruption persists it alongside the evidence).
+    private static func makeBlurEngine(
+        thumbnailLoader: any PhotoThumbnailLoading,
+        accumulator: ScanCheckpointAccumulator,
+        runSequence: Int,
+        clock: @escaping @Sendable () -> Date,
+        budget: AnalysisConcurrencyBudget
+    ) -> BlurAnalysisEngine {
+        var configuration = BlurAnalysisConfiguration()
+        // A policy source, not a tuning value: read live at every width decision so both
+        // pipelines halve their width while concurrent (see `makeSimilarityEngine`).
+        configuration.concurrentPasses = { budget.activePassCount }
+        accumulator.noteBlurThresholds(configuration.thresholds)
         let checkpointSink: (@Sendable (CheckpointEvidence) -> Void)? = { evidence in
             accumulator.record(evidence, runSequence: runSequence)
         }
-
-        let records = catalog.records
         #if DEBUG
         // Same validation hook as the similarity pass: `NETTO_SCAN_METRICS=1` injects the
         // blur metrics recorder so an end-to-end run prints one `blur-summary` line at the
         // end (see `BlurAnalysisMetrics`). Without it the engine is exactly as before.
-        let engine: BlurAnalysisEngine
         if ProcessInfo.processInfo.environment["NETTO_SCAN_METRICS"] == "1" {
-            engine = BlurAnalysisEngine(
+            return BlurAnalysisEngine(
                 configuration: configuration,
                 thumbnailLoader: thumbnailLoader,
                 metrics: BlurAnalysisMetrics(),
-                now: blurAnalysisClock,
-                checkpointSink: checkpointSink
-            )
-        } else {
-            engine = BlurAnalysisEngine(
-                configuration: configuration,
-                thumbnailLoader: thumbnailLoader,
-                now: blurAnalysisClock,
+                now: clock,
                 checkpointSink: checkpointSink
             )
         }
-        #else
-        let engine = BlurAnalysisEngine(
+        return BlurAnalysisEngine(
             configuration: configuration,
             thumbnailLoader: thumbnailLoader,
-            now: blurAnalysisClock,
+            now: clock,
+            checkpointSink: checkpointSink
+        )
+        #else
+        return BlurAnalysisEngine(
+            configuration: configuration,
+            thumbnailLoader: thumbnailLoader,
+            now: clock,
             checkpointSink: checkpointSink
         )
         #endif
-
-        // Verdicts the interrupted run already earned, reconciled against the fresh
-        // catalog (deleted or re-exported assets re-measure) — nil when the calibration
-        // differs, which the engine also refuses, so a mismatch is always a full pass.
-        // Built off the main actor inside the task: the seed walks every catalog record
-        // and every saved verdict, work that used to stall the tap-to-start path on a
-        // large library before the first thumbnail was even requested.
-        let seedCheckpoint = checkpoint
-        let seedRecords = records
-        let seedThresholds = configuration.thresholds
-
-        blurAnalysisTask = Task { [weak self] in
-            guard let self else { return }
-            let seed = await Task.detached(priority: .userInitiated) {
-                Self.blurSeed(
-                    from: seedCheckpoint,
-                    records: seedRecords,
-                    thresholds: seedThresholds
-                )
-            }.value
-            var sawCompletion = false
-            do {
-                for try await event in engine.makeAnalysisStream(
-                    records: records,
-                    seed: seed
-                ) {
-                    guard self.isCurrentBlurAnalysis(generation) else { return }
-                    switch event {
-                    case .progress(let progress):
-                        self.blurAnalysisState = .running(progress)
-                        // Single-stage pass: counts only, tagged `.blur` so a chained
-                        // catalog rebuild can never rewrite this run's saved progress.
-                        self.checkpointAccumulator.setProgress(
-                            kind: .blur,
-                            stage: "",
-                            completed: progress.completedUnits,
-                            total: progress.totalUnits
-                        )
-                    case .completed(let result):
-                        sawCompletion = true
-                        // The slot is released *before* the terminal state write: the
-                        // flip may hand the pipeline to a queued pass (M10), which must
-                        // find the checkpoint free.
-                        self.finishCheckpointRun(kind: .blur)
-                        self.blurAnalysisState = .completed(result)
-                        // Admission only: candidates become markable, nothing is marked.
-                        self.synchronizeBlurDataset()
-                    }
-                }
-                if !sawCompletion {
-                    self.finishBlurAnalysis(generation, as: .cancelled)
-                }
-            } catch is CancellationError {
-                self.finishBlurAnalysis(generation, as: .cancelled)
-            } catch let failure as BlurAnalysisFailure {
-                self.finishBlurAnalysis(
-                    generation,
-                    as: failure == .cancelled ? .cancelled : .failed(failure)
-                )
-            } catch {
-                // PhotoKit/underlying error descriptions never reach the user verbatim.
-                self.finishBlurAnalysis(
-                    generation,
-                    as: .failed(.underlying("Sharpness analysis could not finish. Please try again."))
-                )
-            }
-        }
-        syncBackgroundTask()
     }
 
     /// Cancels the in-flight sharpness pass. The generation bump makes any late write
@@ -1505,8 +1843,9 @@ final class AppEnvironment {
         blurAnalysisTask = nil
         // The checkpoint is abandoned before the state flip: cancelling a running pass is
         // a terminal transition, and the flip may drive a queued pass (M10) that claims
-        // the slot.
-        discardInterruptedCheckpoint()
+        // its slot. Scoped to this kind (M13): a concurrently running similarity pass keeps
+        // its own channel, its own file, and its own progress.
+        discardInterruptedCheckpoint(kinds: [.blur])
         if blurAnalysisState.isRunning {
             blurAnalysisState = .cancelled
         }
@@ -1954,6 +2293,11 @@ final class AppEnvironment {
     /// the persisted snapshot, which keeps the original scan's identity), the catalog loses
     /// only the removed records, and the screenshot/video filters reconcile against that
     /// pruned catalog. No rescan is started; failure outcomes never reach here.
+    ///
+    /// M13: a pipeline still *running* is never cancelled here. Its work for every asset
+    /// that survived the mutation is valid, so the confirmed removals are recorded and
+    /// reconciled out of its result the moment it lands (`deletionsDuringRunningPasses`)
+    /// — a deletion never throws away a concurrent pass's progress or forces a re-run.
     private func preserveResultsAfterDeletion(removing deletedAssetIDs: Set<String>) async {
         planBuildGeneration += 1
         // Deletion invalidation: nothing derived from a removed asset may outlive it —
@@ -1971,28 +2315,21 @@ final class AppEnvironment {
         cancelVideoSizeResolution()
         videoSizeResolution = .idle
 
-        // A read started before the mutation would complete with pre-mutation data: cancel
-        // it and supersede any late write so it can never overwrite the pruned results.
-        analysisGeneration += 1
-        analysisTask?.cancel()
-        analysisTask = nil
-        if analysisState.isRunning {
-            // Interrupted by the mutation — cancelled, never left "running" over data that
-            // just changed underneath it (the same terminal write the sharpness pass below
-            // gets). Without it the state froze at `.running` forever: every later write is
-            // generation-guarded off, and both scan entry points refuse to start.
-            analysisState = .cancelled
+        // A pipeline still running sampled the pre-mutation catalog, but its work for every
+        // asset that *survived* is valid (M13). Cancelling it would throw that away and
+        // force a full re-run; instead the confirmed removals are recorded and reconciled
+        // out of the result the moment it lands (see `reconcileDeletionDuringRun`). The
+        // pass keeps its generation — a late write from it is still *its* write, now
+        // reconciled, never a write from a superseded run.
+        let similarityWasRunning = analysisState.isRunning
+        let blurWasRunning = blurAnalysisState.isRunning
+        if !deletedAssetIDs.isEmpty, similarityWasRunning || blurWasRunning {
+            deletionsDuringRunningPasses.formUnion(deletedAssetIDs)
         }
-        // The sharpness pass sampled the pre-mutation catalog: cancel it the same way, and
-        // supersede any late write, so its result can only ever describe the current data.
-        blurAnalysisGeneration += 1
-        blurAnalysisTask?.cancel()
-        blurAnalysisTask = nil
-        if blurAnalysisState.isRunning {
-            // Interrupted by the mutation — cancelled, never "completed" over data that
-            // just changed underneath it.
-            blurAnalysisState = .cancelled
-        }
+        // Only a *standalone* catalog read is abandoned: it would complete with pre-mutation
+        // records and could overwrite the pruned catalog. A pipeline's own pass is never
+        // cancelled here (see above), and a unified session's shared enumeration cannot be
+        // in flight — a deletion plan requires the completed catalog it would be building.
         let catalogWasRunning = catalogTask != nil
         catalogTask?.cancel()
         catalogTask = nil
@@ -2298,8 +2635,7 @@ final class AppEnvironment {
         // Sizes an interrupted run already measured, validated against this catalog: only
         // an asset that still exists with the exact recorded modification date
         // contributes; deleted or re-exported videos are measured again.
-        if let checkpoint = resumableCheckpoint,
-           checkpoint.kind == .videoSizes,
+        if let checkpoint = resumableCheckpoints[.videoSizes],
            !checkpoint.videoSizes.isEmpty {
             var index: [String: PhotoAssetRecord] = [:]
             index.reserveCapacity(videos.count)
@@ -2416,9 +2752,9 @@ final class AppEnvironment {
 
     // MARK: - Interrupted runs: checkpoints, pause, resume (Phase C)
 
-    /// Claims the single checkpoint slot for a run and returns the sequence its sink must
-    /// present. `carrying` resumes an interrupted run's payload; `nil` starts empty — and
-    /// first discards whatever interrupted state existed, because an explicit new run
+    /// Claims this kind's checkpoint channel for a run and returns the sequence its sink
+    /// must present. `carrying` resumes an interrupted run's payload; `nil` starts empty —
+    /// and first discards that kind's interrupted state, because an explicit new run
     /// supersedes resumable work (the Resume button is what continues it, never a fresh tap).
     @discardableResult
     private func beginCheckpointRun(
@@ -2426,64 +2762,66 @@ final class AppEnvironment {
         carrying checkpoint: ScanCheckpoint?
     ) -> Int {
         if checkpoint == nil {
-            discardInterruptedCheckpoint()
+            discardInterruptedCheckpoint(kinds: [kind])
         }
         let sequence = nextRunSequence
         nextRunSequence += 1
-        checkpointAccumulator.begin(kind: kind, runSequence: sequence, carrying: checkpoint)
+        checkpointChannels.accumulator(for: kind)
+            .begin(kind: kind, runSequence: sequence, carrying: checkpoint)
         // The accumulator owns the payload from here (video checkpoints are the exception:
-        // they never begin a run and keep `resumableCheckpoint` as their seed).
-        resumableCheckpoint = nil
+        // they never begin a run and keep their `resumableCheckpoints` entry as their seed).
+        resumableCheckpoints[kind] = nil
         return sequence
     }
 
-    /// Abandons interrupted work entirely: file gone, no straggler can resurrect it, and
-    /// every paused surface returns to "not started". Used by explicit cancels, fresh runs,
-    /// and supersession — never by completion (which is kind-aware, via `finishCheckpointRun`).
-    private func discardInterruptedCheckpoint() {
-        checkpointAccumulator.endRun()
-        // Blocks every write at or below the last known run, so a late flush from the
-        // discarded run can never bring the file back.
-        checkpointWriter.clear(through: nextRunSequence - 1)
-        resumableCheckpoint = nil
+    /// Abandons interrupted work for the given kinds: files gone, no straggler can
+    /// resurrect them, and every affected paused surface returns to "not started". Used by
+    /// explicit cancels, fresh runs, and supersession — never by completion (which is
+    /// kind-aware, via `finishCheckpointRun`). Defaults to every kind: "abandon everything".
+    private func discardInterruptedCheckpoint(kinds: [ScanCheckpoint.Kind] = ScanCheckpoint.Kind.allCases) {
+        for kind in kinds {
+            let accumulator = checkpointChannels.accumulator(for: kind)
+            accumulator.endRun()
+            // Blocks every write at or below the last known run, so a late flush from the
+            // discarded run can never bring the file back.
+            checkpointChannels.writer(for: kind).clear(through: nextRunSequence - 1)
+            resumableCheckpoints[kind] = nil
+        }
         pendingResume = nil
         lastVideoCheckpointSequence = nil
-        if case .paused = analysisState { analysisState = .notStarted }
-        if case .paused = catalogState { catalogState = .notStarted }
-        if case .paused = blurAnalysisState { blurAnalysisState = .notStarted }
+        if kinds.contains(.similarity), case .paused = analysisState { analysisState = .notStarted }
+        if kinds.contains(.catalog), case .paused = catalogState { catalogState = .notStarted }
+        if kinds.contains(.blur), case .paused = blurAnalysisState { blurAnalysisState = .notStarted }
     }
 
-    /// Completion (or non-pause cancellation) release for the pass that owns the
-    /// accumulator right now. A no-op when the slot belongs to another pass or to nobody —
-    /// that file is not this run's to clear, and blocking through a foreign sequence would
-    /// freeze the file's owner out of its own writes.
+    /// Completion (or non-pause cancellation) release for the pass that owns its channel
+    /// right now. A no-op when that channel belongs to nobody — that file is not this run's
+    /// to clear, and blocking through a foreign sequence would freeze its owner out.
     private func finishCheckpointRun(kind: ScanCheckpoint.Kind) {
-        guard checkpointAccumulator.activeKind == kind else { return }
-        let sequence = checkpointAccumulator.currentRunSequence
-        checkpointAccumulator.endRun()
-        checkpointWriter.clear(owning: kind, through: sequence)
+        let accumulator = checkpointChannels.accumulator(for: kind)
+        guard accumulator.activeKind == kind else { return }
+        let sequence = accumulator.currentRunSequence
+        accumulator.endRun()
+        checkpointChannels.writer(for: kind).clear(owning: kind, through: sequence)
     }
 
-    /// Releases the video-size checkpoint once its dataset is fully measured. Only a video
-    /// file is ever removed (kind-aware), and only writes at or below its own sequence are
-    /// blocked — a heavier pass's file, if one exists, is untouched.
+    /// Releases the video-size checkpoint once its dataset is fully measured. Only the video
+    /// file is ever removed (its own channel), and only writes at or below its own sequence
+    /// are blocked — every other kind's file lives in its own channel and is untouched.
     private func clearVideoCheckpointIfOwned() {
-        guard let checkpoint = resumableCheckpoint, checkpoint.kind == .videoSizes else { return }
+        guard let checkpoint = resumableCheckpoints[.videoSizes] else { return }
         let sequence = lastVideoCheckpointSequence ?? checkpoint.runSequence
         lastVideoCheckpointSequence = nil
-        resumableCheckpoint = nil
-        checkpointWriter.clear(owning: .videoSizes, through: sequence)
+        resumableCheckpoints[.videoSizes] = nil
+        checkpointChannels.writer(for: .videoSizes).clear(owning: .videoSizes, through: sequence)
     }
 
     /// Persists an in-flight video measurement as resumable state — only while a
-    /// measurement is running, only when the file slot holds no heavier pass's resume
-    /// information (a paused similarity/blur/catalog checkpoint always wins the single
-    /// slot), and only with bytes this catalog actually measured. One synchronous bounded
-    /// write at the pause transition: determinism matters more than a few milliseconds
-    /// there, and this is never a per-asset or per-batch write.
+    /// measurement is running and only with bytes this catalog actually measured. One
+    /// synchronous bounded write at the pause transition: determinism matters more than a
+    /// few milliseconds there, and this is never a per-asset or per-batch write.
     private func writeVideoSizeCheckpoint() {
         guard case .measuring(let measurement) = videoSizeResolution else { return }
-        guard checkpointWriter.allows(.videoSizes) else { return }
         guard case .completed(let catalog) = catalogState else { return }
         let videos = VideoDataset.records(in: catalog)
         guard !videos.isEmpty, !measurement.bytes.isEmpty else { return }
@@ -2512,8 +2850,8 @@ final class AppEnvironment {
             videoSizes: entries.sorted { $0.assetID < $1.assetID }
         )
         lastVideoCheckpointSequence = sequence
-        resumableCheckpoint = checkpoint
-        checkpointWriter.write(checkpoint)
+        resumableCheckpoints[.videoSizes] = checkpoint
+        checkpointChannels.writer(for: .videoSizes).write(checkpoint)
     }
 
     /// Freezes every in-flight pass at an interruption (background expiration), in the one
@@ -2523,27 +2861,42 @@ final class AppEnvironment {
     /// heavy pass's file exists). Fully synchronous — this is the last deterministic moment.
     private func pauseAllActiveWork() {
         var interruptedWork = false
+        var interruptedKinds: [ScanCheckpoint.Kind] = []
         if case .running(let progress) = analysisState {
             interruptedWork = true
+            interruptedKinds.append(.similarity)
             analysisGeneration += 1
             analysisTask?.cancel()
             analysisTask = nil
             // The progress on screen is the progress saved — no rounding to a stale tick.
             analysisState = .paused(progress)
-            checkpointAccumulator.setProgress(
+            checkpointChannels.accumulator(for: .similarity).setProgress(
                 kind: .similarity,
                 stage: progress.stage.rawValue,
                 completed: progress.completedUnits,
                 total: progress.totalUnits
             )
         }
+        // A unified session's shared read is in flight when its `catalogTask` is running but
+        // `catalogState` never went `.running` (the read reports through similarity's
+        // `preparing` stage). Interruption abandons the shared read itself — both pipelines
+        // are paused above and below, and resume restarts the read for both.
+        if sharedEnumerationInFlight {
+            interruptedWork = true
+            if !interruptedKinds.contains(.catalog) { interruptedKinds.append(.catalog) }
+            catalogGeneration += 1
+            catalogTask?.cancel()
+            catalogTask = nil
+            sharedEnumerationInFlight = false
+        }
         if case .running(let progress) = catalogState {
             interruptedWork = true
+            if !interruptedKinds.contains(.catalog) { interruptedKinds.append(.catalog) }
             catalogGeneration += 1
             catalogTask?.cancel()
             catalogTask = nil
             catalogState = .paused(progress)
-            checkpointAccumulator.setProgress(
+            checkpointChannels.accumulator(for: .catalog).setProgress(
                 kind: .catalog,
                 stage: "catalog",
                 completed: progress.enumeratedCount,
@@ -2552,23 +2905,28 @@ final class AppEnvironment {
         }
         if case .running(let progress) = blurAnalysisState {
             interruptedWork = true
+            interruptedKinds.append(.blur)
             blurAnalysisGeneration += 1
             blurAnalysisTask?.cancel()
             blurAnalysisTask = nil
             blurAnalysisState = .paused(progress)
-            checkpointAccumulator.setProgress(
+            checkpointChannels.accumulator(for: .blur).setProgress(
                 kind: .blur,
                 stage: "",
                 completed: progress.completedUnits,
                 total: progress.totalUnits
             )
         }
-        // After this call the file is exactly what resume will start from.
-        checkpointAccumulator.flushNowSync()
-        if let paused = checkpointAccumulator.snapshot() {
-            resumableCheckpoint = paused
+        // After this loop each interrupted pass's own file is exactly what resume will start
+        // from — every kind owns its channel, so concurrent passes never clobber one another.
+        for kind in interruptedKinds {
+            let accumulator = checkpointChannels.accumulator(for: kind)
+            accumulator.flushNowSync()
+            if let paused = accumulator.snapshot() {
+                resumableCheckpoints[kind] = paused
+            }
+            accumulator.endRun()
         }
-        checkpointAccumulator.endRun()
         if case .measuring = videoSizeResolution {
             interruptedWork = true
             // Checkpoint first (still `.measuring`, so its bytes are complete), then stop:
@@ -2585,6 +2943,18 @@ final class AppEnvironment {
             pausedThisSession = true
         }
         syncBackgroundTask()
+    }
+
+    /// Insurance-flushes every channel that has an active run (one bounded write per active
+    /// pass, never per asset, never on the main actor during a run). Video sizes persist
+    /// through their own transition, not here.
+    private func flushActiveCheckpoints() {
+        for kind in ScanCheckpoint.Kind.allCases {
+            let accumulator = checkpointChannels.accumulator(for: kind)
+            if accumulator.isActive {
+                accumulator.flushNowSync()
+            }
+        }
     }
 
     /// Whether anything is still computing. The background task is held only for this —
@@ -2630,17 +3000,18 @@ final class AppEnvironment {
                 resumeInterruptedWork()
             }
         case .inactive:
-            checkpointAccumulator.flushNowSync()
+            flushActiveCheckpoints()
         case .background:
             enterBackground()
         }
     }
 
-    /// The app left the foreground: insurance-flush whatever the batcher has not written
-    /// yet (one bounded write, not per asset), then hold a background task only if there
-    /// is work to protect. Video measurement keeps running under the task's budget.
+    /// The app left the foreground: insurance-flush whatever the batchers have not written
+    /// yet (one bounded write per active pass, not per asset), then hold a background task
+    /// only if there is work to protect. Video measurement keeps running under the task's
+    /// budget.
     private func enterBackground() {
-        checkpointAccumulator.flushNowSync()
+        flushActiveCheckpoints()
         syncBackgroundTask()
     }
 
@@ -2654,6 +3025,12 @@ final class AppEnvironment {
     /// Resumes the interrupted run, if the library still allows it. Safe to call
     /// repeatedly: no-ops while work is running, during deletion, without Photos access,
     /// or with nothing to resume.
+    ///
+    /// M13: a unified session checkpoints both passes at once, so a resume that finds both
+    /// a similarity and a sharpness checkpoint restarts **both** from their own files — one
+    /// shared enumeration, two independent pipelines. A resume that finds only one resumes
+    /// just that pass (a sharpness-only checkpoint is the honest state after the similarity
+    /// pass completed and its file was released).
     func resumeInterruptedWork() {
         guard !analysisState.isRunning,
               !catalogState.isRunning,
@@ -2661,19 +3038,37 @@ final class AppEnvironment {
         else { return }
         guard !deletionState.isDeleting else { return }
         guard photoPermissionState.isUsable else { return }
-        guard let checkpoint = resumableCheckpoint else {
-            pausedThisSession = false
+        pausedThisSession = false
+        let similarityCheckpoint = resumableCheckpoints[.similarity]
+        let blurCheckpoint = resumableCheckpoints[.blur]
+        if let similarityCheckpoint, let blurCheckpoint {
+            // Both passes of one unified session were interrupted together: resume them
+            // together, each seeded from its own evidence.
+            startImageAnalysis(resuming: similarityCheckpoint, blurCheckpoint: blurCheckpoint)
             return
         }
-        pausedThisSession = false
-        dispatchInterruptedResume(checkpoint)
+        if let similarityCheckpoint {
+            dispatchInterruptedResume(similarityCheckpoint)
+            return
+        }
+        if let blurCheckpoint {
+            dispatchInterruptedResume(blurCheckpoint)
+            return
+        }
+        if let catalogCheckpoint = resumableCheckpoints[.catalog] {
+            dispatchInterruptedResume(catalogCheckpoint)
+            return
+        }
+        if let videoCheckpoint = resumableCheckpoints[.videoSizes] {
+            dispatchInterruptedResume(videoCheckpoint)
+        }
     }
 
-    /// Routes a checkpoint to the pass that owns it — chaining a catalog rebuild first when
-    /// the seed needs fresh records to reconcile against (blur and video sizes both do;
-    /// similarity rebuilds its own catalog as Stage A regardless). The chained rebuild owns
-    /// no checkpoint of its own: it must not begin one, and must not discard the one it is
-    /// rebuilding for (`startCatalogBuild` keys that off `pendingResume`).
+    /// Routes a single checkpoint to the pass that owns it — chaining a catalog rebuild
+    /// first when the seed needs fresh records to reconcile against (blur and video sizes
+    /// both do; similarity rebuilds its own catalog as Stage A regardless). The chained
+    /// rebuild owns no checkpoint of its own: it must not begin one, and must not discard
+    /// the one it is rebuilding for (`startCatalogBuild` keys that off `pendingResume`).
     private func dispatchInterruptedResume(_ checkpoint: ScanCheckpoint) {
         switch checkpoint.kind {
         case .similarity:
@@ -2689,7 +3084,7 @@ final class AppEnvironment {
             }
         case .videoSizes:
             if case .completed = catalogState {
-                resumableCheckpoint = checkpoint
+                resumableCheckpoints[.videoSizes] = checkpoint
                 resumeVideoSizeMeasurement()
             } else {
                 pendingResume = checkpoint
