@@ -750,6 +750,341 @@ struct DeletionFlowTests {
         #expect(policy.sharedWidth(base: 4, activePasses: 3) == 1) // floor of 1
     }
 
+    // MARK: M13B — deletion → return → reuse review (no forced re-analysis)
+
+    /// The reported regression: analyze, select, delete, return, select again, delete again.
+    /// The second review must open READY over the unaffected remaining groups — never
+    /// "Review out of date" — and must never require re-running the analysis to get there.
+    @Test func deleteReturnSelectDeleteAgainKeepsUnaffectedGroupsReviewable() async {
+        let records = ["a", "b", "c", "d", "e"].map { makeRecord(id: $0) }
+        let (env, service) = makeEnv(
+            records: records,
+            sizeProvider: FakeSizeProvider(sizes: ["b": 500, "d": 100, "e": 200]),
+            outcome: .succeeded(DeletionSuccess(plannedCount: 2, verifiedRemovedCount: 2, remainingIDs: [])),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        // The scan presented its groups; the deterministic default excludes each group's KEEP.
+        env.selection = PhotoSelectionModel(result: DeletionFlowFixtures.threeMemberResult)
+        #expect(env.selection.selectedIDs == ["b", "d", "e"])
+
+        // Round 1 — mark the exact pair (a, b) and delete it.
+        env.mutateSelection {
+            $0.toggle("a") // a is the protected keep; mark it explicitly
+            $0.setSelected(false, forAsset: "d")
+            $0.setSelected(false, forAsset: "e")
+        }
+        #expect(env.selection.selectedIDs == ["a", "b"])
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("round 1 expected readyForReview, got \(env.deletionState)")
+            return
+        }
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        #expect(service.callCount == 1)
+
+        // Only the confirmed pair left the result; the near group stands untouched.
+        guard case .completed(let afterRound1) = env.analysisState else {
+            Issue.record("analysis must stay completed after deletion, got \(env.analysisState)")
+            return
+        }
+        #expect(afterRound1.exactGroups.isEmpty)
+        #expect(afterRound1.similarGroups.map(\.memberAssetIDs) == [["c", "d", "e"]])
+        env.dismissDeletionResult()
+        #expect(env.deletionState == .noSelection)
+
+        // Round 2 — the unaffected group must back a fresh, READY review with no re-analysis.
+        env.mutateSelection {
+            $0.setSelected(true, forAsset: "d")
+            $0.setSelected(true, forAsset: "e")
+        }
+        #expect(env.selection.selectedIDs == ["d", "e"])
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("round 2 expected readyForReview over the unaffected group, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["d", "e"])
+        // Still one recorded deletion — reaching a ready plan required no extra mutation run.
+        #expect(service.callCount == 1)
+
+        // The second delete also completes and leaves an (empty) completed scan, never a reset.
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        #expect(service.callCount == 2)
+        guard case .completed(let afterRound2) = env.analysisState else {
+            Issue.record("analysis must stay completed after the second deletion, got \(env.analysisState)")
+            return
+        }
+        #expect(afterRound2.exactGroups.isEmpty)
+        #expect(afterRound2.similarGroups.isEmpty)
+        #expect(afterRound2.totalRecordCount == DeletionFlowFixtures.threeMemberResult.totalRecordCount)
+    }
+
+    /// A deletion while the *other* pipeline is live (M13) must neither cancel that pass nor
+    /// invalidate the similarity result: the unaffected group still backs a READY review and
+    /// no re-analysis is forced.
+    @Test func deletionWhileTheOtherPipelineRunsKeepsReviewReusableWithoutForcingReanalysis() async {
+        let records = ["a", "b", "c", "d", "e"].map { makeRecord(id: $0) }
+        let (env, service) = makeEnv(
+            records: records,
+            sizeProvider: FakeSizeProvider(sizes: ["b": 500, "d": 100, "e": 200]),
+            outcome: .succeeded(DeletionSuccess(plannedCount: 2, verifiedRemovedCount: 2, remainingIDs: [])),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(result: DeletionFlowFixtures.threeMemberResult)
+        env.mutateSelection {
+            $0.toggle("a")
+            $0.setSelected(false, forAsset: "d")
+            $0.setSelected(false, forAsset: "e")
+        }
+        #expect(env.selection.selectedIDs == ["a", "b"])
+
+        // Bring the sharpness pass up so an unrelated pipeline is live during the deletion.
+        env.startBlurAnalysis()
+        guard case .running = env.blurAnalysisState else {
+            Issue.record("setup: expected the sharpness pass running, got \(env.blurAnalysisState)")
+            return
+        }
+
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("expected readyForReview while the other pipeline runs, got \(env.deletionState)")
+            return
+        }
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        guard case .succeeded = env.deletionState else {
+            Issue.record("expected succeeded, got \(env.deletionState)")
+            return
+        }
+        // The deletion must not cancel or strand the unrelated sharpness pass.
+        if case .cancelled = env.blurAnalysisState {
+            Issue.record("deletion must not cancel the running sharpness pass")
+        }
+        // The similarity result stands (pruned in place) with the unaffected group intact.
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("similarity must stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.similarGroups.map(\.memberAssetIDs) == [["c", "d", "e"]])
+
+        env.dismissDeletionResult()
+        // The review is reusable over the surviving group with no re-analysis.
+        env.mutateSelection {
+            $0.setSelected(true, forAsset: "d")
+            $0.setSelected(true, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("review must be reusable over unaffected results, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["d", "e"])
+        env.cancelBlurAnalysis()
+    }
+
+    /// A partial removal (some planned IDs survived) lands in `.needsReview`; the surviving
+    /// results must stay reviewable and the re-review must reconcile only the removed IDs.
+    @Test func partialRemovalKeepsReviewReusableOverTheRemainingResults() async {
+        let records = ["a", "b", "c", "d", "e"].map { makeRecord(id: $0) }
+        let (env, _) = makeEnv(
+            records: records,
+            sizeProvider: FakeSizeProvider(sizes: ["b": 500]),
+            outcome: .succeeded(DeletionSuccess(
+                plannedCount: 2,
+                verifiedRemovedCount: 1,
+                remainingIDs: ["b"] // only a was actually removed
+            )),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(result: DeletionFlowFixtures.threeMemberResult)
+        env.mutateSelection {
+            $0.toggle("a")
+            $0.setSelected(false, forAsset: "d")
+            $0.setSelected(false, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .needsReview = env.deletionState else {
+            Issue.record("expected needsReview for a partial removal, got \(env.deletionState)")
+            return
+        }
+        // Only the confirmed removal (a) left the result; b survives inside a now-single
+        // member exact group that dissolves, and the near group is untouched.
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("analysis must stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.exactGroups.isEmpty) // (a, b) with a gone leaves b alone → dissolves
+        #expect(result.similarGroups.map(\.memberAssetIDs) == [["c", "d", "e"]])
+
+        env.dismissDeletionResult()
+        env.mutateSelection {
+            $0.setSelected(true, forAsset: "d")
+            $0.setSelected(true, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("review must stay reusable after a partial removal, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["d", "e"])
+    }
+
+    /// Identifiers that vanish between planning and execution are revalidated and refuse the
+    /// mutation (`.stale([.assetsMissing])`) — never a silent shrink, never a stranded state —
+    /// and the completed results stand so the user can re-review the survivors.
+    @Test func planFailsClosedWhenAPlannedAssetWentMissingBeforeDeletion() async {
+        let records = ["a", "b", "c", "d", "e"].map { makeRecord(id: $0) }
+        let (env, _) = makeEnv(
+            records: records,
+            sizeProvider: FakeSizeProvider(sizes: ["b": 500]),
+            // The backing reports b missing at revalidation time.
+            outcome: .stale([.assetsMissing(["b"])]),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(result: DeletionFlowFixtures.threeMemberResult)
+        env.mutateSelection {
+            $0.toggle("a")
+            $0.setSelected(false, forAsset: "d")
+            $0.setSelected(false, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+
+        guard case .planStale(_, let reasons) = env.deletionState else {
+            Issue.record("expected planStale for a missing asset, got \(env.deletionState)")
+            return
+        }
+        #expect(reasons == [.assetsMissing(["b"])])
+        // Nothing was removed: the completed results and the full selection stand.
+        guard case .completed(let result) = env.analysisState else {
+            Issue.record("analysis must stay completed, got \(env.analysisState)")
+            return
+        }
+        #expect(result.exactGroups.map(\.memberAssetIDs) == [["a", "b"]])
+        #expect(result.similarGroups.map(\.memberAssetIDs) == [["c", "d", "e"]])
+
+        // The survivors remain reviewable: dismissing the stale plan and re-preparing over
+        // the still-valid group opens a READY review without re-analysis.
+        env.dismissDeletionResult()
+        env.mutateSelection {
+            $0.setSelected(false, forAsset: "a")
+            $0.setSelected(false, forAsset: "b")
+            $0.setSelected(true, forAsset: "d")
+            $0.setSelected(true, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("survivors must stay reviewable, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["d", "e"])
+    }
+
+    /// Backing out of the review after a deletion without tapping "Done" leaves the terminal
+    /// outcome on the state machine. Re-entering the review with a fresh selection must drop
+    /// that leftover and prepare a fresh plan over the preserved results — never show the old
+    /// outcome or a stale "Review out of date".
+    @Test func reenteringReviewAfterADeletionWithoutDismissingPreparesAFreshPlan() async {
+        let records = ["a", "b", "c", "d", "e"].map { makeRecord(id: $0) }
+        let (env, _) = makeEnv(
+            records: records,
+            sizeProvider: FakeSizeProvider(sizes: ["b": 500, "d": 100, "e": 200]),
+            outcome: .succeeded(DeletionSuccess(plannedCount: 2, verifiedRemovedCount: 2, remainingIDs: [])),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(result: DeletionFlowFixtures.threeMemberResult)
+        env.mutateSelection {
+            $0.toggle("a")
+            $0.setSelected(false, forAsset: "d")
+            $0.setSelected(false, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        env.beginConfirmation()
+        await env.confirmDeletion()
+        guard case .succeeded = env.deletionState else {
+            Issue.record("setup: expected succeeded, got \(env.deletionState)")
+            return
+        }
+        // Deliberately NOT dismissed — the user backed out of the review instead.
+
+        // A fresh selection over the unaffected group, then re-enter the review.
+        env.mutateSelection {
+            $0.setSelected(true, forAsset: "d")
+            $0.setSelected(true, forAsset: "e")
+        }
+        env.reviewDidAppear(from: .similarPhotos)
+        await waitForPlanReady(env)
+
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("re-entering after a deletion must prepare a fresh plan, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["d", "e"])
+        // The plan is stamped over the *preserved* (pruned) result, not the pre-deletion one.
+        guard case .completed(let pruned) = env.analysisState else {
+            Issue.record("expected the pruned result to stand, got \(env.analysisState)")
+            return
+        }
+        #expect(plan.analysisSignature == DeletionPlanner.analysisSignature(for: pruned))
+    }
+
+    /// A leftover stale record from an earlier selection change must not stick: re-entering
+    /// the review with a valid selection re-prepares over the current results, so the screen
+    /// is reusable instead of parking on "Review out of date".
+    @Test func reenteringReviewAfterAStaleRecordRepreparesOverTheCurrentResults() async {
+        let records = ["a", "b", "c", "d", "e"].map { makeRecord(id: $0) }
+        let (env, _) = makeEnv(
+            records: records,
+            sizeProvider: FakeSizeProvider(sizes: ["b": 500, "d": 100, "e": 200]),
+            result: DeletionFlowFixtures.threeMemberResult
+        )
+        env.selection = PhotoSelectionModel(result: DeletionFlowFixtures.threeMemberResult)
+        env.mutateSelection {
+            $0.toggle("a")
+            $0.setSelected(false, forAsset: "d")
+            $0.setSelected(false, forAsset: "e")
+        }
+        env.prepareDeletionPlan()
+        await waitForPlanReady(env)
+        guard case .readyForReview = env.deletionState else {
+            Issue.record("setup: expected readyForReview, got \(env.deletionState)")
+            return
+        }
+        // Back out (Change Selection) and change the marks — the prepared plan goes stale.
+        env.mutateSelection {
+            $0.setSelected(false, forAsset: "a")
+            $0.setSelected(true, forAsset: "d")
+        }
+        guard case .planStale = env.deletionState else {
+            Issue.record("setup: expected the selection change to stale the plan, got \(env.deletionState)")
+            return
+        }
+
+        // Re-entering re-prepares over the current marks instead of parking on the stale record.
+        env.reviewDidAppear(from: .similarPhotos)
+        await waitForPlanReady(env)
+        guard case .readyForReview(let plan) = env.deletionState else {
+            Issue.record("re-entering must re-prepare over the current results, got \(env.deletionState)")
+            return
+        }
+        #expect(plan.selectionSnapshot == ["b", "d"])
+    }
+
     // MARK: Helpers
 
     private func makeEnv(

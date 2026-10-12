@@ -2081,9 +2081,16 @@ final class AppEnvironment {
     /// never be shown or confirmed under this screen, so any foreign deletion state — plan,
     /// stale record, failure, permission notice, or in-flight build — is dropped via the
     /// universal `noSelection` reset (an in-flight build is discarded first so it cannot land
-    /// afterwards), and this source prepares exactly as from the empty phase. A plan that
-    /// already belongs to `source` is kept, so re-entering the same review never re-resolves
-    /// sizes.
+    /// afterwards), and this source prepares exactly as from the empty phase.
+    ///
+    /// Re-entering the *same* source keeps only a live plan that still matches the current
+    /// selection — the "Change Selection" round-trip must never re-resolve sizes. Every other
+    /// state is dropped and re-prepared over the current, preserved results: an empty phase, a
+    /// stale record, a plan whose selection no longer matches, or a leftover terminal outcome
+    /// (`.succeeded`/`.needsReview`) a deletion can leave behind when the screen is backed out
+    /// of without dismissing. That keeps the review reusable after a deletion — unaffected
+    /// groups still back a fresh plan — without re-running analysis and without the screen
+    /// showing a stale "Review out of date" for results that are still valid.
     ///
     /// An in-flight mutation is untouchable: `noSelection` is universally legal, so applying
     /// it during `.deleting` would silently wipe the executing state (the outcome would then
@@ -2092,8 +2099,26 @@ final class AppEnvironment {
     func reviewDidAppear(from source: DeletionSelectionSource) {
         guard !deletionState.isDeleting else { return }
         guard planSource != source else {
-            if case .noSelection = deletionState, selectionCount(for: source) > 0 {
-                prepareDeletionPlan(from: source)
+            let keepsLivePlan: Bool = {
+                switch deletionState {
+                case .readyForReview(let plan), .awaitingConfirmation(let plan):
+                    return plan.selectionSnapshot == selectionIDs(for: source)
+                default:
+                    return false
+                }
+            }()
+            if !keepsLivePlan {
+                if deletionState.isBuildingPlan {
+                    planBuildGeneration += 1 // an in-flight build can never become current
+                }
+                if case .noSelection = deletionState {
+                    // Already empty; nothing to drop.
+                } else {
+                    applyDeletion(.noSelection)
+                }
+                if selectionCount(for: source) > 0 {
+                    prepareDeletionPlan(from: source)
+                }
             }
             return
         }

@@ -502,6 +502,35 @@ runs that queued behind each other, so a scan only ever advanced one of them.
   claimed for a physical device; the Simulator end-to-end validation is the only timing
   evidence, and it is not representative of device performance.
 
+### Reusable review after deletion (M13B)
+
+After a confirmed deletion the review stays **reusable over the surviving results** — no
+re-analysis is ever forced, and unaffected groups are never discarded.
+
+- **Only the affected identifiers are reconciled** — `removingAssets` prunes the completed
+  similarity result in place: a group that loses members below two dissolves, a group that
+  keeps its recommended KEEP keeps it (a removed KEEP promotes the best remaining member),
+  and every unaffected group stands with its original membership, evidence, and
+  recommendation. The sharpness result and the catalog are pruned the same way — in place,
+  never reset to "start analysis".
+- **The review re-prepares instead of staling** — `reviewDidAppear` now keeps only a live
+  plan that still matches the current selection (so the "Change Selection" round-trip never
+  re-resolves sizes) and re-prepares every other state over the current, preserved results.
+  Previously a leftover state — a stale record, a plan whose selection no longer matched, or
+  a terminal outcome reached by backing out of the review without tapping "Done" — blocked
+  re-preparation, so re-entering the review showed a stale "Review out of date" and demanded
+  "Review Again" even though the unaffected results were still valid. The review now opens
+  ready over the survivors.
+- **Identifiers are revalidated before every mutation** — the deletion service resolves every
+  planned identifier against the live library immediately before mutating and refuses the
+  whole plan (`.stale([.assetsMissing])`, zero mutations) rather than silently shrinking it,
+  so an identifier that vanished between planning and execution can never be counted as
+  removed.
+- **Confirmation and truthful counts are unchanged** — the plan → confirmation → mutation
+  pipeline, the fresh-authorization read, the pure staleness validation, and the honest
+  planned/verified/remaining counts are exactly as before; nothing was relaxed to make the
+  review reusable.
+
 ## Privacy
 
 - Photos and contacts are read, analyzed, and mutated **on-device only**.
