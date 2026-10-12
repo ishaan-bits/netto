@@ -15,6 +15,10 @@ struct VideoInventoryRow: View {
     /// Whether the shared measurement *attempted* this video and honestly could not
     /// measure it (M15) — distinct from a video nobody has tried yet.
     let isKnownUnavailable: Bool
+    /// Whether a measurement pass is currently working through this dataset (M15-R1): a
+    /// not-yet-attempted row then reads "Measuring size…" instead of a terminal-sounding
+    /// "not measured yet".
+    let isBeingMeasured: Bool
     let isSelected: Bool
     let store: ThumbnailStore
     let onPreview: () -> Void
@@ -106,22 +110,23 @@ struct VideoInventoryRow: View {
         return "\(resolution) · \(date.formatted(date: .abbreviated, time: .omitted))"
     }
 
-    /// The honest size line (M15): measured bytes, or an explicit distinction between
-    /// "not measured yet" (never attempted) and "could not be measured" (attempted and
-    /// honestly unavailable) — never a guessed zero, and never a claim about *why* a size
-    /// is unknown (iCloud residency is not evidence this screen holds).
+    /// The honest size line (M15-R1): measured bytes, or one of three distinct states —
+    /// "Measuring size…" (a pass is actively working through this dataset), "not measured
+    /// yet" (nothing has attempted it), or "could not be measured" (attempted and honestly
+    /// unavailable locally). Never a guessed zero, never a terminal-sounding label before
+    /// a terminal outcome, and never a claim about *why* a size is unknown.
     private var sizeText: String {
         if let bytes = record.sizeInBytes {
             return ByteFormat.string(bytes)
         }
-        return isKnownUnavailable
-            ? "Size unavailable — could not be measured"
-            : "Size not measured yet"
+        if isKnownUnavailable {
+            return "Size unavailable — could not be measured"
+        }
+        return isBeingMeasured ? "Measuring size…" : "Size not measured yet"
     }
 
     private var previewAccessibilityLabel: String {
-        let size = record.sizeInBytes.map(ByteFormat.string)
-            ?? (isKnownUnavailable ? "size could not be measured" : "size not measured yet")
+        let size = record.sizeInBytes.map(ByteFormat.string) ?? sizeText.lowercased()
         return "Video, \(VideosPresentation.durationText(record.duration)), \(size)"
     }
 }

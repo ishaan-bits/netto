@@ -270,31 +270,63 @@ final class SwipeThumbnailPrefetcher: ObservableObject {
 ///   working (the next `prepare` is a fresh generation).
 @MainActor
 final class SwipeCardFrameModel: ObservableObject {
+    /// The loading contract (M15-R1) — every state a card can be in, and none of them
+    /// replaces a valid frame with an error while a request that can still succeed is in
+    /// flight.
     enum Phase: Equatable {
         case idle
-        case loading
-        /// The final, screen-sized thumbnail — the sharp image the card keeps.
+        /// The local fast path is in flight. `temporary` is the warm low-resolution frame
+        /// of the *same* photo shown while the sharp one prepares (never the final).
+        case preparing(temporary: CGImage?)
+        /// The local rendition is not on device (iCloud-backed) and the permitted
+        /// network-enabled request is in flight — an honest, non-blocking download state.
+        /// Any temporary frame stays visible while it runs.
+        case downloading(temporary: CGImage?)
+        /// The final, screen-sized frame — the sharp image the card keeps.
         case final(CGImage)
-        /// The temporary low-resolution frame, on screen only while the final prepares.
-        case temporary(CGImage)
+        /// A transient failure (iCloud download failed, timeout, PhotoKit hiccup): retry is
+        /// meaningful, nothing is poisoned, and `visible` keeps any frame already on screen.
+        case retryable(PhotoContentError, visible: CGImage?)
+        /// A genuine terminal failure for this session: the asset no longer exists, or
+        /// Photos access is off. Shown only after such a failure, never for a transient one.
         case unavailable(PhotoContentError)
     }
 
     @Published private(set) var phase: Phase = .idle
     private(set) var assetID: String?
     private var generation = 0
+    private var isRequestInFlight = false
 
-    /// Prepares the frame for `assetID` through the shared store. Safe to call for the
-    /// same card repeatedly (idempotent per generation) and for a new card at any time.
+    /// Prepares the frame for `assetID` through the shared store. Idempotent while a
+    /// request for the same card is in flight or a final frame exists; a settled *failure*
+    /// re-attempts on revisit (transient failures must never stick). Safe for a new card
+    /// at any time — the generation guard discards everything the old card started.
     func prepare(assetID: String, store: ThumbnailStore) {
-        if self.assetID == assetID, phase.isDisplayable {
-            // The card on screen already has its pixels (or its terminal state) — never
-            // re-load, never flash a loading state over them.
-            return
+        if self.assetID == assetID {
+            if case .final = phase { return }
+            if isRequestInFlight { return }
         }
+        let changedAsset = self.assetID != assetID
+        let carriedFrame = changedAsset ? nil : phase.visibleFrame
         generation += 1
         let generation = generation
         self.assetID = assetID
+        isRequestInFlight = true
+        // Identity-critical reset: when the card changes, the previous photo's pixels
+        // leave the screen immediately (a frame is never shown for the wrong asset).
+        // A re-attempt of the *same* card drops its stale failure but keeps its own
+        // pixels visible. A fresh card from idle resets nothing — a warm key resolves
+        // before any loading state is published.
+        switch phase {
+        case .retryable, .unavailable:
+            phase = .preparing(temporary: carriedFrame)
+        default:
+            if changedAsset, carriedFrame == nil, self.phase.visibleFrame != nil {
+                phase = .preparing(temporary: nil)
+            } else if changedAsset, case .final = phase {
+                phase = .preparing(temporary: nil)
+            }
+        }
 
         Task { [weak self] in
             guard let self else { return }
@@ -304,42 +336,82 @@ final class SwipeCardFrameModel: ObservableObject {
                 targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
             ) {
                 guard self.generation == generation else { return }
+                self.isRequestInFlight = false
                 self.phase = .final(sharp)
                 return
             }
             guard self.generation == generation else { return }
-            self.phase = .loading
-            // The temporary tier: a warm low-resolution frame of the same photo, shown
-            // only while the final prepares, replaced by it below — never left standing
-            // as though it were sharp.
-            if let lowRes = await store.peekCached(
+            // The temporary tier: a warm low-resolution frame of the same photo, kept
+            // visible while the sharp one prepares and while any download runs.
+            let temporary = await store.peekCached(
                 assetID: assetID,
                 targetPixelSize: SwipeReviewPresentation.swipeThumbnailLowResPixelSize
-            ) {
-                guard self.generation == generation else { return }
-                self.phase = .temporary(lowRes)
-            }
+            )
+            guard self.generation == generation else { return }
+            self.phase = .preparing(temporary: temporary)
+
             do {
-                let sharp = try await store.image(
-                    for: assetID,
-                    targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
+                let sharp = try await Self.loadFinalFrame(
+                    assetID: assetID,
+                    store: store,
+                    onFallback: { [weak self] in
+                        guard let self, self.generation == generation else { return }
+                        self.phase = .downloading(temporary: temporary)
+                    }
                 )
                 guard self.generation == generation else { return }
+                self.isRequestInFlight = false
                 self.phase = .final(sharp)
             } catch {
                 guard self.generation == generation else { return }
-                // No local screen-sized rendition: a low-resolution frame (if any) is not
-                // a substitute for the final — the honest unavailable state is.
-                self.phase = .unavailable(Self.contentError(for: error))
+                self.isRequestInFlight = false
+                if error is CancellationError || Task.isCancelled { return }
+                let contentError = Self.contentError(for: error)
+                if Self.isTerminal(contentError) {
+                    self.phase = .unavailable(contentError)
+                } else {
+                    // Transient: retryable, and any frame already on screen stays.
+                    self.phase = .retryable(contentError, visible: temporary)
+                }
             }
         }
     }
 
-    /// Retries the current card after a failure (a fresh generation, fresh request).
+    /// The frame pipeline: local-first, then — only when the local rendition is genuinely
+    /// missing and the failure is the kind a download can fix — the permitted
+    /// network-enabled request. Prefetch never reaches this; it stays local-only.
+    private static func loadFinalFrame(
+        assetID: String,
+        store: ThumbnailStore,
+        onFallback: @escaping @MainActor () -> Void
+    ) async throws -> CGImage {
+        do {
+            return try await store.image(
+                for: assetID,
+                targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize,
+                policy: .localOnly
+            )
+        } catch {
+            if error is CancellationError || Task.isCancelled { throw error }
+            let contentError = contentError(for: error)
+            guard PhotoKitThumbnailLoader.isPreviewFallbackCandidate(contentError) else {
+                throw error
+            }
+            onFallback()
+            return try await store.image(
+                for: assetID,
+                targetPixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize,
+                policy: .allowNetwork
+            )
+        }
+    }
+
+    /// Retries the current card after a transient failure (one fresh request chain; any
+    /// visible frame is kept on screen). No-op for a final frame or an in-flight request.
     func retry(store: ThumbnailStore) {
         guard let assetID else { return }
-        phase = .idle
-        self.assetID = nil
+        if case .final = phase { return }
+        guard !isRequestInFlight else { return }
         prepare(assetID: assetID, store: store)
     }
 
@@ -347,29 +419,51 @@ final class SwipeCardFrameModel: ObservableObject {
     func close() {
         generation += 1
         assetID = nil
+        isRequestInFlight = false
         phase = .idle
     }
 
     private static func contentError(for error: any Error) -> PhotoContentError {
         (error as? PhotoContentError) ?? .unavailable
     }
-}
 
-extension SwipeCardFrameModel.Phase {
-    /// Frames that mean "this card is settled" — a warm re-prepare must never replace
-    /// them with a loading state.
-    var isDisplayable: Bool {
-        switch self {
-        case .final, .temporary, .unavailable: return true
-        case .idle, .loading: return false
+    /// Only a genuine terminal failure may claim permanent unavailability: the asset is
+    /// gone, or Photos access is off. Everything else (iCloud, timeout, framework hiccups)
+    /// is transient and retryable — never labelled permanent.
+    static func isTerminal(_ error: PhotoContentError) -> Bool {
+        switch error {
+        case .assetNotFound, .permissionDenied: return true
+        case .onlyInICloud, .unavailable: return false
         }
     }
 }
 
-/// Renders one card's frame state: the final screen-sized thumbnail when it exists, the
-/// temporary low-resolution frame while it prepares, the loading skeleton only when
-/// nothing at all is available, and the honest unavailable state when no local rendition
-/// exists. The image is aspect-fit (letterboxed), same presentation as Photo Details.
+extension SwipeCardFrameModel.Phase {
+    /// A settled outcome (frame or failure) — no request is running for it.
+    var isSettled: Bool {
+        switch self {
+        case .final, .retryable, .unavailable: return true
+        case .idle, .preparing, .downloading: return false
+        }
+    }
+
+    /// A valid frame that must stay on screen while sharper work continues.
+    var visibleFrame: CGImage? {
+        switch self {
+        case .final(let image): return image
+        case .preparing(let temporary), .downloading(let temporary): return temporary
+        case .retryable(_, let visible): return visible
+        case .idle, .unavailable: return nil
+        }
+    }
+}
+
+/// Renders one card's frame state (M15-R1): the screen-sized frame when it exists, the
+/// temporary low-resolution frame while anything sharper prepares or downloads, an honest
+/// non-blocking download state for iCloud-backed photos, and — only after a genuine
+/// terminal failure — the error card. A valid frame is never replaced by an error while a
+/// request that can still succeed is in flight; a transient failure keeps any frame it
+/// already had and offers Retry inline.
 struct SwipeCardFrameView: View {
     let phase: SwipeCardFrameModel.Phase
     let onRetry: () -> Void
@@ -378,12 +472,37 @@ struct SwipeCardFrameView: View {
         ZStack {
             Color.black
             switch phase {
-            case .idle, .loading:
+            case .idle:
                 skeleton
-            case .temporary(let image):
-                frameImage(image)
+
+            case .preparing(let temporary):
+                if let temporary {
+                    frameImage(temporary)
+                } else {
+                    skeleton
+                }
+
+            case .downloading(let temporary):
+                if let temporary {
+                    frameImage(temporary)
+                        .overlay(alignment: .bottom) { downloadingChip }
+                } else {
+                    downloadingState
+                }
+
             case .final(let image):
                 frameImage(image)
+
+            case .retryable(_, let visible):
+                if let visible {
+                    // The photo is on screen; the transient failure is a chip, not an
+                    // error card — and never a blank.
+                    frameImage(visible)
+                        .overlay(alignment: .bottom) { retryChip }
+                } else {
+                    retryableState
+                }
+
             case .unavailable(let error):
                 unavailable(error)
             }
@@ -404,6 +523,75 @@ struct SwipeCardFrameView: View {
         SwipeCardSkeleton(message: SimilarPhotosPresentation.previewLoadingMessage)
     }
 
+    /// The honest iCloud download state: progress copy, no promise of instant rendering,
+    /// bounded by the request's own timeout (which lands in a retryable state).
+    private var downloadingState: some View {
+        VStack(spacing: Theme.Spacing.md) {
+            Image(systemName: "icloud.and.arrow.down")
+                .font(.system(size: 34))
+                .foregroundStyle(.white.opacity(0.75))
+            Text(SwipeReviewPresentation.downloadMessage)
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.85))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, Theme.Spacing.xl)
+            ProgressView()
+                .tint(.white)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(SwipeReviewPresentation.downloadMessage)
+    }
+
+    /// Non-blocking status over a visible frame while a download runs.
+    private var downloadingChip: some View {
+        statusChip(SwipeReviewPresentation.downloadShortMessage, systemImage: "icloud.and.arrow.down")
+    }
+
+    /// Non-blocking retry over a visible frame after a transient failure.
+    private var retryChip: some View {
+        Button(action: onRetry) {
+            Label(SwipeReviewPresentation.retryChipTitle, systemImage: "arrow.clockwise")
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, Theme.Spacing.sm)
+                .padding(.vertical, Theme.Spacing.xs)
+                .background(.black.opacity(0.55), in: Capsule())
+                .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .padding(Theme.Spacing.sm)
+        .accessibilityLabel("Try loading the photo again")
+    }
+
+    private func statusChip(_ text: String, systemImage: String) -> some View {
+        Label(text, systemImage: systemImage)
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, Theme.Spacing.sm)
+            .padding(.vertical, Theme.Spacing.xs)
+            .background(.black.opacity(0.55), in: Capsule())
+            .foregroundStyle(.white)
+            .padding(Theme.Spacing.sm)
+            .allowsHitTesting(false)
+    }
+
+    /// A transient failure with no frame to keep: the retryable message (never the
+    /// permanent one) with a functional Try Again.
+    private var retryableState: some View {
+        VStack(spacing: Theme.Spacing.md) {
+            Image(systemName: "icloud.slash")
+                .font(.system(size: 34))
+                .foregroundStyle(.white.opacity(0.75))
+            Text(SwipeReviewPresentation.transientFailureMessage)
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.8))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            retryButton
+        }
+        .padding(Theme.Spacing.lg)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+    }
+
     private func unavailable(_ error: PhotoContentError) -> some View {
         VStack(spacing: Theme.Spacing.md) {
             Image(systemName: SimilarPhotosPresentation.previewFailureSymbol(for: error))
@@ -417,22 +605,26 @@ struct SwipeCardFrameView: View {
                 .foregroundStyle(.white.opacity(0.8))
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            Button {
-                onRetry()
-            } label: {
-                Text("Try Again")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, Theme.Spacing.lg)
-                    .padding(.vertical, Theme.Spacing.sm)
-                    .background(.white.opacity(0.16), in: Capsule())
-                    .foregroundStyle(.white)
-            }
-            .accessibilityLabel("Try loading the photo again")
+            retryButton
         }
         .padding(Theme.Spacing.lg)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(SimilarPhotosPresentation.previewUnavailableTitle)
+    }
+
+    private var retryButton: some View {
+        Button {
+            onRetry()
+        } label: {
+            Text("Try Again")
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, Theme.Spacing.lg)
+                .padding(.vertical, Theme.Spacing.sm)
+                .background(.white.opacity(0.16), in: Capsule())
+                .foregroundStyle(.white)
+        }
+        .accessibilityLabel("Try loading the photo again")
     }
 }
 

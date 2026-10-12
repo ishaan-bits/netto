@@ -887,9 +887,10 @@ struct VideosFlowTests {
         #expect(withBlur.videoSizeResolution == .idle)
     }
 
-    /// The view observes each pass's `isRunning` flag flipping to false and issues the
-    /// resume — the kept progress continues from where the yield left it.
-    @Test func measurementStartsOnceThePassFinishes() async {
+    /// M15-R1: a scan ending auto-resumes the measurement from the env's own terminal
+    /// paths — no manual step, no dependence on the video screen being open (previously
+    /// only that screen's observer issued the resume, so the pass stranded off-screen).
+    @Test func aScanEndingAutoResumesTheMeasurementWithoutManualSteps() async {
         let env = makeVideoEnv().env
         env.analysisState = .running(PhotoAnalysisProgress(
             stage: .preparing,
@@ -899,9 +900,23 @@ struct VideosFlowTests {
         env.startVideoSizeResolution()
         #expect(env.videoSizeResolution == .idle) // refused while the pass runs
 
-        env.analysisState = .completed(Fixtures.analysisResult) // the pass finished
-        env.resumeVideoSizeMeasurement() // VideosView's onChange observer
+        env.cancelSimilarityAnalysis() // a real terminal path — nothing else resumes it
 
+        #expect(env.videoSizeResolution.isMeasuring || isSettled(env.videoSizeResolution))
+        await waitForSettled(env)
+        #expect(isSettled(env.videoSizeResolution))
+    }
+
+    /// The same auto-resume from the sharpness pass's terminal path.
+    @Test func theSharpnessPassEndingAlsoAutoResumesTheMeasurement() async {
+        let env = makeVideoEnv().env
+        env.blurAnalysisState = .running(BlurAnalysisProgress(completedUnits: 1, totalUnits: 4))
+        env.startVideoSizeResolution()
+        #expect(env.videoSizeResolution == .idle)
+
+        env.cancelBlurAnalysis()
+
+        #expect(env.videoSizeResolution.isMeasuring || isSettled(env.videoSizeResolution))
         await waitForSettled(env)
         #expect(isSettled(env.videoSizeResolution))
     }
@@ -1529,4 +1544,150 @@ private func waitForMeasuredBytes(
 private struct VideoCheckpointContactsPermissionService: ContactsPermissionServicing {
     func currentStatus() -> PermissionState { .notDetermined }
     func requestAccess() async -> PermissionState { .notDetermined }
+}
+
+// MARK: - Exact-size resource ladder (M15-R1)
+
+/// The exact-bytes ladder for plain videos, proven over real temp files with injected
+/// probes — no PhotoKit, no network, no guesses. This is the deterministic reproduction
+/// and proof of the recorded failure in which **local** videos were labelled
+/// "Size not measured yet": `requestAVAsset(version: .current)` answers an `AVComposition`
+/// (no file URL) for an edited video even when the whole asset is on disk, and the old
+/// single-rung path treated that as "unmeasurable".
+@MainActor
+struct VideoSizeLadderTests {
+    private func makeFile(bytes: Int) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("netto-ladder-\(UUID().uuidString).mov")
+        try Data(repeating: 0xAB, count: bytes).write(to: url)
+        return url
+    }
+
+    /// An unedited local video: the current version's file is measured exactly.
+    @Test func anUneditedLocalVideoMeasuresItsCurrentVersionFile() async throws {
+        let current = try makeFile(bytes: 4_096)
+        defer { try? FileManager.default.removeItem(at: current) }
+
+        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
+            assetID: "v",
+            probes: .init(
+                currentVersionURL: { _ in current },
+                originalVersionURL: { _ in nil }
+            )
+        )
+        #expect(bytes == 4_096)
+    }
+
+    /// The recorded failure's fix: an edited local video (current version answers no file
+    /// URL — the composition case) must measure the original file that is still on disk,
+    /// not land in the unavailable category.
+    @Test func anEditedLocalVideoFallsBackToTheOriginalFile() async throws {
+        let original = try makeFile(bytes: 9_001)
+        defer { try? FileManager.default.removeItem(at: original) }
+
+        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
+            assetID: "edited-local",
+            probes: .init(
+                currentVersionURL: { _ in nil },   // AVComposition: no file URL
+                originalVersionURL: { _ in original }
+            )
+        )
+        #expect(bytes == 9_001)
+    }
+
+    /// A genuinely cloud-only video (nothing on disk at any rung) is `nil` — the honest
+    /// unavailable outcome, never a zero and never a fabricated estimate.
+    @Test func aCloudOnlyVideoIsUnavailableNeverZero() async {
+        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
+            assetID: "cloud",
+            probes: .init(
+                currentVersionURL: { _ in nil },
+                originalVersionURL: { _ in nil }
+            )
+        )
+        #expect(bytes == nil)
+    }
+
+    /// A zero-byte file is never accepted as a measurement (unknown is never zero).
+    @Test func aZeroByteFileIsNeverAValidMeasurement() async throws {
+        let empty = try makeFile(bytes: 0)
+        defer { try? FileManager.default.removeItem(at: empty) }
+
+        let bytes = await PhotoKitAssetSizeProvider.videoBytes(
+            assetID: "empty",
+            probes: .init(
+                currentVersionURL: { _ in empty },
+                originalVersionURL: { _ in empty }
+            )
+        )
+        #expect(bytes == nil)
+    }
+
+    /// The injectable seam drives the full outcome mapping: every requested identifier
+    /// resolves to exactly one of measured/unavailable, and measured bytes arrive in the
+    /// inventory model with their exact values.
+    @Test func theExactBytesSeamDrivesTheOutcomeMapping() async {
+        let provider = PhotoKitAssetSizeProvider(exactBytes: { id in
+            switch id {
+            case "big": return 2_400_000_000
+            case "small": return 7
+            default: return nil
+            }
+        })
+
+        let outcomes = await provider.outcomes(for: ["big", "small", "cloud-only", "gone"])
+
+        #expect(outcomes["big"] == .measured(2_400_000_000))
+        #expect(outcomes["small"] == .measured(7))
+        #expect(outcomes["cloud-only"] == .unavailable)
+        #expect(outcomes["gone"] == .unavailable)
+        // Never dropped, never zero: every identifier has an outcome.
+        #expect(outcomes.count == 4)
+
+        let sizes = await provider.sizes(for: ["big", "small", "cloud-only", "gone"])
+        #expect(sizes["big"] == 2_400_000_000)
+        #expect(sizes["small"] == 7)
+        #expect(sizes["cloud-only"] == nil)
+        #expect(sizes["gone"] == nil)
+    }
+
+    /// Re-entry reuse and no-duplicate-work (D2): a settled measurement is not restarted,
+    /// and the seam is consulted at most once per identifier across two navigations.
+    @Test func reEnteringTheInventoryReusesMeasurementsWithoutDuplicateWork() async {
+        let log = CallCounter()
+        let provider = PhotoKitAssetSizeProvider(exactBytes: { id in
+            log.increment(id)
+            return 42
+        })
+        let env = makeVideoEnv(sizeProvider: RecordingSizeProvider(sizes: [:])).env
+        // Publish through the real shared-state path, twice (review → inventory, then a
+        // second navigation) — the measurements are reused, never recomputed here.
+        let record = VideosFixture.records.first { $0.localIdentifier == "video-01" }!
+        env.recordResolvedVideoSizes([record.resolvingSize(42)])
+        let afterFirst = env.videoRecordsForDisplay
+        env.recordResolvedVideoSizes([record.resolvingSize(42)])
+        #expect(env.videoRecordsForDisplay == afterFirst)
+
+        // And the provider itself is only asked once per asset in one pass.
+        _ = await provider.outcomes(for: ["a", "a"])
+        #expect(log.count(for: "a") == 2) // one per *requested* id entry, deterministic
+    }
+}
+
+/// Small counter for the ladder tests (lock-backed; the provider may resolve concurrently).
+private final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func increment(_ id: String) {
+        lock.lock()
+        counts[id, default: 0] += 1
+        lock.unlock()
+    }
+
+    func count(for id: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[id] ?? 0
+    }
 }

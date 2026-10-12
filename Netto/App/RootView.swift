@@ -1461,6 +1461,7 @@ final class AppEnvironment {
         if analysisState.isRunning {
             analysisState = .cancelled
         }
+        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -1539,6 +1540,9 @@ final class AppEnvironment {
             finishCheckpointRun(kind: .similarity)
         }
         analysisState = state
+        // Video measurement yields to the scans; the moment one ends it resumes even if
+        // the video screen is not on screen (M15-R1) — the pass must not strand.
+        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -1831,6 +1835,7 @@ final class AppEnvironment {
         if blurAnalysisState.isRunning {
             blurAnalysisState = .cancelled
         }
+        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 
@@ -1850,6 +1855,8 @@ final class AppEnvironment {
             finishCheckpointRun(kind: .blur)
         }
         blurAnalysisState = state
+        // Same resume-on-terminal as the similarity pass (M15-R1).
+        resumeVideoSizeMeasurement()
         syncBackgroundTask()
     }
 

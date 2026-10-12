@@ -1226,7 +1226,7 @@ struct SwipeReviewTests {
 
         model.prepare(assetID: "warm-me", store: store)
         let settle = ContinuousClock.now.advanced(by: .seconds(5))
-        while model.phase.isDisplayable == false, ContinuousClock.now < settle {
+        while !model.phase.isSettled, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
 
@@ -1257,7 +1257,7 @@ struct SwipeReviewTests {
 
         model.prepare(assetID: "next", store: store)
         let settle = ContinuousClock.now.advanced(by: .seconds(5))
-        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+        while !model.phase.isSettled, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
 
@@ -1265,7 +1265,12 @@ struct SwipeReviewTests {
             Issue.record("expected final, got \(model.phase)")
             return
         }
-        #expect(!seen.contains(.loading))
+        let sawInFlight = seen.contains { phase in
+            if case .preparing = phase { return true }
+            if case .downloading = phase { return true }
+            return false
+        }
+        #expect(!sawInFlight)
     }
 
     /// A low-resolution preview is only ever a temporary stand-in (M15): it shows while
@@ -1297,11 +1302,15 @@ struct SwipeReviewTests {
             Issue.record("expected the final screen-sized thumbnail, got \(model.phase)")
             return
         }
-        // The temporary low-resolution frame appeared and was replaced — it never stood
-        // as the final sharp image.
+        // The temporary low-resolution frame appeared (carried by the preparing state)
+        // and was replaced by the final — it never stood as the sharp image.
         let sawTemporary = seen.contains { phase in
-            if case .temporary = phase { return true }
-            return false
+            switch phase {
+            case .preparing(let temporary), .downloading(let temporary):
+                return temporary != nil
+            default:
+                return false
+            }
         }
         #expect(sawTemporary)
     }
@@ -1326,6 +1335,160 @@ struct SwipeReviewTests {
         #expect(requested.count < ids.count)
     }
 
+    // MARK: M15-R1 reproduction of the recorded failures (current contract)
+
+    /// Repro of the recording: an iCloud-backed photo (nothing on disk locally) dead-ends
+    /// in the error card even though a permitted network-enabled request could serve it.
+    /// Against today's code this FAILS — that failure *is* the reproduction.
+    @Test func REPRO_iCloudOnlyPhotoShouldDisplayViaThePermittedFallback() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(
+            loader: RecordingPrefetchLoader(log: log, cloudOnlyAssetIDs: ["cloud-1"]),
+            capacity: 96
+        )
+        let model = SwipeCardFrameModel()
+        model.prepare(assetID: "cloud-1", store: store)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .final(let frame) = model.phase else {
+            Issue.record("REPRO: iCloud-backed photo shows \(model.phase) instead of the photo")
+            return
+        }
+        #expect(pixelTone(frame) == referenceTone(for: "cloud-1"))
+    }
+
+    /// Repro of the recording: a transient failure sticks — swiping away and back keeps
+    /// the error state instead of re-attempting. Against today's code this FAILS too.
+    @Test func REPRO_aTransientFailureMustNotStickAcrossRevisit() async {
+        let log = PrefetchCallLog()
+        let loader = RecordingPrefetchLoader(log: log, failingAssetIDs: ["flaky"])
+        let store = ThumbnailStore(loader: loader, capacity: 96)
+        let model = SwipeCardFrameModel()
+        model.prepare(assetID: "flaky", store: store)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        // The photo recovers; a revisit (or retry) must re-attempt and display it.
+        var recovered = loader
+        recovered.failingAssetIDs = []
+        let recoveredStore = ThumbnailStore(loader: recovered, capacity: 96)
+        model.prepare(assetID: "flaky", store: recoveredStore)
+        let second = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < second {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .final = model.phase else {
+            Issue.record("REPRO: transient failure stuck across revisit: \(model.phase)")
+            return
+        }
+    }
+
+    // MARK: Retry, cancellation isolation, download failure (M15-R1)
+
+    /// Retry issues exactly one fresh request chain and reaches the frame — no duplicate
+    /// concurrent requests for the same rendition.
+    @Test func retryStartsOneRequestAndRecovers() async {
+        let log = PrefetchCallLog()
+        let loader = RecordingPrefetchLoader(log: log, failingAssetIDs: ["once-bad"])
+        let store = ThumbnailStore(loader: loader, capacity: 96)
+        let model = SwipeCardFrameModel()
+        model.prepare(assetID: "once-bad", store: store)
+        let first = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < first {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .retryable = model.phase else {
+            Issue.record("expected retryable, got \(model.phase)")
+            return
+        }
+        let callsBeforeRetry = log.requestedIDs().count
+
+        var recovered = loader
+        recovered.failingAssetIDs = []
+        let recoveredStore = ThumbnailStore(loader: recovered, capacity: 96)
+        model.retry(store: recoveredStore)
+        let second = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < second {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        guard case .final = model.phase else {
+            Issue.record("expected retry to produce the frame, got \(model.phase)")
+            return
+        }
+        // One local rendition request for the retry — exactly one, not a fan-out.
+        #expect(log.requestedIDs().count == callsBeforeRetry + 1)
+    }
+
+    /// Cancelling an obsolete prefetch walk never cancels the visible card's own request:
+    /// the card still lands its frame after the window re-walks underneath it.
+    @Test func cancellingObsoletePrefetchDoesNotCancelTheVisibleCardsRequest() async {
+        let log = PrefetchCallLog()
+        let store = ThumbnailStore(
+            loader: RecordingPrefetchLoader(log: log, delayNanoseconds: 15_000_000),
+            capacity: 96
+        )
+        let prefetcher = SwipeThumbnailPrefetcher()
+        let model = SwipeCardFrameModel()
+
+        prefetcher.warm(order: ["shown", "next-1", "next-2", "next-3"], store: store)
+        model.prepare(assetID: "shown", store: store)
+        // The window re-walks (cursor moved on another card) while the visible card's
+        // request is in flight.
+        prefetcher.warm(order: ["next-1", "next-2"], store: store)
+
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        guard case .final(let frame) = model.phase else {
+            Issue.record("expected the visible card's request to survive, got \(model.phase)")
+            return
+        }
+        #expect(pixelTone(frame) == referenceTone(for: "shown"))
+    }
+
+    /// A failed *download* keeps any valid low-resolution frame on screen and stays
+    /// retryable — never an error card over pixels that are already visible, never a
+    /// permanent claim for a transient failure.
+    @Test func aDownloadFailureKeepsTheTemporaryFrameAndStaysRetryable() async {
+        let log = PrefetchCallLog()
+        // The photo's smaller rendition is fetchable, but the screen-sized download dies —
+        // the partial-failure shape that must keep the preview and stay retryable.
+        let loader = RecordingPrefetchLoader(
+            log: log,
+            cloudOnlyAssetIDs: ["cloud-fails"],
+            failAtOrAbovePixelSize: SwipeReviewPresentation.swipeThumbnailPixelSize
+        )
+        let store = ThumbnailStore(loader: loader, capacity: 96)
+        // Warm the low-resolution tier through the network path first (the local path
+        // fails for this asset): the temporary frame the card must keep.
+        let warm = try? await store.image(
+            for: "cloud-fails",
+            targetPixelSize: SwipeReviewPresentation.swipeThumbnailLowResPixelSize,
+            policy: .allowNetwork
+        )
+        #expect(warm != nil)
+
+        let model = SwipeCardFrameModel()
+        model.prepare(assetID: "cloud-fails", store: store)
+        let settle = ContinuousClock.now.advanced(by: .seconds(5))
+        while !model.phase.isSettled, ContinuousClock.now < settle {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+
+        guard case .retryable(_, let visible) = model.phase else {
+            Issue.record("expected retryable after the failed download, got \(model.phase)")
+            return
+        }
+        // The same photo's low-resolution frame is still the visible content.
+        #expect(visible != nil)
+        #expect(visible.map(pixelTone) == referenceTone(for: "cloud-fails"))
+    }
+
     // MARK: Frame identity & staleness (M15)
 
     /// Fast consecutive swipes never display an image belonging to the wrong asset: the
@@ -1340,7 +1503,7 @@ struct SwipeReviewTests {
         model.prepare(assetID: "asset-b", store: store) // the swipe lands before A settles
 
         let settle = ContinuousClock.now.advanced(by: .seconds(5))
-        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+        while !model.phase.isSettled, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
 
@@ -1368,7 +1531,7 @@ struct SwipeReviewTests {
         model.prepare(assetID: "quick-new", store: store)
 
         let settle = ContinuousClock.now.advanced(by: .seconds(5))
-        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+        while !model.phase.isSettled, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
         // Both loads have landed by now; the old one's late completion must be a no-op.
@@ -1451,11 +1614,11 @@ struct SwipeReviewTests {
 
         model.prepare(assetID: "broken", store: store)
         let settle = ContinuousClock.now.advanced(by: .seconds(5))
-        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+        while !model.phase.isSettled, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
-        guard case .unavailable = model.phase else {
-            Issue.record("expected an honest unavailable state, got \(model.phase)")
+        guard case .retryable = model.phase else {
+            Issue.record("expected a retryable (transient) state, got \(model.phase)")
             return
         }
 
@@ -1512,7 +1675,7 @@ struct SwipeReviewTests {
         }
         model.prepare(assetID: "shared", store: store)
         let settle = ContinuousClock.now.advanced(by: .seconds(5))
-        while !model.phase.isDisplayable, ContinuousClock.now < settle {
+        while !model.phase.isSettled, ContinuousClock.now < settle {
             try? await Task.sleep(for: .milliseconds(5))
         }
 
@@ -1866,6 +2029,13 @@ private struct RecordingPrefetchLoader: PhotoThumbnailLoading {
     let log: PrefetchCallLog
     var delayNanoseconds: UInt64 = 0
     var failingAssetIDs: Set<String> = []
+    /// Assets whose content is iCloud-only: the local-only path fails with `.onlyInICloud`
+    /// (nothing on disk), while the network-enabled path serves pixels — exactly PhotoKit's
+    /// real behaviour on an Optimize-Storage library.
+    var cloudOnlyAssetIDs: Set<String> = []
+    /// Renditions at or above this size fail (the large download dies while smaller
+    /// renditions still serve) — the partial-failure shape of a real iCloud library.
+    var failAtOrAbovePixelSize: Int?
 
     func thumbnail(
         for assetID: String,
@@ -1878,7 +2048,35 @@ private struct RecordingPrefetchLoader: PhotoThumbnailLoading {
         if delayNanoseconds > 0 {
             try await Task.sleep(nanoseconds: delayNanoseconds)
         }
+        if cloudOnlyAssetIDs.contains(assetID) {
+            throw PhotoContentError.onlyInICloud
+        }
         if failingAssetIDs.contains(assetID) {
+            throw PhotoContentError.unavailable
+        }
+        if let cap = failAtOrAbovePixelSize, targetPixelSize >= cap {
+            throw PhotoContentError.unavailable
+        }
+        return Self.tonedImage(side: targetPixelSize, tone: Self.tone(for: assetID))
+    }
+
+    /// The network-enabled path (Photo Details' product behaviour): serves the pixels the
+    /// local-only path could not.
+    func previewImage(
+        for assetID: String,
+        targetPixelSize: Int,
+        onInterim: @escaping @Sendable (CGImage) -> Void
+    ) async throws -> CGImage {
+        log.record(assetID: assetID, targetPixelSize: targetPixelSize)
+        log.beginRequest()
+        defer { log.endRequest() }
+        if delayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+        }
+        if failingAssetIDs.contains(assetID) {
+            throw PhotoContentError.unavailable
+        }
+        if let cap = failAtOrAbovePixelSize, targetPixelSize >= cap {
             throw PhotoContentError.unavailable
         }
         return Self.tonedImage(side: targetPixelSize, tone: Self.tone(for: assetID))

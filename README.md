@@ -75,9 +75,12 @@ Beyond the core cleanup loop:
   window, the sharp screen-sized one for the current photo and the next few), so a warm
   card renders with no loading state and reaches full sharpness immediately. The
   low-resolution frame is only ever a temporary stand-in, never the final image; routine
-  swipes never fetch full-resolution originals or download cloud-only photos (a photo
-  with no local rendition shows an honest unavailable state), and no pixels ever enter
-  the persisted session. Shuffle re-orders only the photos
+  swipes never fetch full-resolution originals. If a photo's local rendition is not on
+  device (iCloud-backed), the card shows an honest download state and uses the same
+  permitted network-enabled request Photo Details uses for a photo you are looking at —
+  bounded, cancellable, and only ever for the photo on screen (the prefetch window stays
+  local-only, so navigation never downloads a library). Transient failures stay retryable
+  and keep any frame already on screen; no pixels ever enter the persisted session. Shuffle re-orders only the photos
   you have not reviewed yet (no repeats within a pass; **Start New Pass** on the
   completion screen resets position and keeps every decision), the session itself —
   deck order, position, undo history, and the decision log — persists through
@@ -634,7 +637,9 @@ not prevent either, and both were fixed at the confirmed root cause, not papered
   frame is tagged with its asset and generation-guarded (`SwipeCardFrameModel`), so fast
   swipes, Shuffle, Undo, and session restore can never show one photo's pixels for
   another. Keep/Delete, Undo, Shuffle, Start New Pass, session persistence, and the
-  deletion handoff are untouched.
+  deletion handoff are untouched. (**M15-R1 supersedes the local-only rule**: on device
+  it dead-ended every iCloud-backed photo in "Photo unavailable"; the current card now
+  falls back to the permitted network-enabled request — see below.)
 - **Video inventory never showed sizes the review had (confirmed cause)** — two defects:
   (1) leaving Video Cleanup cancelled the measurement into a settled-partial state, but
   re-entering only *started* from `.idle`, so a settled-partial was stranded forever
@@ -657,6 +662,59 @@ not prevent either, and both were fixed at the confirmed root cause, not papered
   Unknown sizes still sort below every measured size, are never ranked as zero, and no
   video is ever labelled iCloud-only without evidence. Newly measured sizes republish the
   sorted list live, without resetting selection.
+
+### Swipe availability & video size truth at the root (M15-R1)
+
+A second device recording contradicted M15's simulator-green state: Swipe Cleanup showed
+`Photo unavailable` for iCloud-backed photos and took seconds per image, and Video Cleanup
+still listed thousands of videos — including local ones — as `Size not measured yet`.
+Both failures reproduced deterministically in tests before any fix, and both were fixed at
+the confirmed root cause.
+
+- **Swipe: local-only display was the bug (confirmed cause)** — M15 routed the card's
+  final frame through `PhotoKitThumbnailLoader.thumbnail`, whose request options set
+  `isNetworkAccessAllowed = false`. On an Optimize-Storage library that fails
+  `.onlyInICloud` for every photo whose full rendition is not on disk, and the card
+  dead-ended in the error state with no way forward. Two further defects compounded it:
+  `SwipeCardFrameModel.prepare` kept a settled failure across revisits (a transient miss
+  stuck forever), and the terminal error replaced a valid low-resolution frame outright.
+- **New loading contract (`SwipeCardFrameModel.Phase`)** — `preparing(temporary:)`,
+  `downloading(temporary:)`, `final`, `retryable(error, visible:)`, `unavailable(error)`:
+  a warm cache key renders with no loading state; a low-resolution frame stays visible
+  while anything sharper prepares *or downloads*; a local-only miss falls through to the
+  **permitted network-enabled request** (the same bounded, cancellable pipeline Photo
+  Details uses — `thumbnailAllowingNetwork` → `previewImage`, incl. its local-rendition
+  ladder), for the photo on screen only; a transient failure (iCloud download failed,
+  timeout, PhotoKit hiccup) is `retryable` — keeping the visible frame, with Retry that
+  issues exactly one fresh chain — and only a genuine terminal failure (asset gone,
+  access off) claims permanent unavailability. Failures never poison the cache: only a
+  permanently-gone asset is remembered, and success and failure are stored separately.
+- **One cache, one key, both policies** — `ThumbnailStore.image(...policy:)` shares the
+  asset+size key between `.localOnly` and `.allowNetwork`, so a downloaded frame is a
+  later cache hit and prefetch output is exactly what the renderer reads. Prefetch stays
+  local-only (a swipe never downloads a library), bounded, and sequential in priority
+  order; superseding a window walk never cancels the visible card's request. Stale
+  callbacks and wrong-asset frames are excluded by the model's generation + asset tag.
+- **Video sizes: one exact-size ladder (confirmed cause)** — `requestAVAsset(version:
+  .current)` answers an `AVComposition` (no file URL) for an **edited** video even when
+  the whole asset is local, and the old single-rung path recorded that as unmeasurable.
+  `PhotoKitAssetSizeProvider` now walks a local-only ladder: the current version's file,
+  then the original version's file (what deleting frees, minus the small adjustment
+  record), then the content-editing-input URLs — exact bytes from real files at every
+  rung, `nil` (honest unavailable) only when nothing is on disk. Nothing is ever
+  downloaded to measure, no size is ever estimated, and unknown is never zero.
+- **Video lifecycle: no more stranded passes (confirmed cause)** — leaving the inventory
+  cancelled the measurement and only the inventory screen could resume it, so a user
+  living on review/the dashboard never got measurements at all. Measurement is no longer
+  cancelled on navigation (app-backgrounding still checkpoint-cancels), and every scan
+  terminal path (finish or cancel of either pipeline) auto-resumes it. Rows now read
+  "Measuring size…" while a pass works through the dataset, "not measured yet" only when
+  nothing has attempted them, and "could not be measured" after a genuine terminal
+  outcome; the summary counts add up (total / sorted / unavailable / still to measure).
+- **Where sizes come from, for both screens** — the shared `videoSizeResolution` state
+  remains the single source of truth: the bulk pass and review's plan-time resolutions
+  (`recordResolvedVideoSizes`) both publish into it, keyed by asset identity + dataset
+  signature + modification date, so the inventory and the review always agree.
 
 ## Privacy
 
@@ -803,6 +861,22 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
+- **Recent verification (M15-R1)** — the two recorded failures were first reproduced as
+  failing deterministic tests (iCloud-backed photo dead-ending in "Photo unavailable";
+  transient failure sticking across revisit), then fixed. Focused suites
+  (`SwipeReviewTests`, `ThumbnailStoreTests`, `PhotoPreviewTests`, `VideosFlowTests`,
+  `VideoDatasetTests`) report **181 tests green**; the full suite reports **897 passed,
+  0 failed** (the pre-existing `cancellationPropagatesOutOfTheLoader` skip is unchanged;
+  5 UI cases included); one clean app build with **no warnings** and a clean
+  `git diff --check`. New coverage includes the permitted fallback (local miss →
+  network-enabled request → frame), preview-survives-download-failure with retry, retry
+  issuing exactly one request, prefetch-cancel isolation from the visible card, per-asset
+  frame identity at pixel level, and the exact-size ladder (current → original → honest
+  unavailable; zero-byte files refused) with the injectable measurement seam driving the
+  outcome mapping. Harness evidence (deterministic fakes, not device timing): cache-hit
+  frames render with zero PhotoKit requests, one request per rendition per asset
+  (coalesced, peak in-flight 1 for the prefetch walk), stale callbacks discarded by
+  generation guards. **No device latency is claimed or measured.**
 - **Recent verification (M15)** — focused Swipe Cleanup and Video Cleanup suites first
   (fixing failures before any full run), then the complete suite: **885 passed, 0 failed**
   (the pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is
@@ -1036,11 +1110,19 @@ ARCHITECTURE.md   Design document: modules, state machines, safety model, valida
   profiled, and no latency improvement is claimed numerically — the fix removes the
   per-swipe uncached network-enabled request from the display path, which is a structural
   change, not a measured one. The same applies to the video inventory's update timing.
-- **Physical-device checks still outstanding (M15)** — replaying the original recordings'
-  flows on an iPhone (swipe through a warmed deck; open Video Cleanup after a scan and
-  after a review) is the remaining validation for both fixes; the two regression causes
-  and their fixes are covered deterministically in tests, but the end-to-end device feel
-  was not re-recorded.
+- **Physical-device checks still outstanding (M15/M15-R1)** — replaying the original
+  recordings' flows on an iPhone (swipe through a deck incl. iCloud-backed photos and
+  their download/retry states; open Video Cleanup after a scan and after a review) is the
+  remaining validation; the regression causes and fixes are covered deterministically in
+  tests, but the end-to-end device feel was not re-recorded.
+- **Public-API limits on exact video sizes (M15-R1)** — iOS 17 exposes no metadata-only
+  exact byte count for a video resource (`PHAssetResource.dataSize` is not available on
+  this OS version), so sizes are the exact bytes of real locally-stored files, obtained
+  without downloading anything. For an *edited* video the measured file is the stored
+  original (what deletion frees, minus the small adjustment record) because the current
+  version is a composition with no file. A cloud-only video reports "could not be
+  measured" — never a guess, never zero — and can only gain a size by the user
+  downloading it in Photos first.
 - **Repository note (M14)** — `Netto.xcodeproj/project.pbxproj` carried an unrelated,
   pre-existing regeneration diff at the start of this work and was deliberately left
   unstaged/uncommitted alongside these changes. No source files were added or removed in

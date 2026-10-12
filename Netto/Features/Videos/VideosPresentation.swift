@@ -206,12 +206,18 @@ enum VideosPresentation {
         guard total > 0 else { return [] }
         var lines = ["\(total) videos total"]
         if unavailable > 0 {
-            lines.append("\(unavailable) sizes unavailable — not measured locally")
+            lines.append("\(unavailable) sizes unavailable — could not be measured locally")
         }
         if measured > 0 {
             lines.append("\(measured) videos sorted by known size")
         } else if unavailable == 0 {
             lines.append("Sizes not measured yet")
+        }
+        // The remainder is what the running (or interrupted) pass still has to attempt —
+        // named so the counters always add up instead of leaving rows silently labelled.
+        let stillToMeasure = total - measured - unavailable
+        if stillToMeasure > 0 {
+            lines.append("\(stillToMeasure) still to measure")
         }
         return lines
     }

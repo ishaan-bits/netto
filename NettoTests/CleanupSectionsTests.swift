@@ -406,9 +406,9 @@ struct VideoInventoryUnifiedTests {
 
         let mixed = VideosPresentation.inventorySummary(total: 41, measured: 12, unavailable: 29)
         #expect(mixed.first == "41 videos total")
-        // Unknown sizes are named as not measured locally — never given a cause this
+        // Unknown sizes are named as unmeasurable locally — never given a cause this
         // screen cannot evidence.
-        #expect(mixed.contains("29 sizes unavailable — not measured locally"))
+        #expect(mixed.contains("29 sizes unavailable — could not be measured locally"))
         #expect(mixed.contains("12 videos sorted by known size"))
     }
 }

@@ -340,6 +340,25 @@ enum SwipeReviewPresentation {
     /// first `swipeSharpPrefetchCount`. Bounds the request count per window re-walk.
     static let swipePrefetchWindowCount = 20
 
+    // MARK: Frame states (M15-R1)
+
+    /// Shown while the permitted iCloud download of the current photo runs — an honest,
+    /// non-blocking state (bounded by the request's timeout), never a promise of instant
+    /// rendering for content that is not on the device.
+    static let downloadMessage =
+        "Downloading this photo from iCloud so it can be shown at full size. This can take a moment."
+
+    /// The compact download status shown over a visible temporary frame.
+    static let downloadShortMessage = "Downloading from iCloud…"
+
+    /// Inline retry over a visible frame after a transient failure.
+    static let retryChipTitle = "Retry"
+
+    /// A transient failure with no frame to keep — explicitly retryable wording, never the
+    /// permanent "Photo unavailable" claim.
+    static let transientFailureMessage =
+        "Netto couldn't load this photo just now. Tap Try Again — nothing is cached as broken."
+
     /// The warm-up order for a swipe at `index`: the current photo first (it is on screen
     /// now), then the forward window. Never backward — reviewed photos sit behind the
     /// cursor and only Undo returns there, and the store's LRU keeps recently shown frames

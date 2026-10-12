@@ -74,9 +74,10 @@ struct VideosView: View {
             .onChange(of: env.blurAnalysisState.isRunning) { _, running in
                 if !running { env.resumeVideoSizeMeasurement() }
             }
-            // Leaving the screen during measurement cancels it: the progress kept so far is
-            // kept (as a settled, possibly partial state), the rest is simply not measured.
-            .onDisappear { env.cancelVideoSizeResolution() }
+            // Measurement is *not* cancelled on navigation (M15-R1): leaving for review or
+            // another screen must not strand the inventory in a partial state — the bounded
+            // pass keeps filling the shared size state while other consumers read it. The
+            // app-backgrounding path checkpoint-cancels it as before, and re-entry resumes.
             .fullScreenCover(item: $previewedVideo) { record in
                 VideoPreviewView(
                     assetID: record.localIdentifier,
@@ -291,6 +292,7 @@ struct VideosView: View {
             record: record,
             isKnownUnavailable: env.videoSizeResolution.measurement?
                 .unavailableIDs.contains(record.localIdentifier) ?? false,
+            isBeingMeasured: env.videoSizeResolution.isMeasuring,
             isSelected: env.videoSelection.isSelected(record.localIdentifier),
             store: env.thumbnails,
             onPreview: { previewedVideo = record },
