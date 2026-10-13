@@ -258,6 +258,15 @@ enum VideosPresentation {
         attempted > 0 ? "iCloud / size unavailable" : "Sizes not measured yet"
     }
 
+    /// The top-of-list iCloud line: how many of the library's videos have no size
+    /// because they are not stored on this iPhone. Only shown once a run has actually
+    /// proven those sizes unavailable (attempted and failed the local check) — never
+    /// as a guess, and nil while there is nothing honest to say.
+    static func videoICloudHeader(unavailable: Int, total: Int) -> String? {
+        guard unavailable > 0, total > 0 else { return nil }
+        return "\(unavailable) of \(total) videos' size unavailable — stored in iCloud"
+    }
+
     /// The inventory summary lines — enumeration's counts first, always, then honest
     /// measurement figures derived from actual data. Illustrative shape:
     ///

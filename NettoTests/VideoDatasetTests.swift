@@ -645,6 +645,22 @@ struct VideoDatasetTests {
         )
     }
 
+    // MARK: Top-of-list iCloud header (the only scan indicator; no progress bar)
+
+    @Test func iCloudHeaderCountsUnavailableOutOfTotal() {
+        #expect(
+            VideosPresentation.videoICloudHeader(unavailable: 4, total: 6)
+                == "4 of 6 videos' size unavailable — stored in iCloud"
+        )
+    }
+
+    @Test func iCloudHeaderIsAbsentBeforeAnyFailureIsProven() {
+        // Nil (not an empty line, not "0 of N") until a run has actually proven at least
+        // one remote video — the screen never guesses at iCloud, and never shows a bar.
+        #expect(VideosPresentation.videoICloudHeader(unavailable: 0, total: 6) == nil)
+        #expect(VideosPresentation.videoICloudHeader(unavailable: 2, total: 0) == nil)
+    }
+
     @Test func durationTextFormatsClockReadouts() {
         #expect(VideosPresentation.durationText(0) == "0:00")
         #expect(VideosPresentation.durationText(7) == "0:07")

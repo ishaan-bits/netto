@@ -5,11 +5,15 @@ import SwiftUI
 ///
 /// - **Measured first.** Videos whose exact local file size is known are listed largest
 ///   first. Sizes come only from the shared size provider: nothing is inferred from
-///   dimensions, duration, thumbnails, or any fabricated estimate.
+///   dimensions, duration, thumbnails, or any fabricated estimate. Only videos stored on
+///   this iPhone are measured; an iCloud-only video's size is never downloaded to read.
 /// - **Unknowns below, honestly labelled.** Videos whose size is unknown are listed after
 ///   every measured video — never ranked as zero. The section says "Sizes not measured yet"
 ///   until an attempt has actually failed, then "iCloud / size unavailable" for the ids the
 ///   run tried and could not measure — a row never claims a failure it has not earned.
+/// - **No progress bar.** The full list renders immediately and fills in as sizes resolve;
+///   the only scan indicator is the honest iCloud count at the top ("X of N videos' size
+///   unavailable — stored in iCloud"), which grows as the sweep proves each remote video.
 /// - **Scans automatically, keeps its results.** Measurement starts when the screen
 ///   appears and continues from whatever is already measured — opening the screen never
 ///   re-measures known sizes, and the completed sizes are persisted (checkpoint) so they
@@ -153,22 +157,20 @@ struct VideoCleanupView: View {
                     : "Nothing in your library is a video."
             )
 
-        case .measuringVideos(let measured, let total, let unavailable):
+        case .measuringVideos:
             // Enumeration is already complete: the full list renders immediately and the
-            // measurement only fills sizes in — the screen never waits on it.
+            // measurement only fills sizes in — the screen never waits on it, and there
+            // is no progress bar: the top iCloud count and the rows themselves are the
+            // only honest indicators of how far the sweep has gotten.
             inventoryContent(
                 records: env.videoRecordsForDisplay,
-                measured: measured,
-                total: total,
-                unavailable: unavailable
+                unavailable: env.videoSizeResolution.measurement?.unavailableCount ?? 0
             )
 
         case .results(let records):
             let measurement = env.videoSizeResolution.measurement
             inventoryContent(
                 records: records,
-                measured: measurement?.measuredCount ?? records.count,
-                total: measurement?.total ?? records.count,
                 unavailable: measurement?.unavailableCount ?? 0
             )
         }
@@ -178,8 +180,6 @@ struct VideoCleanupView: View {
 
     private func inventoryContent(
         records: [PhotoAssetRecord],
-        measured: Int,
-        total: Int,
         unavailable: Int
     ) -> some View {
         // `records` already carries the dataset's order: known sizes largest-first, then
@@ -193,6 +193,13 @@ struct VideoCleanupView: View {
             ? env.videoSizeResolution.measurement?.unavailableIDs ?? []
             : []
         let attemptedCount = unknown.filter { attemptedIDs.contains($0.localIdentifier) }.count
+        // The one scan indicator this screen shows: the honest iCloud count, updated as
+        // the sweep proves each remote video's size unavailable. Nil while there is
+        // nothing proven yet — never a guess, never a bar.
+        let iCloudHeader = VideosPresentation.videoICloudHeader(
+            unavailable: unavailable,
+            total: known.count + unknown.count
+        )
         return ScrollView {
             VStack(alignment: .leading, spacing: NettoLayout.Spacing.lg) {
                 if VideosPresentation.showsLimitedAccessNotice(permission: env.photoPermissionState) {
@@ -200,17 +207,12 @@ struct VideoCleanupView: View {
                 }
                 summaryHeader(known: known, unknown: unknown)
 
-                if env.videoSizeResolution.isMeasuring {
-                    NettoProgressPanel(
-                        message: VideosPresentation.measuringMessage(
-                            measured: measured,
-                            total: total,
-                            unavailable: unavailable,
-                            isActive: true
-                        ),
-                        fraction: total > 0 ? Double(measured + unavailable) / Double(total) : nil,
-                        cancel: { env.cancelVideoSizeResolution() }
-                    )
+                if let iCloudHeader {
+                    Text(iCloudHeader)
+                        .font(NettoType.caption)
+                        .foregroundStyle(NettoColor.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("videoICloudHeader")
                 }
 
                 if !known.isEmpty {
@@ -222,9 +224,6 @@ struct VideoCleanupView: View {
                         records: unknown,
                         attemptedIDs: attemptedIDs
                     )
-                    if attemptedCount > 0 {
-                        cloudNote
-                    }
                 }
             }
             .padding(NettoLayout.Spacing.lg)
@@ -239,16 +238,6 @@ struct VideoCleanupView: View {
         )
         .font(.caption)
         .foregroundStyle(NettoColor.warning)
-    }
-
-    /// Honest scope note for the unavailable group: Netto measures only what is stored on
-    /// this iPhone, never downloads a video just to read its size, and names iCloud as the
-    /// typical reason without claiming it as proven for every asset.
-    private var cloudNote: some View {
-        Text("Netto measures only videos stored on this iPhone — it never downloads a video just to read its size. These typically live in iCloud.")
-            .font(NettoType.caption)
-            .foregroundStyle(NettoColor.textSecondary)
-            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func summaryHeader(known: [PhotoAssetRecord], unknown: [PhotoAssetRecord]) -> some View {
