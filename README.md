@@ -1,21 +1,73 @@
-# Netto — iOS Storage Cleaner
+<div align="center">
+
+<img src="logos/netto-logo-preview.png" alt="Netto brand assets — two-leaf symbol, horizontal and stacked lockups, app icon" width="720">
+
+**Netto — an iOS storage cleaner that shows you what is actually wasting space, and lets you review every candidate before anything is removed.**
+
+*Scan → Review → Confirm → Delete. Entirely on this iPhone.*
+
+[Features](#core-features) · [Why Netto](#why-netto) · [Screenshots](#screenshots) · [Privacy](#privacy) · [Building](#building--running) · [Testing](#testing--verification) · [Architecture](ARCHITECTURE.md)
+
+</div>
+
+---
 
 Netto finds what is wasting space on your iPhone — duplicate and similar photos,
 screenshots, large videos, and duplicate contacts — and lets you review every candidate
 before anything is removed. Scanning, analysis, and deletion all run on the device: there
 is no backend, no cloud processing, and no third-party analytics.
 
+## Why Netto
+
+iPhone storage fills up quietly. You get the low-storage banner, but not the "why":
+the Photos library is usually the largest item on the phone and yet iOS gives you no way
+to ask *which* part of it — a burst of near-identical shots, an old screenshot graveyard,
+a year of videos — is responsible. Existing cleaners either push you to a subscription,
+promise a magical "one-tap clean", or quietly upload your library to compute results on a
+server.
+
+Netto exists to close that gap honestly:
+
+- **Show the real number, not a scary one.** Storage, counts, and freed bytes come from
+  measured values. A size that cannot be measured stays an honest "unavailable" — it is
+  never guessed to zero and never inflated to make a button look tempting.
+- **Explain what will be deleted, before it is deleted.** Every feature is a review
+  surface, not an auto-cleaner: candidates are grouped, ranked by measured impact, and
+  nothing is preselected for removal without your confirmation.
+- **Respect the device.** Analysis never leaves the phone, there is no account, no
+  network client, and no third-party dependency. The same local-only constraint keeps the
+  app fast on-device and simple to trust.
+
+Each feature below exists because of a specific, unmet cleanup need — duplicates and
+similar shots waste space *and* decision time, screenshots age into pure noise, large
+videos are the fastest reclaimable gigabytes, and duplicate contacts are a small but
+persistent annoyance. The remainder of this README is the detailed account of how each
+one is built and verified.
+
+## Screenshots
+
+Captured on the iPhone 18 Pro simulator against a fixture library (dark appearance).
+The numbers shown are fixture data, not a real user library.
+
+| | |
+|:---:|:---:|
+| <img src="docs/screenshots/01-dashboard-idle.png" alt="Dashboard before any scan: a storage ring showing 228.53 GB of 245.53 GB used (93%), and a scan card reading 'Ready when you are' with an 'Analyze my library' button." width="260"><br>**Dashboard, ready to scan** — real storage status and one explicit action. | <img src="docs/screenshots/02-dashboard-scanned.png" alt="Dashboard after a scan: the scan card now reads 'Last scanned · in 0 seconds · 0 of 28 items analyzed · There is nothing marked for cleanup' with an 'Analyze again' button." width="260"><br>**Dashboard, scanned** — the same card reports the last real scan; no fabricated percentage. |
+| <img src="docs/screenshots/04-image-cleanup-hub.png" alt="Image Cleanup hub listing three rows: Similar Images (No groups found), Blurry Images (12 items), and Old Screenshots (10 items)." width="260"><br>**Image Cleanup** — Similar Images (identical + near-duplicate), Blurry, and Old Screenshots behind one row. | <img src="docs/screenshots/05-similar-photos.png" alt="Similar Photos screen showing the empty state: 'No similar groups found' with explanatory copy." width="260"><br>**Similar Photos** — one merged group list (exact duplicates first); an empty library says so honestly. |
+| <img src="docs/screenshots/06-blurry-images.png" alt="Blurry Images screen with three tabs — All Flagged (12), Likely Blurry (3), Borderline (9) — listing thumbnail cards of flagged photos." width="260"><br>**Potentially Blurry** — three tabs with live counts, every candidate a suggestion for review. | <img src="docs/screenshots/07-video-cleanup.png" alt="Video Cleanup screen with a header line reading '6 of 6 videos' size unavailable — stored in iCloud', a summary of videos and their measurement state, and a 'Sizes not measured yet' list section." width="260"><br>**Video Cleanup** — measured videos ranked largest-first; iCloud-only videos are counted in a top header, never guessed to zero. |
+| <img src="docs/screenshots/08-swipe-review.png" alt="Swipe review deck showing one photo with 'Keep' and 'Remove' actions, a top progress bar, and a 'Swipe to keep or mark for cleanup' caption." width="260"><br>**Swipe review** — a keep/delete pass over the library with undo and a live Delete-mark count. | |
+
 ## Core features
 
 - **Storage dashboard** — storage and permission status up front, then four primary
   cleanup sections (**Image Cleanup**, **Video Cleanup**, **Duplicate Contacts**,
   **Swipe Cleanup**), each with live scan progress and a status line derived from real
-  app state. Image Cleanup groups the four photo destinations (duplicates, similar
-  shots, blurry, old screenshots) behind one row; Old Screenshots lists screenshots at
-  least **90 days** old (oldest first, unknown dates never counted as old). Video
-  Cleanup splits the library into **Recorded**, **Downloaded**, and a reported
-  **other/unknown** count that is never guessed into a source, with the biggest measured
-  videos reviewed first.
+  app state. Image Cleanup groups the three photo destinations (similar images, blurry,
+  old screenshots) behind one row — one "Similar Images" destination now serves both
+  byte-identical copies and visually alike shots (previously two separate rows). Old
+  Screenshots lists screenshots at least **90 days** old (oldest first, unknown dates
+  never counted as old). Video Cleanup splits the library into **Recorded**,
+  **Downloaded**, and a reported **other/unknown** count that is never guessed into a
+  source, with the biggest measured videos reviewed first.
 - **Premium scan animation** — the dashboard's scan core is a native SwiftUI visual: a
   luminous green centre, concentric rings, and a slow sweep that runs **only** while a
   scan is actually in flight and settles the moment it is paused, cancelled, failed, or
@@ -24,7 +76,8 @@ is no backend, no cloud processing, and no third-party analytics.
   or completion.
 - **Similar / duplicate photo detection** — exact duplicates and near-duplicate shots
   found through content fingerprints, perceptual hashes, and Vision features, presented
-  as reviewable groups.
+  as a single reviewable list of groups (exact byte-identical copies first, then visually
+  alike shots) — one destination, "Similar Images", rather than two separate screens.
 - **Potentially Blurry detection** — an on-device sharpness pass scores every scanned
   photo on a small local thumbnail and flags candidates for review in three tabs
   (All Flagged / Likely Blurry / Borderline, with live counts). Classification uses
@@ -345,11 +398,14 @@ never left "0 of N". Even when the callback arrived, it was slow enough that a
   is dropped without a double resume. The whole library always finishes.
 - **Enumerate first; measure second** — the Videos screen renders the full inventory as
   soon as the catalog is complete: every video listed immediately, sizes filling in as
-  they measure, a summary of the real counts (`N videos total` / `Y sizes unavailable —
-  stored in iCloud or unavailable locally` / `Z videos sorted by known size`), and a
-  compact progress panel with cancel while measurement runs. An idle screen offers
-  "Measure Sizes" instead of blocking. Unknown sizes stay after every measured one —
-  never ranked, never zero — and rows say so.
+  they measure, and a summary of the real counts (`N videos total` / `Y sizes unavailable —
+  stored in iCloud or unavailable locally` / `Z videos sorted by known size`). There is
+  deliberately **no progress bar or measuring panel** (both were removed in a later
+  revision): measurement is I/O-bound and the list is already complete, so a spinner or
+  percentage would only claim progress the user cannot act on. Instead the top of the
+  screen carries a single header counting unavailable-of-total once any size is proven
+  unmeasurable, and an idle screen offers "Measure Sizes" instead of blocking. Unknown
+  sizes stay after every measured one — never ranked, never zero — and rows say so.
 - **Cached inventory, coalesced updates** — `AppEnvironment.videoRecordsForDisplay`
   (replacing the settled-only cache) serves the resolved, largest-first list and
   rebuilds only when the catalog or measurement changes, never per render; measurement
@@ -519,7 +575,7 @@ never ran.
   `resumeVideoSizeMeasurement` and the cancels in both prepare functions are gone:
   sizing is I/O-bound over its own bounded, thermal-aware batches, so it runs
   alongside a pass instead of being starved by one. Cancelled only by the user
-  (Rescan, the progress panel), backgrounding, dataset change, and deletion.
+  (Rescan / Measure Sizes), backgrounding, dataset change, and deletion.
 - **An ordered probe ladder replaces the single-path provider** —
   `PhotoKitAssetSizeProvider` now asks five probes in order, first answer wins, every
   step deadline-bounded, network access disabled everywhere (nothing is ever downloaded
@@ -546,8 +602,10 @@ never ran.
   (~100ms) instead of one `fetchAssets` XPC per probe per asset. On iOS 27 the `dataSize`
   step answers first and the whole scan drops to metadata speed; on iOS ≤ 26 a full
   first scan of a 7 000-video library is bound by the daemon ceiling at roughly a
-  minute, and every later visit is instant from the checkpoint. The progress message
-  counts resolved work (measured + unavailable), matching the bar it sits under.
+  minute, and every later visit is instant from the checkpoint. The screen has no
+  progress bar: it is an instant inventory that fills in as results land, with the top
+  header counting how many of the library's videos have a size versus how many are
+  unavailable.
 - **Attempted vs untouched, honestly named** — `Measurement` now carries the ids the run
   *attempted* and could not measure (`unavailableIDs`, seeded across a resumed run,
   never persisted — a relaunch retries them). The screen only says "Size unavailable —
@@ -647,7 +705,7 @@ wired into the app as:
 
 ## Testing & verification
 
-- **Unit suite** — 49 files, 838 Swift Testing cases across 83 suites covering the pure
+- **Unit suite** — 50 files, 861 Swift Testing cases across 84 suites covering the pure
   logic: contact normalization and matching, similarity grouping, plan construction and
   its confirmation boundary, state machines, the mutation service's
   revalidation/verification behavior, scan snapshot persistence, ETA estimation,
@@ -729,7 +787,16 @@ wired into the app as:
   something static.
 - **UI suites** — 5 XCUITest cases covering dashboard layout QA and an end-to-end scan
   validation run against fixture data in Simulator.
-- **Recent verification (M13)** — after unifying the Image Cleanup session, the full unit
+- **Current verification (Similar Images merge + video-size UI, M17)** — after merging
+  the duplicate and similar destinations into one "Similar Images" group list and
+  replacing the Video Cleanup progress panel with an honest iCloud/unavailable count
+  header, the full suite reported **863 tests across 84 suites, 0 failures** (the
+  pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged),
+  plus one clean app build with no warnings. Two new unit cases pin the iCloud-header
+  contract (unavailable-of-total once a failure is proven, absent before any failure);
+  the duplicate/similar merge is covered by the existing grouping and presentation suites
+  with the removed exact-duplicate destination cases deleted.
+- **Historical verification (M13)** — the full unit
   suite reported **843 tests in 83 suites, 0 failures** (the pre-existing
   `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged), plus one clean
   app build with **no warnings**. Five new unit cases pin the M13 contracts: one Analyze
@@ -746,7 +813,7 @@ wired into the app as:
   similarity-only scan); the sharpness pass then continues for several more minutes — a real
   cost of running both, reported here rather than dressed up as a device claim.
 
-- **Recent verification (M12)** — after removing Large Files and adding the scan-core
+- **Historical verification (M12)** — after removing Large Files and adding the scan-core
   animation, a full-suite run reported **838 tests in 83 suites, 0 failures** (the
   pre-existing `cancellationPropagatesOutOfTheLoader` suite-context skip is unchanged),
   plus one clean build of the app with no warnings and all 5 UI cases passing (dashboard
@@ -756,7 +823,7 @@ wired into the app as:
   pin the scan core's state→visual mapping — resting/paused/terminal cores never sweep,
   an indeterminate stage draws no progress ring, a measured fraction is passed through
   (and clamped) exactly, and only an in-flight run ever moves.
-- **Recent verification (M11)** — after the dashboard-IA restructuring, a full-suite
+- **Historical verification (M11)** — after the dashboard-IA restructuring, a full-suite
   run reported **836 tests: 835 passed, 0 failed, 1 skipped** (the skip is the
   pre-existing `cancellationPropagatesOutOfTheLoader` suite-context quirk, unchanged),
   plus one clean build of the app with no warnings. The 26 new unit cases
@@ -766,7 +833,7 @@ wired into the app as:
   a guess); the 5 UI cases were updated to the new section identifiers and assert the
   sections in fixed vertical order with no overlap, plus the end-to-end scan reaching
   the Image Cleanup destinations.
-- **Recent verification (M10)** — after the coordination + widget work, a full-suite
+- **Historical verification (M10)** — after the coordination + widget work, a full-suite
   run reported **"805 tests in 79 suites passed"** (14 new: the queue's start-once /
   cancel / failure / replace / paused / deletion contracts in both directions, the
   queued phase mappings, the designed widget fallback copy across every unusable store
@@ -774,7 +841,7 @@ wired into the app as:
   widget extension, and test target with no warnings. The two admission tests that
   previously pinned the silent-refusal rule were rewritten to pin the queue rule
   (same no-clobber guarantees, plus the acknowledged queue).
-- **Recent verification (M9)** — focused video suites after the large-videos fix:
+- **Historical verification (M9)** — focused video suites after the large-videos fix:
   `VideoDatasetTests`, `VideosFlowTests`, `VideoCheckpointFlowTests`, and the new
   `VideoSizeDeadlineTests` — **80 tests across 4 suites green** (11 new: inventory
   summary honesty, mixed local/cloud counts and ordering, the inventory rendering
@@ -843,10 +910,10 @@ wired into the app as:
   across launches.
   Thermal scaling reacts to the reported thermal state, not to per-request latency; at
   critical pressure the scan deliberately slows instead of failing. Video-size
-  measurement yields to a similarity or sharpness pass and resumes only when a pass's
-  `isRunning` flag flips to false (an explicit resume also works); if the app is
-  backgrounded or killed while yielded, measurement restarts from persisted partial
-  results on the next session.
+  measurement now runs alongside analysis passes rather than yielding to them (see M16);
+  it is cancelled only by explicit user actions, backgrounding, dataset change, or
+  deletion, and a measurement interrupted by backgrounding or a kill resumes from its
+  persisted partial results on the next session.
 - **Interrupted-run checkpointing (Phase C)** — checkpoints store resume *evidence*, not
   finished results (a completed scan persists through the separate scan snapshot). A
   resumed catalog restarts enumeration from the first asset — per-asset offsets are not
