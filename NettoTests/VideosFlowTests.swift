@@ -1427,12 +1427,12 @@ struct VideoSizeLadderTests {
     @Test func firstMeasuredProbeWinsAndLaterProbesNeverRun() async {
         let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
             avCurrentBytes: { id in
                 log.append("avCurrent(\(id))")
                 return .measured(111)
             },
             avOriginalBytes: { _ in log.append("avOriginal"); return .measured(999) },
-            resourceBytes: { _ in log.append("resource"); return .measured(999) },
             editingInputBytes: { _ in log.append("editingInput"); return .measured(999) },
             imageDataBytes: { _ in log.append("imageData"); return .measured(999) }
         )
@@ -1440,7 +1440,24 @@ struct VideoSizeLadderTests {
         let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
 
         #expect(outcome == .measured(111))
-        #expect(log.steps == ["avCurrent(video-1)"])
+        #expect(log.steps == ["resource", "avCurrent(video-1)"])
+    }
+
+    @Test func thePhotosMetadataCountWinsWhenItAnswersFirst() async {
+        // iOS 27's dataSize is the first step: when it answers, the AV probes never run.
+        let log = StepLog()
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in log.append("resource"); return .measured(4_242) },
+            avCurrentBytes: { _ in log.append("avCurrent"); return .measured(999) },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .measured(999) },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) },
+            imageDataBytes: { _ in log.append("imageData"); return .measured(999) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .measured(4_242))
+        #expect(log.steps == ["resource"])
     }
 
     @Test func anEditedVideoFallsThroughToTheOriginalFile() async {
@@ -1448,6 +1465,7 @@ struct VideoSizeLadderTests {
         // `.original` is the pre-iOS 27 answer and carries the file.
         let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
             avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
             avOriginalBytes: { _ in log.append("avOriginal"); return .measured(500) },
             editingInputBytes: { _ in log.append("editingInput"); return .measured(999) }
@@ -1456,35 +1474,18 @@ struct VideoSizeLadderTests {
         let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
 
         #expect(outcome == .measured(500))
-        #expect(log.steps == ["avCurrent", "avOriginal"])
-    }
-
-    @Test func unreadableContentURLsFallThroughToThePhotosMetadataCount() async {
-        // Neither AV URL is stat-able (sandbox, composition): Photos' own dataSize answers,
-        // and the editing-input race is never entered.
-        let log = StepLog()
-        let probes = PhotoKitAssetSizeProvider.Probes(
-            avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
-            avOriginalBytes: { _ in log.append("avOriginal"); return .noAnswer },
-            resourceBytes: { _ in log.append("resource"); return .measured(4_242) },
-            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) }
-        )
-
-        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
-
-        #expect(outcome == .measured(4_242))
-        #expect(log.steps == ["avCurrent", "avOriginal", "resource"])
+        #expect(log.steps == ["resource", "avCurrent", "avOriginal"])
     }
 
     @Test func aRemoteVideoStopsAfterTheSingleLocalityProbe() async {
         // PhotoKit said "not local" (network access disabled, no content): the ladder
-        // answers unavailable immediately — no original, no metadata fetch, no
-        // editing-input race. This is the fast path a cloud-heavy library lives on.
+        // answers unavailable immediately — no original, no editing-input race. This is
+        // the fast path a cloud-heavy library lives on.
         let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
             avCurrentBytes: { _ in log.append("avCurrent"); return .notLocal },
             avOriginalBytes: { _ in log.append("avOriginal"); return .measured(999) },
-            resourceBytes: { _ in log.append("resource"); return .measured(999) },
             editingInputBytes: { _ in log.append("editingInput"); return .measured(999) },
             imageDataBytes: { _ in log.append("imageData"); return .measured(999) }
         )
@@ -1492,32 +1493,32 @@ struct VideoSizeLadderTests {
         let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
 
         #expect(outcome == .unavailable)
-        #expect(log.steps == ["avCurrent"]) // one probe, then stop
+        #expect(log.steps == ["resource", "avCurrent"]) // one locality probe, then stop
     }
 
     @Test func aRemoteOriginalIsAlsoTerminal() async {
         // The current version had no file URL (edited render → no answer); the original
-        // reports not-local — the ladder stops there too, before the metadata fetch.
+        // reports not-local — the ladder stops there too.
         let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
             avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
             avOriginalBytes: { _ in log.append("avOriginal"); return .notLocal },
-            resourceBytes: { _ in log.append("resource"); return .measured(999) },
             editingInputBytes: { _ in log.append("editingInput"); return .measured(999) }
         )
 
         let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
 
         #expect(outcome == .unavailable)
-        #expect(log.steps == ["avCurrent", "avOriginal"])
+        #expect(log.steps == ["resource", "avCurrent", "avOriginal"])
     }
 
     @Test func imageBytesAreTheLastResortWhenEveryFileAnswerIsSilent() async {
         let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
             avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
             avOriginalBytes: { _ in log.append("avOriginal"); return .noAnswer },
-            resourceBytes: { _ in log.append("resource"); return .noAnswer },
             editingInputBytes: { _ in log.append("editingInput"); return .noAnswer },
             imageDataBytes: { _ in log.append("imageData"); return .measured(12_345) }
         )
@@ -1526,16 +1527,23 @@ struct VideoSizeLadderTests {
 
         #expect(outcome == .measured(12_345))
         #expect(
-            log.steps == ["avCurrent", "avOriginal", "resource", "editingInput", "imageData"]
+            log.steps == ["resource", "avCurrent", "avOriginal", "editingInput", "imageData"]
         )
+    }
+
+    @Test func theAssetIndexAnswersEveryLookupFromItsCache() {
+        // A prefilled index answers from the dictionary and never hits PhotoKit — the
+        // per-pass cache that replaces one `fetchAssets` XPC per probe per asset.
+        let index = PhotoKitAssetSizeProvider.AssetIndex(cache: [:])
+        #expect(index.asset(for: "deleted-or-photos-only-id") == nil)
     }
 
     @Test func aMeasuredZeroIsNeverReportedAsASize() async {
         // A genuinely empty file is not a measurement — silence everywhere is honest.
         let probes = PhotoKitAssetSizeProvider.Probes(
+            resourceBytes: { _ in .measured(0) },
             avCurrentBytes: { _ in .measured(0) },
             avOriginalBytes: { _ in .measured(0) },
-            resourceBytes: { _ in .measured(0) },
             editingInputBytes: { _ in .measured(0) },
             imageDataBytes: { _ in .measured(0) }
         )

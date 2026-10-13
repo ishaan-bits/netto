@@ -114,19 +114,21 @@ extension Array where Element == PhotoAssetRecord {
 /// The ladder, in order (each step receives the asset's localIdentifier and answers
 /// `.measured(bytes)` / `.notLocal` / `.noAnswer`):
 ///
-/// 1. **`requestAVAsset(.current)` → stat** — the exact file size of the version the user
-///    sees. Network access stays disabled, so a cloud-only video answers nil promptly (the
-///    API's documented behaviour) — treated as **not local, terminal**: nothing below can
-///    hold local bytes for content PhotoKit just reported as absent. An edited video
-///    answers with an `AVComposition`, which carries no file URL — no answer, next step.
-/// 2. **`requestAVAsset(.original)` → stat** — the pre-iOS 27 answer for edited videos:
-///    their original file is a real, reclaimable payload even when the render has no URL.
-/// 3. **`PHAssetResource.dataSize` (iOS 27+)** — Photos' own metadata byte count summed over
-///    `AssetResourceScope`'s counted resources: synchronous, sandbox-independent, and the
-///    answer when every content URL is unreadable but the asset is local. (Not consulted
-///    for proven-remote assets — steps 1–2 already stopped the ladder — which on-device
-///    measurements confirmed: dataSize never answers for them, and the extra XPC per cloud
-///    asset dominated scan time on a 7 000-video iCloud-only library.)
+/// 1. **`PHAssetResource.dataSize` (iOS 27+)** — Photos' own metadata byte count summed over
+///    `AssetResourceScope`'s counted resources: synchronous, sandbox-independent, and exact
+///    when the asset is local. Promoted to first because it is free on iOS ≤ 26 (the
+///    `#available` guard fails before any XPC is issued — measured at 0.0 ms/asset on an
+///    iPhone 17 Pro on iOS 26.5) and answers outright on iOS 27, so a future device drops
+///    the whole scan to metadata speed.
+/// 2. **`requestAVAsset(.current)` → stat** — the exact file size of the version the user
+///    sees, and (with network access disabled) the **locality verdict**: a cloud-only video
+///    answers nil promptly — terminal — while a local one answers an `AVURLAsset` to stat.
+///    An edited video answers an `AVComposition` with no file URL — no answer, next step.
+///    This is the expensive step (measured ~7 ms per asset, serialized by the Photos daemon
+///    at ~125 videos/second no matter the concurrency) and the reason the pass walks the
+///    dataset newest-first: locally stored videos are the newest ones, so a cloud-heavy
+///    library surfaces its real, sized results within seconds.
+/// 3. **`requestAVAsset(.original)` → stat** — the pre-iOS 27 answer for edited videos.
 /// 4. **`requestContentEditingInput` → stat** — full-size image URL and paired/AV URL, summed
 ///    per `AssetResourceScope` (a Live Photo = still + movie). Only reached when nothing
 ///    above knew the locality; its callback has been observed to stall for remote assets,
@@ -142,14 +144,20 @@ extension Array where Element == PhotoAssetRecord {
 ///   probe rather than guessed — and is never downloaded to measure.
 /// - An edited asset measured through the original file reports the original's size.
 /// - A genuinely empty file is never reported as a measured zero.
+/// - On iOS ≤ 26 there is no public metadata byte count, so classifying a whole library is
+///   bound by the Photos daemon's ~125 verdicts/second (independent of width and of how many
+///   `PHImageManager` connections are open — both measured). The ladder is therefore ordered
+///   and the pass is driven newest-first so the sized, sorted result lands in seconds.
 ///
 /// `probes` is the test seam: scripted id-level closures (defaulting to "no answer") so tests
 /// exercise the ladder and the batching engine without touching PhotoKit.
 struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     /// XPC-bound probe width (thermal-scaled by `ScanConcurrencyPolicy`): each probe is a
     /// Photos-daemon round trip, not CPU work, so the pool runs wider than the CPU-bound
-    /// passes. Eight is the measured sweet spot for a cloud-heavy library — the remote
-    /// fast path (one probe per asset) roughly doubles throughput versus the old width.
+    /// passes. Eight is the measured sweet spot — the daemon serializes verdicts at ~125
+    /// videos/second, and both a wider pool (up to 128) and extra `PHImageManager`
+    /// connections (up to 16) left wall-clock unchanged on an iPhone 17 Pro, so a wider
+    /// pool would only deepen the queue.
     var maxConcurrentResolutions: Int = 8
     /// Per-asset ceiling on a PhotoKit callback (see the type docs). Exceeding it yields an
     /// honest no-answer — never a hang, never zero.
@@ -169,48 +177,56 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         case noAnswer
     }
 
-    /// The five ladder steps, keyed by localIdentifier. Every closure defaults to `.noAnswer`,
-    /// so a partially specified `Probes` can never accidentally reach PhotoKit in tests.
+    /// The five ladder steps in ladder order, keyed by localIdentifier. Every closure
+    /// defaults to `.noAnswer`, so a partially specified `Probes` can never accidentally
+    /// reach PhotoKit in tests.
     struct Probes: Sendable {
+        var resourceBytes: @Sendable (String) async -> ProbeAnswer
         var avCurrentBytes: @Sendable (String) async -> ProbeAnswer
         var avOriginalBytes: @Sendable (String) async -> ProbeAnswer
-        var resourceBytes: @Sendable (String) async -> ProbeAnswer
         var editingInputBytes: @Sendable (String) async -> ProbeAnswer
         var imageDataBytes: @Sendable (String) async -> ProbeAnswer
 
         init(
+            resourceBytes: @escaping @Sendable (String) async -> ProbeAnswer = { _ in .noAnswer },
             avCurrentBytes: @escaping @Sendable (String) async -> ProbeAnswer = { _ in .noAnswer },
             avOriginalBytes: @escaping @Sendable (String) async -> ProbeAnswer = { _ in .noAnswer },
-            resourceBytes: @escaping @Sendable (String) async -> ProbeAnswer = { _ in .noAnswer },
             editingInputBytes: @escaping @Sendable (String) async -> ProbeAnswer = { _ in .noAnswer },
             imageDataBytes: @escaping @Sendable (String) async -> ProbeAnswer = { _ in .noAnswer }
         ) {
+            self.resourceBytes = resourceBytes
             self.avCurrentBytes = avCurrentBytes
             self.avOriginalBytes = avOriginalBytes
-            self.resourceBytes = resourceBytes
             self.editingInputBytes = editingInputBytes
             self.imageDataBytes = imageDataBytes
         }
 
         /// The production ladder, wired to PhotoKit with the provider's per-callback deadline.
+        ///
+        /// One `AssetIndex` backs every probe in the pass, so each asset is fetched once
+        /// instead of once per probe. It is built lazily on first use (a single
+        /// `PHFetchOptions` pass over the library's videos) and reused for the rest.
         static func photoKit(deadlineNanoseconds: UInt64) -> Probes {
-            Probes(
+            let index = AssetIndex()
+            return Probes(
+                resourceBytes: { identifier in
+                    await PhotoKitAssetSizeProvider.resourceBytes(for: identifier, index: index)
+                },
                 avCurrentBytes: { identifier in
                     await PhotoKitAssetSizeProvider.avBytes(
-                        for: identifier, version: .current, deadlineNanoseconds: deadlineNanoseconds
+                        for: identifier, version: .current, index: index,
+                        deadlineNanoseconds: deadlineNanoseconds
                     )
                 },
                 avOriginalBytes: { identifier in
                     await PhotoKitAssetSizeProvider.avBytes(
-                        for: identifier, version: .original, deadlineNanoseconds: deadlineNanoseconds
+                        for: identifier, version: .original, index: index,
+                        deadlineNanoseconds: deadlineNanoseconds
                     )
-                },
-                resourceBytes: { identifier in
-                    await PhotoKitAssetSizeProvider.resourceBytes(for: identifier)
                 },
                 editingInputBytes: { identifier in
                     await PhotoKitAssetSizeProvider.editingInputBytes(
-                        for: identifier, deadlineNanoseconds: deadlineNanoseconds
+                        for: identifier, index: index, deadlineNanoseconds: deadlineNanoseconds
                     )
                 },
                 imageDataBytes: { identifier in
@@ -294,13 +310,20 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     }
 
     /// The ladder itself: first measured bytes win; a proven-remote asset stops right
-    /// there — one locality probe, no original, no metadata fetch, no editing-input race
-    /// (a 7 000-video iCloud-only library resolves at callback speed instead of
-    /// probe-stacking speed); silence everywhere is `.unavailable`.
+    /// there — one locality probe, no original, no editing-input race; silence everywhere
+    /// is `.unavailable`.
     static func ladder(for identifier: String, probes: Probes) async -> VideoSizeOutcome {
-        // Step 1: the current version's file. A cloud-only video answers nil promptly
-        // with network access disabled — terminal: nothing further down the ladder can
-        // hold local bytes for content PhotoKit just reported as not local.
+        // Step 1: Photos' own metadata byte count (iOS 27+). Free on iOS ≤ 26 (the guard
+        // below fails before any XPC), exact on iOS 27 — so a device that has it answers
+        // local videos here without ever touching the AV machinery.
+        if case .measured(let bytes) = await probes.resourceBytes(identifier), bytes > 0 {
+            return .measured(bytes)
+        }
+
+        // Step 2: the current version's file, and the locality verdict. A cloud-only video
+        // answers nil promptly with network access disabled — terminal: nothing further
+        // down the ladder can hold local bytes for content PhotoKit just reported as
+        // absent.
         switch await probes.avCurrentBytes(identifier) {
         case .measured(let bytes):
             if bytes > 0 { return .measured(bytes) }
@@ -310,7 +333,7 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             break
         }
 
-        // Step 2: an edited render is an AVComposition with no file URL (no answer
+        // Step 3: an edited render is an AVComposition with no file URL (no answer
         // above) — the original file is the pre-iOS 27 answer for it.
         switch await probes.avOriginalBytes(identifier) {
         case .measured(let bytes):
@@ -319,12 +342,6 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             return .unavailable
         case .noAnswer:
             break
-        }
-
-        // Step 3: Photos' own metadata byte count (iOS 27+) — answers where every
-        // content URL is unreadable but the asset is local.
-        if case .measured(let bytes) = await probes.resourceBytes(identifier), bytes > 0 {
-            return .measured(bytes)
         }
 
         if case .measured(let bytes) = await probes.editingInputBytes(identifier), bytes > 0 {
@@ -343,20 +360,60 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
 
     // MARK: - Production probes (PhotoKit)
 
-    private static func asset(for localIdentifier: String) -> PHAsset? {
-        PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil).firstObject
+    /// A per-pass map from `localIdentifier` to `PHAsset`, fetched once.
+    ///
+    /// Every probe used to call `PHAsset.fetchAssets(withLocalIdentifiers:)` on its own —
+    /// a synchronous XPC to the Photos daemon *per probe per asset*, stacked on top of the
+    /// `requestAVAsset` callback. On a 7 000-video library that is tens of thousands of
+    /// redundant round trips for assets the caller already enumerated into the catalog.
+    /// Building the map once (a single `PHFetchOptions` pass over the requested videos) turns
+    /// every per-probe fetch into a dictionary lookup.
+    ///
+    /// `@unchecked Sendable`: the cache is written under `lock` on first use and read-only
+    /// thereafter; `PHAsset` is itself immutable and thread-safe to hold.
+    final class AssetIndex: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cache: [String: PHAsset]?
+
+        init(cache: [String: PHAsset]? = nil) {
+            self.cache = cache
+        }
+
+        /// The asset for `localIdentifier`, or nil if it is not in this pass's set.
+        ///
+        /// The first call builds the whole map in one fetch; later calls are dictionary
+        /// lookups. An identifier missing from the map is not re-fetched one at a time —
+        /// that is the redundancy this type exists to remove — it simply answers nil, and
+        /// the probe reports "no answer".
+        func asset(for localIdentifier: String) -> PHAsset? {
+            lock.lock()
+            defer { lock.unlock() }
+            if let cache {
+                return cache[localIdentifier]
+            }
+            var built: [String: PHAsset] = [:]
+            let options = PHFetchOptions()
+            options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+            let fetch = PHAsset.fetchAssets(with: options)
+            fetch.enumerateObjects { asset, _, _ in
+                built[asset.localIdentifier] = asset
+            }
+            cache = built
+            return built[localIdentifier]
+        }
     }
 
-    /// Steps 1–2: `requestAVAsset` with network access disabled, then stat the file URL.
+    /// Steps 2–3: `requestAVAsset` with network access disabled, then stat the file URL.
     /// A locally stored video answers promptly with an `AVURLAsset`; a cloud-only one
     /// answers promptly with nil (recorded as not local); an edited `.current` render is an
-    /// `AVComposition` with no file URL (no answer — step 2 gets the original).
+    /// `AVComposition` with no file URL (no answer — step 3 gets the original).
     private static func avBytes(
         for localIdentifier: String,
         version: PHVideoRequestOptionsVersion,
+        index: AssetIndex,
         deadlineNanoseconds: UInt64
     ) async -> ProbeAnswer {
-        guard let asset = asset(for: localIdentifier),
+        guard let asset = index.asset(for: localIdentifier),
               asset.mediaType == .video,
               !asset.mediaSubtypes.contains(.photoLive) else {
             return .noAnswer
@@ -385,12 +442,15 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         return answer ?? .noAnswer
     }
 
-    /// Step 3 (iOS 27+): Photos' own metadata byte count over the counted resources.
+    /// Step 1 (iOS 27+): Photos' own metadata byte count over the counted resources.
     /// Synchronous, no file access, no callbacks — and honest when Photos hasn't finished
     /// processing a resource (any counted resource without a size → no answer).
-    private static func resourceBytes(for localIdentifier: String) async -> ProbeAnswer {
+    private static func resourceBytes(
+        for localIdentifier: String,
+        index: AssetIndex
+    ) async -> ProbeAnswer {
         guard #available(iOS 27.0, *),
-              let asset = asset(for: localIdentifier) else {
+              let asset = index.asset(for: localIdentifier) else {
             return .noAnswer
         }
         let counted = AssetResourceScope.countableTypes(
@@ -410,9 +470,10 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     /// callback from pinning an asset beyond the per-probe ceiling.
     private static func editingInputBytes(
         for localIdentifier: String,
+        index: AssetIndex,
         deadlineNanoseconds: UInt64
     ) async -> ProbeAnswer {
-        guard let asset = asset(for: localIdentifier) else { return .noAnswer }
+        guard let asset = index.asset(for: localIdentifier) else { return .noAnswer }
         let answer: ProbeAnswer? = await withDeadline(nanoseconds: deadlineNanoseconds) { deliver in
             let options = PHContentEditingInputRequestOptions()
             options.isNetworkAccessAllowed = false
@@ -442,11 +503,15 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
 
     /// Step 5 (photos only): the exact byte count of the image data itself — no file URL
     /// involved, so it answers where every URL is unreadable. The buffer is transient.
+    ///
+    /// Deliberately its own `fetchAssets` rather than a shared index: the index holds
+    /// videos, and this probe only ever answers for a photo, so a dictionary lookup here
+    /// would always miss and photos would stop being measured at all.
     private static func imageDataBytes(
         for localIdentifier: String,
         deadlineNanoseconds: UInt64
     ) async -> ProbeAnswer {
-        guard let asset = asset(for: localIdentifier),
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil).firstObject,
               asset.mediaType == .image,
               !asset.mediaSubtypes.contains(.photoLive) else {
             return .noAnswer

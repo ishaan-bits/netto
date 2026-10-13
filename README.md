@@ -523,25 +523,31 @@ never ran.
 - **An ordered probe ladder replaces the single-path provider** —
   `PhotoKitAssetSizeProvider` now asks five probes in order, first answer wins, every
   step deadline-bounded, network access disabled everywhere (nothing is ever downloaded
-  to measure): `requestAVAsset(.current)` → stat; `requestAVAsset(.original)` → stat
-  (the edited-video answer); `PHAssetResource.dataSize` (iOS 27+ Photos metadata —
-  synchronous and sandbox-independent); `requestContentEditingInput` → stat;
+  to measure): `PHAssetResource.dataSize` (iOS 27+ Photos metadata — synchronous and
+  sandbox-independent; free no-op below 27) → `requestAVAsset(.current)` → stat (and the
+  locality verdict: a cloud-only video answers nil promptly — terminal); `requestAVAsset(.original)`
+  → stat (the edited-video answer); `requestContentEditingInput` → stat;
   and `requestImageDataAndOrientation` → byte count for photos with no file URL at all.
   A measured zero is never a size; a genuinely empty file ends `.unavailable`. Probes are
   injectable (`Probes`), so the ladder and the batching engine are tested with scripted
   answers and no PhotoKit. Validated end-to-end on the iOS 27 simulator's seeded library
   (3/3 videos and a photo measured, including through the Photos-metadata path).
-- **A known-remote video costs exactly one probe** — on a real iPhone 17 Pro library
-  (7 085 of 7 114 videos iCloud-only), each cloud video used to pay *two* `requestAVAsset`
-  callbacks plus a metadata fetch before honestly giving up (~22 videos/second at the old
-  width of 4 — about five minutes for the library). PhotoKit's nil answer with network
-  access disabled *is* the locality verdict — the info dictionary's inCloud key is
-  corroboration, not a requirement (a key-less nil used to count as "no answer" and fell
-  through the rest of the ladder) — so `.notLocal` is now **terminal**: one probe, then
-  unavailable. Photos' `dataSize` is not consulted for proven-remote assets either (on the
-  measured library it never answered for them). The probe pool widened from 4 to 8 —
-  these are Photos-daemon round trips, not CPU work. The progress message now counts
-  resolved work (measured + unavailable), matching the bar it sits under.
+- **A known-remote video costs exactly one probe, and results land in seconds** —
+  PhotoKit's nil answer with network access disabled *is* the locality verdict, so
+  `.notLocal` is terminal: one probe, then unavailable; Photos' `dataSize` is not
+  consulted again for proven-remote assets. Three measurements on a real iPhone 17 Pro
+  (iOS 26.5.1, 7 116 videos, 7 085 iCloud-only) shaped the pass: the Photos daemon
+  classifies at a hard **~125 videos/second** — widening the probe pool 4→128 or opening
+  up to 16 `PHImageManager` connections left wall-clock unchanged — and locally stored
+  videos are the *newest* ones on an Optimize-Storage library. So the pass walks the
+  dataset **newest-first**: the sized, sorted local results appear on screen within
+  seconds while the cloud-only tail resolves in the background (every video is still
+  probed; nothing is skipped). Each pass also builds a **shared `PHAsset` index once**
+  (~100ms) instead of one `fetchAssets` XPC per probe per asset. On iOS 27 the `dataSize`
+  step answers first and the whole scan drops to metadata speed; on iOS ≤ 26 a full
+  first scan of a 7 000-video library is bound by the daemon ceiling at roughly a
+  minute, and every later visit is instant from the checkpoint. The progress message
+  counts resolved work (measured + unavailable), matching the bar it sits under.
 - **Attempted vs untouched, honestly named** — `Measurement` now carries the ids the run
   *attempted* and could not measure (`unavailableIDs`, seeded across a resumed run,
   never persisted — a relaunch retries them). The screen only says "Size unavailable —

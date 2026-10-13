@@ -2679,7 +2679,17 @@ final class AppEnvironment {
                 measuredBytes[entry.assetID] = entry.bytes
             }
         }
-        let targets = videos.lazy.map(\.localIdentifier).filter { measuredBytes[$0] == nil }
+        // Newest-first: the Photos daemon classifies videos at a hard ~125/second ceiling
+        // (measured on an iPhone 17 Pro — independent of probe width or connection count),
+        // and locally stored videos are the newest ones on an Optimize-Storage library.
+        // Walking newest-first therefore surfaces the sized, sorted local results within
+        // seconds while the older cloud-only tail resolves in the background — every video
+        // is still probed; nothing is skipped or guessed.
+        let targets = videos
+            .sorted { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
+            .lazy
+            .map(\.localIdentifier)
+            .filter { measuredBytes[$0] == nil }
 
         guard !targets.isEmpty else {
             videoSizeResolution = .settled(
