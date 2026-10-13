@@ -591,11 +591,12 @@ struct VideoDatasetTests {
                 measured: 0, total: 6, unavailable: 0, isActive: false
             ) == "Preparing to measure 6 videos…"
         )
-        // Active: honest progress, with unmeasurable sizes surfaced as their own figure.
+        // Active: honest progress as *resolved* work (measured + unavailable, matching
+        // the bar), with unmeasurable sizes surfaced as their own figure.
         #expect(
             VideosPresentation.measuringMessage(
                 measured: 2, total: 6, unavailable: 3, isActive: true
-            ) == "Measuring video sizes… 2 of 6 done (3 unavailable)"
+            ) == "Measuring video sizes… 5 of 6 done (3 unavailable)"
         )
         #expect(
             VideosPresentation.measuringMessage(

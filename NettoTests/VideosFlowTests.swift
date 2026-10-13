@@ -1476,38 +1476,40 @@ struct VideoSizeLadderTests {
         #expect(log.steps == ["avCurrent", "avOriginal", "resource"])
     }
 
-    @Test func aProvenRemoteVideoNeverEntersTheStallingEditingInputRace() async {
-        // PhotoKit affirmatively said "not local": the ladder skips the callback that has
-        // been observed to stall indefinitely for such assets — and answers unavailable,
-        // never a fabricated size.
+    @Test func aRemoteVideoStopsAfterTheSingleLocalityProbe() async {
+        // PhotoKit said "not local" (network access disabled, no content): the ladder
+        // answers unavailable immediately — no original, no metadata fetch, no
+        // editing-input race. This is the fast path a cloud-heavy library lives on.
         let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
             avCurrentBytes: { _ in log.append("avCurrent"); return .notLocal },
-            avOriginalBytes: { _ in log.append("avOriginal"); return .noAnswer },
-            resourceBytes: { _ in log.append("resource"); return .noAnswer },
-            editingInputBytes: { _ in log.append("editingInput"); return .measured(7) },
-            imageDataBytes: { _ in log.append("imageData"); return .measured(7) }
+            avOriginalBytes: { _ in log.append("avOriginal"); return .measured(999) },
+            resourceBytes: { _ in log.append("resource"); return .measured(999) },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) },
+            imageDataBytes: { _ in log.append("imageData"); return .measured(999) }
         )
 
         let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
 
         #expect(outcome == .unavailable)
-        #expect(log.steps == ["avCurrent", "avOriginal", "resource"])
+        #expect(log.steps == ["avCurrent"]) // one probe, then stop
     }
 
-    @Test func thePhotoMetadataCountStillAnswersForARemoteAsset() async {
-        // data is only in iCloud, but Photos already knows its byte count: metadata is
-        // not a download, so it may answer where no local URL exists.
+    @Test func aRemoteOriginalIsAlsoTerminal() async {
+        // The current version had no file URL (edited render → no answer); the original
+        // reports not-local — the ladder stops there too, before the metadata fetch.
+        let log = StepLog()
         let probes = PhotoKitAssetSizeProvider.Probes(
-            avCurrentBytes: { _ in .notLocal },
-            avOriginalBytes: { _ in .notLocal },
-            resourceBytes: { _ in .measured(8_888) },
-            editingInputBytes: { _ in .measured(1) }
+            avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .notLocal },
+            resourceBytes: { _ in log.append("resource"); return .measured(999) },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) }
         )
 
         let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
 
-        #expect(outcome == .measured(8_888))
+        #expect(outcome == .unavailable)
+        #expect(log.steps == ["avCurrent", "avOriginal"])
     }
 
     @Test func imageBytesAreTheLastResortWhenEveryFileAnswerIsSilent() async {

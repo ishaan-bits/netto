@@ -174,8 +174,9 @@ enum VideosPresentation {
 
     /// The measuring screen's progress message. An idle state has started nothing, so it
     /// never claims "0 of N done" — it says what is about to happen. An active run names
-    /// its honest progress, and surfaces sizes the provider could not measure (they are
-    /// real outcomes of real work, never folded into the measured count).
+    /// its honest progress as *resolved* work (measured plus honestly-unavailable, matching
+    /// the progress bar), and surfaces sizes the provider could not measure as their own
+    /// figure — never folded into the measured count.
     static func measuringMessage(
         measured: Int,
         total: Int,
@@ -188,7 +189,7 @@ enum VideosPresentation {
                 : "Preparing to measure video sizes…"
         }
         var message = total > 0
-            ? "Measuring video sizes… \(measured) of \(total) done"
+            ? "Measuring video sizes… \(measured + unavailable) of \(total) done"
             : "Measuring video sizes…"
         if unavailable > 0 {
             message += " (\(unavailable) unavailable)"

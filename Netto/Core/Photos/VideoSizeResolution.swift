@@ -47,8 +47,8 @@ enum VideoSizeResolution: Sendable, Equatable {
 
     /// Sequential batch size for resolution: at most this many identifiers are handed to the
     /// (internally thermal-width) size provider at once, so a large video list produces bounded,
-    /// cancellable progress instead of one unbounded fan-out. Kept small — two waves at the
-    /// provider's default width of 4 — so the first on-screen increment lands within about a
+    /// cancellable progress instead of one unbounded fan-out. Kept small — one wave at the
+    /// provider's default width of 8 — so the first on-screen increment lands within about a
     /// second of measurement starting, instead of after a full 32-asset pass (which left the
     /// screen pinned at "0 of N" for several seconds on a large library).
     static let measurementBatchSize = 8

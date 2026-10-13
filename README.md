@@ -525,14 +525,23 @@ never ran.
   step deadline-bounded, network access disabled everywhere (nothing is ever downloaded
   to measure): `requestAVAsset(.current)` → stat; `requestAVAsset(.original)` → stat
   (the edited-video answer); `PHAssetResource.dataSize` (iOS 27+ Photos metadata —
-  synchronous and sandbox-independent); `requestContentEditingInput` → stat —
-  *skipped when a probe already proved the content is remote*, because that callback has
-  been observed to stall for such assets (the deadline is a backstop, not the strategy);
+  synchronous and sandbox-independent); `requestContentEditingInput` → stat;
   and `requestImageDataAndOrientation` → byte count for photos with no file URL at all.
   A measured zero is never a size; a genuinely empty file ends `.unavailable`. Probes are
   injectable (`Probes`), so the ladder and the batching engine are tested with scripted
   answers and no PhotoKit. Validated end-to-end on the iOS 27 simulator's seeded library
   (3/3 videos and a photo measured, including through the Photos-metadata path).
+- **A known-remote video costs exactly one probe** — on a real iPhone 17 Pro library
+  (7 085 of 7 114 videos iCloud-only), each cloud video used to pay *two* `requestAVAsset`
+  callbacks plus a metadata fetch before honestly giving up (~22 videos/second at the old
+  width of 4 — about five minutes for the library). PhotoKit's nil answer with network
+  access disabled *is* the locality verdict — the info dictionary's inCloud key is
+  corroboration, not a requirement (a key-less nil used to count as "no answer" and fell
+  through the rest of the ladder) — so `.notLocal` is now **terminal**: one probe, then
+  unavailable. Photos' `dataSize` is not consulted for proven-remote assets either (on the
+  measured library it never answered for them). The probe pool widened from 4 to 8 —
+  these are Photos-daemon round trips, not CPU work. The progress message now counts
+  resolved work (measured + unavailable), matching the bar it sits under.
 - **Attempted vs untouched, honestly named** — `Measurement` now carries the ids the run
   *attempted* and could not measure (`unavailableIDs`, seeded across a resumed run,
   never persisted — a relaunch retries them). The screen only says "Size unavailable —

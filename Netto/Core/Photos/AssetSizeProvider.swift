@@ -106,26 +106,31 @@ extension Array where Element == PhotoAssetRecord {
 }
 
 /// Exact byte sizes for assets the user is already moving toward review — resolved by an
-/// ordered **probe ladder**: first probe that answers with bytes wins, a probe that proves the
-/// content is not on this device skips the stalling paths below it, and no answers at all is
-/// an honest `.unavailable`. Never downloads, never estimates, never reports zero.
+/// ordered **probe ladder**: first probe that answers with bytes wins; a probe that proves
+/// the content is not on this device **stops the ladder immediately** (one locality probe,
+/// no more); no answers at all is an honest `.unavailable`. Never downloads, never
+/// estimates, never reports zero.
 ///
 /// The ladder, in order (each step receives the asset's localIdentifier and answers
 /// `.measured(bytes)` / `.notLocal` / `.noAnswer`):
 ///
 /// 1. **`requestAVAsset(.current)` → stat** — the exact file size of the version the user
 ///    sees. Network access stays disabled, so a cloud-only video answers nil promptly (the
-///    API's documented behaviour) — recorded as *not local*. An edited video answers with an
-///    `AVComposition`, which carries no file URL — no answer, next step.
+///    API's documented behaviour) — treated as **not local, terminal**: nothing below can
+///    hold local bytes for content PhotoKit just reported as absent. An edited video
+///    answers with an `AVComposition`, which carries no file URL — no answer, next step.
 /// 2. **`requestAVAsset(.original)` → stat** — the pre-iOS 27 answer for edited videos:
 ///    their original file is a real, reclaimable payload even when the render has no URL.
 /// 3. **`PHAssetResource.dataSize` (iOS 27+)** — Photos' own metadata byte count summed over
 ///    `AssetResourceScope`'s counted resources: synchronous, sandbox-independent, and the
-///    answer when every content URL is unreadable. Missing or partial data → no answer.
+///    answer when every content URL is unreadable but the asset is local. (Not consulted
+///    for proven-remote assets — steps 1–2 already stopped the ladder — which on-device
+///    measurements confirmed: dataSize never answers for them, and the extra XPC per cloud
+///    asset dominated scan time on a 7 000-video iCloud-only library.)
 /// 4. **`requestContentEditingInput` → stat** — full-size image URL and paired/AV URL, summed
-///    per `AssetResourceScope` (a Live Photo = still + movie). **Skipped when a previous probe
-///    proved the content is not local**: this callback has been observed to stall indefinitely
-///    for such assets, and the deadline race is a backstop, not the strategy.
+///    per `AssetResourceScope` (a Live Photo = still + movie). Only reached when nothing
+///    above knew the locality; its callback has been observed to stall for remote assets,
+///    and the deadline race is a backstop, not the strategy.
 /// 5. **`requestImageDataAndOrientation` → byte count** — exact image bytes with no file URL
 ///    at all (last resort for non-Live photos; never used for videos).
 ///
@@ -133,15 +138,19 @@ extension Array where Element == PhotoAssetRecord {
 /// pathological PhotoKit answer can delay at most one asset, never a whole pass.
 ///
 /// Limitations, stated rather than hidden:
-/// - An asset whose data lives only in iCloud has no local content URL here, so it ends
-///   unavailable rather than guessed — and is never downloaded to measure.
+/// - An asset whose data lives only in iCloud ends unavailable after the single locality
+///   probe rather than guessed — and is never downloaded to measure.
 /// - An edited asset measured through the original file reports the original's size.
 /// - A genuinely empty file is never reported as a measured zero.
 ///
 /// `probes` is the test seam: scripted id-level closures (defaulting to "no answer") so tests
 /// exercise the ladder and the batching engine without touching PhotoKit.
 struct PhotoKitAssetSizeProvider: AssetSizeProviding {
-    var maxConcurrentResolutions: Int = 4
+    /// XPC-bound probe width (thermal-scaled by `ScanConcurrencyPolicy`): each probe is a
+    /// Photos-daemon round trip, not CPU work, so the pool runs wider than the CPU-bound
+    /// passes. Eight is the measured sweet spot for a cloud-heavy library — the remote
+    /// fast path (one probe per asset) roughly doubles throughput versus the old width.
+    var maxConcurrentResolutions: Int = 8
     /// Per-asset ceiling on a PhotoKit callback (see the type docs). Exceeding it yields an
     /// honest no-answer — never a hang, never zero.
     var callbackDeadlineNanoseconds: UInt64 = 5_000_000_000
@@ -152,8 +161,9 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
     enum ProbeAnswer: Sendable, Equatable {
         /// Exact bytes for content that is (at least partly) on this device.
         case measured(Int64)
-        /// PhotoKit affirmatively reported the content is not available locally (and was not
-        /// allowed to fetch it). The ladder never enters the stalling paths after this.
+        /// PhotoKit could not provide the content locally (network access was disabled).
+        /// **Terminal**: the ladder answers `.unavailable` immediately — a proven-remote
+        /// asset never pays for a second probe.
         case notLocal
         /// This probe has no answer: unsupported kind, no file URL, unreadable, or timed out.
         case noAnswer
@@ -283,27 +293,39 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
         return outcomes
     }
 
-    /// The ladder itself: first measured bytes win; a proven-remote asset never enters the
-    /// stalling editing-input race; silence everywhere is `.unavailable`.
+    /// The ladder itself: first measured bytes win; a proven-remote asset stops right
+    /// there — one locality probe, no original, no metadata fetch, no editing-input race
+    /// (a 7 000-video iCloud-only library resolves at callback speed instead of
+    /// probe-stacking speed); silence everywhere is `.unavailable`.
     static func ladder(for identifier: String, probes: Probes) async -> VideoSizeOutcome {
-        var provenRemote = false
-
-        for probe in [probes.avCurrentBytes, probes.avOriginalBytes] {
-            switch await probe(identifier) {
-            case .measured(let bytes):
-                if bytes > 0 { return .measured(bytes) }
-            case .notLocal:
-                provenRemote = true
-            case .noAnswer:
-                break
-            }
+        // Step 1: the current version's file. A cloud-only video answers nil promptly
+        // with network access disabled — terminal: nothing further down the ladder can
+        // hold local bytes for content PhotoKit just reported as not local.
+        switch await probes.avCurrentBytes(identifier) {
+        case .measured(let bytes):
+            if bytes > 0 { return .measured(bytes) }
+        case .notLocal:
+            return .unavailable
+        case .noAnswer:
+            break
         }
 
+        // Step 2: an edited render is an AVComposition with no file URL (no answer
+        // above) — the original file is the pre-iOS 27 answer for it.
+        switch await probes.avOriginalBytes(identifier) {
+        case .measured(let bytes):
+            if bytes > 0 { return .measured(bytes) }
+        case .notLocal:
+            return .unavailable
+        case .noAnswer:
+            break
+        }
+
+        // Step 3: Photos' own metadata byte count (iOS 27+) — answers where every
+        // content URL is unreadable but the asset is local.
         if case .measured(let bytes) = await probes.resourceBytes(identifier), bytes > 0 {
             return .measured(bytes)
         }
-
-        guard !provenRemote else { return .unavailable }
 
         if case .measured(let bytes) = await probes.editingInputBytes(identifier), bytes > 0 {
             return .measured(bytes)
@@ -343,10 +365,14 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             let options = PHVideoRequestOptions()
             options.isNetworkAccessAllowed = false
             options.version = version
-            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, info in
+            PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
                 guard let avAsset else {
-                    let inCloud = (info?[PHImageResultIsInCloudKey] as? NSNumber)?.boolValue ?? false
-                    deliver(inCloud ? .notLocal : .noAnswer)
+                    // Network access is disabled, so nil means "no local content" —
+                    // terminal for the ladder. The info dictionary's inCloud key is
+                    // corroboration, not a requirement: a key-less nil used to count as
+                    // "no answer", sending thousands of known-remote videos through
+                    // every remaining probe.
+                    deliver(.notLocal)
                     return
                 }
                 guard let urlAsset = avAsset as? AVURLAsset else {
@@ -430,10 +456,11 @@ struct PhotoKitAssetSizeProvider: AssetSizeProviding {
             options.isNetworkAccessAllowed = false
             options.version = .current
             PHImageManager.default()
-                .requestImageDataAndOrientation(for: asset, options: options) { data, _, _, info in
+                .requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
                     guard let data, !data.isEmpty else {
-                        let inCloud = (info?[PHImageResultIsInCloudKey] as? NSNumber)?.boolValue ?? false
-                        deliver(inCloud ? .notLocal : .noAnswer)
+                        // Network access is disabled: nil means no local content
+                        // (same terminal semantics as the AV probes).
+                        deliver(.notLocal)
                         return
                     }
                     deliver(.measured(Int64(data.count)))
