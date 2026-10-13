@@ -559,9 +559,32 @@ Netto/
 NettoWidget/      WidgetKit extension (renders the App Group scan summary only)
 NettoTests/       Unit tests for pure logic (Swift Testing)
 NettoUITests/     XCUITest suites: dashboard layout QA, end-to-end scan validation
+logos/            Approved Netto brand assets (SVG masters, app-icon sources, brand
+                  README with palette/typography/export rules; Plus Jakarta Sans is
+                  used as vector outlines under SIL OFL 1.1, license included)
 project.yml       xcodegen manifest
 ARCHITECTURE.md   Design document: modules, state machines, safety model, validation notes
 ```
+
+## Brand
+
+The two-leaf Netto identity lives in `logos/` (hand-rebuilt SVG masters; the brand
+README there documents the palette, gradient axes, typography and export rules) and is
+wired into the app as:
+
+- **App icon** — `AppIcon.png` is a full-bleed 1024 render of the glass app-icon master,
+  drawn from the exact SVG geometry (base gradient, glow, vignette, sheen, leaf shadows,
+  brand-leaf gradients), flattened RGB with no alpha per the brand README's iOS export
+  rules. Dark and tinted reference renders ship alongside the SVG sources in
+  `logos/Netto-Brand-Assets/`.
+- **In-app mark** — `NettoLogo` and the variant imagesets (light/dark/green symbol,
+  horizontal/stacked/tagline lockups, wordmark) are the SVG masters, so every surface
+  renders the same approved vectors at any size.
+- **Vector symbol + motion** — `NettoBrandSymbol` draws the two leaves as live geometry
+  (exact path data and gradient axes) with the brand's motion: a staggered leaf reveal on
+  appear and a slow idle drift, both collapsing to simple fades under Reduce Motion. The
+  dashboard header and the design-system gallery use it; the gallery shows every style,
+  lockup, and the motion controls.
 
 ## Testing & verification
 

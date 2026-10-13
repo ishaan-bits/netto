@@ -1,0 +1,12 @@
+{
+  "images" : [
+    {
+      "filename" : "netto-wordmark.svg",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

@@ -4,7 +4,7 @@ import SwiftUI
 struct DesignSystemGallery: View {
     @State private var appearToken = 0
     @State private var selected = false
-    @State private var logoActive = false
+    @State private var logoIdle = false
     @State private var logoToken = 0
 
     var body: some View {
@@ -235,8 +235,10 @@ struct DesignSystemGallery: View {
         }
     }
 
+    @ViewBuilder
     private var logoSection: some View {
-        Section("Logo") {
+        Section("Brand · symbol") {
+            // The approved two-leaf mark, asset and vector, in every brand style.
             HStack(spacing: NettoLayout.Spacing.lg) {
                 NettoLogo().frame(width: 24)
                 NettoLogo().frame(width: 32)
@@ -247,14 +249,26 @@ struct DesignSystemGallery: View {
             .padding(.vertical, NettoLayout.Spacing.md)
 
             HStack(spacing: NettoLayout.Spacing.lg) {
-                NettoLogo()
-                    .frame(width: 96)
-                    .nettoLogoActivity(logoActive)
+                NettoBrandSymbol().frame(width: 48, height: 48)
+                NettoBrandSymbol(style: .green).frame(width: 48, height: 48)
+                NettoBrandSymbol(style: .dark).frame(width: 48, height: 48)
+                NettoBrandSymbol(style: .luminous)
+                    .frame(width: 48, height: 48)
+                    .padding(NettoLayout.Spacing.xs)
+                    .background(NettoBrandPalette.inkDark, in: RoundedRectangle(cornerRadius: 8))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, NettoLayout.Spacing.md)
+
+            HStack(spacing: NettoLayout.Spacing.lg) {
+                NettoBrandSymbol(animateIdle: logoIdle)
+                    .frame(width: 96, height: 96)
                     .id(logoToken)
                 Spacer()
                 VStack(spacing: NettoLayout.Spacing.sm) {
-                    Button(logoActive ? "Stop activity" : "Start activity") {
-                        logoActive.toggle()
+                    Button(logoIdle ? "Stop motion" : "Start motion") {
+                        logoIdle.toggle()
+                        logoToken += 1
                     }
                     .buttonStyle(NettoSecondaryButtonStyle())
                     Button("Replay reveal") {
@@ -263,6 +277,49 @@ struct DesignSystemGallery: View {
                     .buttonStyle(NettoSecondaryButtonStyle())
                 }
             }
+            Text("Vector symbol: staggered leaf reveal on appear, slow idle drift — both collapse to simple fades under Reduce Motion.")
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textTertiary)
+        }
+
+        Section("Brand · lockups") {
+            VStack(alignment: .leading, spacing: NettoLayout.Spacing.md) {
+                Image("NettoLogoHorizontal")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: 44)
+                Image("NettoLogoStacked")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: 96)
+                Image("NettoLogoTagline")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: 110)
+                Image("NettoWordmark")
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: 28)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, NettoLayout.Spacing.md)
+            Text("Horizontal (headers, bars), stacked (splash-scale placements), stacked + tagline (brand sheets), and the outlined wordmark. Plus Jakarta Sans is used as outlines only (SIL OFL 1.1).")
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textTertiary)
+        }
+
+        Section("Brand · app icon") {
+            HStack(spacing: NettoLayout.Spacing.lg) {
+                Image(uiImage: UIImage(named: "AppIcon") ?? UIImage())
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 64, height: 64)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                Spacer()
+            }
+            Text("The AppIcon asset is rendered from the brand SVG geometry (glass variant, full-bleed). Dark and tinted reference renders ship in logos/Netto-Brand-Assets — see the brand README for iOS export notes.")
+                .font(NettoType.caption)
+                .foregroundStyle(NettoColor.textTertiary)
         }
     }
 }

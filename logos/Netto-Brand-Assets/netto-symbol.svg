@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Netto symbol">
+  <title>Netto symbol</title>
+  <defs>
+    <linearGradient id="netto-grad-left" gradientUnits="userSpaceOnUse" x1="110" y1="100" x2="320" y2="432">
+      <stop offset="0" stop-color="#A3D29A"/>
+      <stop offset="0.42" stop-color="#6DB283"/>
+      <stop offset="0.78" stop-color="#3B896A"/>
+      <stop offset="1" stop-color="#1F6756"/>
+    </linearGradient>
+    <linearGradient id="netto-grad-right" gradientUnits="userSpaceOnUse" x1="392" y1="84" x2="410" y2="388">
+      <stop offset="0" stop-color="#CDEAA1"/>
+      <stop offset="0.35" stop-color="#9CCB86"/>
+      <stop offset="0.7" stop-color="#5DAE88"/>
+      <stop offset="1" stop-color="#2F8466"/>
+    </linearGradient>
+  </defs>
+  <g>
+    <path id="netto-leaf-left" fill="url(#netto-grad-left)" d="M 101.0 131.7 Q 101.0 105.3 117.1 115.1 C 204.0 171.9 334.2 312.2 334.2 382.5 L 334.2 400.1 C 334.2 417.7 321.0 428.7 294.6 428.7 C 193.4 426.5 101.0 356.1 101.0 268.1 Z"/>
+    <path id="netto-leaf-right" fill="url(#netto-grad-right)" d="M 411.2 369.3 L 411.2 105.3 Q 411.2 83.3 389.2 83.3 C 321.0 83.3 270.4 127.3 270.4 184.5 C 270.4 228.5 321.0 294.5 404.6 380.3 Q 411.2 384.7 411.2 369.3 Z"/>
+  </g>
+</svg>

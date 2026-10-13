@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Netto symbol, solid green">
+  <title>Netto symbol, solid green</title>
+  <g>
+    <path id="netto-leaf-left" fill="#1F7A55" d="M 101.0 131.7 Q 101.0 105.3 117.1 115.1 C 204.0 171.9 334.2 312.2 334.2 382.5 L 334.2 400.1 C 334.2 417.7 321.0 428.7 294.6 428.7 C 193.4 426.5 101.0 356.1 101.0 268.1 Z"/>
+    <path id="netto-leaf-right" fill="#1F7A55" d="M 411.2 369.3 L 411.2 105.3 Q 411.2 83.3 389.2 83.3 C 321.0 83.3 270.4 127.3 270.4 184.5 C 270.4 228.5 321.0 294.5 404.6 380.3 Q 411.2 384.7 411.2 369.3 Z"/>
+  </g>
+</svg>

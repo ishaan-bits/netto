@@ -65,7 +65,9 @@ struct DashboardView: View {
 
     private var header: some View {
         HStack(spacing: NettoLayout.Spacing.sm) {
-            NettoLogo()
+            // The brand's two-leaf symbol as live vector geometry: it assembles on appear
+            // (staggered leaf reveal) and drifts gently while the dashboard is up.
+            NettoBrandSymbol(animateIdle: true)
                 .frame(width: 26, height: 26)
                 .accessibilityHidden(true)
             Text("Netto")
