@@ -7,11 +7,6 @@ import SwiftUI
 /// view stores nothing itself except the currently open detail sheet. There is no deletion or
 /// mutation API anywhere in this file — the only writes are selection changes.
 struct SimilarPhotosView: View {
-    /// Presentation-only (set by the Duplicate Images destination): drives the nav title and
-    /// a11y ID so the same engine serves both hubs without a renamed duplicate screen. It never
-    /// changes selection, review, or the result — exact groups are first-class in the analysis.
-    var highlightExactDuplicates: Bool = false
-
     @Environment(AppEnvironment.self) private var env: AppEnvironment
     @State private var detailTarget: DetailTarget?
 
@@ -33,7 +28,7 @@ struct SimilarPhotosView: View {
     var body: some View {
         content
             .background(NettoColor.background.ignoresSafeArea())
-            .navigationTitle(highlightExactDuplicates ? "Duplicate Images" : "Similar Photos")
+            .navigationTitle("Similar Photos")
             .nettoAppear()
             .nettoStateTransition(phaseID)
             .onAppear { env.refreshPermissions() }
@@ -216,16 +211,13 @@ struct SimilarPhotosView: View {
                 summaryHeader(result, summary: summary)
             }
 
-            if !result.exactGroups.isEmpty {
-                Section("Exact Duplicates") {
+            if !result.exactGroups.isEmpty || !result.similarGroups.isEmpty {
+                // One section for both group kinds, exact-duplicates first — the group row
+                // already says whether a group is "N identical copies" or "N similar photos".
+                Section("Groups") {
                     ForEach(result.exactGroups) { group in
                         groupRow(group)
                     }
-                }
-            }
-
-            if !result.similarGroups.isEmpty {
-                Section("Similar Photos") {
                     ForEach(result.similarGroups) { group in
                         groupRow(group)
                     }
@@ -334,7 +326,7 @@ struct SimilarPhotosView: View {
             }
             PhaseMessage(
                 systemImage: "checkmark.seal",
-                title: "No duplicates found",
+                title: "No groups found",
                 message: SimilarPhotosPresentation.noDuplicatesMessage(result: result),
                 buttonTitle: "Analyze Again"
             ) {

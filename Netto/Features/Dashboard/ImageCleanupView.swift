@@ -1,10 +1,11 @@
 import SwiftUI
 
-/// The Image Cleanup hub — one screen grouping the four photo destinations.
+/// The Image Cleanup hub — one screen grouping the photo destinations.
 ///
-/// It launches no analysis on appear. The similar/exact pass is the single existing engine
-/// behind both Duplicate Images and Similar Images; Blurry Images and Old Screenshots are
-/// independent. Every row reports the honest status of the feature it opens.
+/// It launches no analysis on appear. The similarity pass is the single engine behind
+/// Similar Images, which lists both byte-identical duplicates and visually alike shots
+/// in one screen; Blurry Images and Old Screenshots are independent. Every row reports
+/// the honest status of the feature it opens.
 struct ImageCleanupView: View {
     @Environment(AppEnvironment.self) private var env: AppEnvironment
 
@@ -37,12 +38,10 @@ struct ImageCleanupView: View {
                     accessibilityIdentifier: destination.accessibilityIdentifier
                 ) {
                     switch destination {
-                    case .duplicateImages:
-                        // Same engine and screen as Similar Images: exact-duplicate groups
-                        // are a first-class section of the Similar Photos result, never a
-                        // renamed stand-in. Opening this destination does not start a run.
-                        SimilarPhotosView(highlightExactDuplicates: true)
                     case .similarImages:
+                        // One screen for both group kinds: exact-duplicate groups and
+                        // visually similar groups share one list, ordered exact-first.
+                        // Opening this destination does not start a run.
                         SimilarPhotosView()
                     case .blurryImages:
                         PotentiallyBlurryView()

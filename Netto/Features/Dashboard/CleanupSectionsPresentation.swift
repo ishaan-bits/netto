@@ -129,10 +129,10 @@ struct VideoSourceSummary: Equatable, Sendable {
 
 // MARK: - Image Cleanup hub
 
-/// The four destinations of the Image Cleanup hub, in the order they are shown, with the
-/// status each row reports from real app state.
+/// The destinations of the Image Cleanup hub, in the order they are shown, with the
+/// status each row reports from real app state. Exact-duplicate groups and visually
+/// similar groups both live under Similar Images — one row, one screen, one list.
 enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
-    case duplicateImages = "Duplicate Images"
     case similarImages = "Similar Images"
     case blurryImages = "Blurry Images"
     case oldScreenshots = "Old Screenshots"
@@ -141,7 +141,6 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
 
     var icon: String {
         switch self {
-        case .duplicateImages: return "doc.on.doc"
         case .similarImages: return "photo.on.rectangle.angled"
         case .blurryImages: return "camera.metering.unknown"
         case .oldScreenshots: return "clock.badge.questionmark"
@@ -150,7 +149,6 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
 
     var accessibilityIdentifier: String {
         switch self {
-        case .duplicateImages: return "duplicateImagesRow"
         case .similarImages: return "similarImagesRow"
         case .blurryImages: return "blurryImagesRow"
         case .oldScreenshots: return "oldScreenshotsRow"
@@ -160,10 +158,8 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
     /// What the destination is for, in one short line shown under its title.
     var subtitle: String {
         switch self {
-        case .duplicateImages:
-            return "Byte-identical copies, found by content hash"
         case .similarImages:
-            return "Looks-like-the-same-shot groups"
+            return "Identical copies and visually alike shots"
         case .blurryImages:
             return "Photos flagged for soft focus or shake"
         case .oldScreenshots:
@@ -189,26 +185,26 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
         )
         switch phase {
         case .permissionRequired, .permissionDenied:
-            return "Duplicate and similar groups come from one on-device analysis pass. Duplicate Images are byte-identical copies found by content hash; Similar Images are visually alike shots. Neither is ever deleted automatically."
+            return "Duplicate and similar groups come from one on-device analysis pass, both listed under Similar Images — byte-identical copies found by content hash, and visually alike shots. Neither is ever deleted automatically."
         case .idle, .cancelled, .failed:
-            return "Duplicate and similar groups come from one on-device analysis pass, run only when you start it. Duplicate Images are byte-identical copies found by content hash; Similar Images are visually alike shots."
+            return "Duplicate and similar groups come from one on-device analysis pass, run only when you start it — both listed under Similar Images: byte-identical copies and visually alike shots."
         case .buildingCatalog:
-            return "Reading your library on this iPhone. Duplicate Images will list byte-identical copies; Similar Images will list visually alike shots. Nothing is deleted automatically."
+            return "Reading your library on this iPhone. Similar Images will list byte-identical copies and visually alike shots together. Nothing is deleted automatically."
         case .analyzing:
             let summary = analysisSummary(analysis)
-            return "Analyzing on this iPhone — \(summary.exactGroupCount) exact \(summary.exactGroupCount == 1 ? "group" : "groups") and \(summary.similarGroupCount) similar \(summary.similarGroupCount == 1 ? "group" : "groups") so far. Duplicate Images are byte-identical; Similar Images are visually alike."
+            return "Analyzing on this iPhone — \(summary.exactGroupCount) exact \(summary.exactGroupCount == 1 ? "group" : "groups") and \(summary.similarGroupCount) similar \(summary.similarGroupCount == 1 ? "group" : "groups") so far, all reported under Similar Images."
         case .paused:
-            return "The analysis is paused. Duplicate Images and Similar Images will fill in when it finishes. Nothing is deleted automatically."
+            return "The analysis is paused. Similar Images will fill in with duplicate and similar groups when it finishes. Nothing is deleted automatically."
         case .queuedBehindBlur:
-            return "The analysis is queued and starts when the sharpness check finishes. Duplicate Images are byte-identical copies; Similar Images are visually alike shots."
+            return "The analysis is queued and starts when the sharpness check finishes. Similar Images will list byte-identical copies and visually alike shots."
         case .emptyLibrary:
             return "No photos are visible to Netto, so there is nothing to compare."
         case .results:
             let summary = analysisSummary(analysis)
             if summary.exactGroupCount == 0 && summary.similarGroupCount == 0 {
-                return "The analysis finished and found no duplicate or similar groups. Duplicate Images would list byte-identical copies; Similar Images would list visually alike shots."
+                return "The analysis finished and found no duplicate or similar groups — Similar Images would list byte-identical copies and visually alike shots."
             }
-            return "Duplicate Images lists \(summary.exactGroupCount) byte-identical \(summary.exactGroupCount == 1 ? "group" : "groups"); Similar Images lists \(summary.similarGroupCount) visually alike \(summary.similarGroupCount == 1 ? "group" : "groups"). Blurry Images and Old Screenshots are independent of this pass."
+            return "Similar Images lists \(summary.exactGroupCount) byte-identical \(summary.exactGroupCount == 1 ? "group" : "groups") and \(summary.similarGroupCount) visually alike \(summary.similarGroupCount == 1 ? "group" : "groups"). Blurry Images and Old Screenshots are independent of this pass."
         }
     }
 
@@ -220,8 +216,8 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
     }
 
     /// The destination's row status from the real analysis/scan state it reports on.
-    /// Duplicate Images are part of the same pass as Similar Images — one analysis run,
-    /// two group kinds — so it reports the same honest phase, never a fabricated count.
+    /// Similar Images covers both group kinds — one analysis run, exact and near groups
+    /// reported together — so it shows the same honest phase, never a fabricated count.
     static func status(
         for destination: ImageCleanupDestination,
         permission: PermissionState,
@@ -230,15 +226,14 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
         blur: BlurAnalysisState,
         pendingBehindOtherPass: Bool
     ) -> CleanupDestinationStatus {
-        let similarPhase = SimilarPhotosPresentation.phase(
-            permission: permission,
-            catalog: catalog,
-            analysis: analysis,
-            pendingBehindOtherPass: pendingBehindOtherPass
-        )
         switch destination {
-        case .duplicateImages, .similarImages:
-            return similarityStatus(phase: similarPhase, destination: destination)
+        case .similarImages:
+            return similarityStatus(phase: SimilarPhotosPresentation.phase(
+                permission: permission,
+                catalog: catalog,
+                analysis: analysis,
+                pendingBehindOtherPass: pendingBehindOtherPass
+            ))
         case .blurryImages:
             return blurStatus(phase: PotentiallyBlurryPresentation.phase(
                 permission: permission,
@@ -254,13 +249,12 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
         }
     }
 
-    /// The similarity pass reports one honest status for both of its group kinds —
-    /// exact duplicates are a subset of the same analysis result, never a separate run.
+    /// The similarity pass reports one honest status for Similar Images — exact
+    /// duplicates and visually similar groups are both part of the same analysis result,
+    /// never a separate run, so the row counts them together.
     private static func similarityStatus(
-        phase: SimilarPhotosPhase,
-        destination: ImageCleanupDestination
+        phase: SimilarPhotosPhase
     ) -> CleanupDestinationStatus {
-        let noun = destination == .duplicateImages ? "duplicate groups" : "groups"
         switch phase {
         case .permissionRequired:
             return .unavailable(reason: "Allow Photos access to continue.")
@@ -287,11 +281,9 @@ enum ImageCleanupDestination: String, CaseIterable, Sendable, Equatable {
             return .failed(message)
         case .results(let result):
             let summary = SimilarPhotosSummary(result: result)
-            let count = destination == .duplicateImages
-                ? summary.exactGroupCount
-                : summary.exactGroupCount + summary.similarGroupCount
+            let count = summary.exactGroupCount + summary.similarGroupCount
             if count == 0 {
-                return .empty("No \(noun) found")
+                return .empty("No groups found")
             }
             return .count(count)
         }
@@ -483,7 +475,7 @@ enum DashboardCleanupSection: String, CaseIterable, Sendable, Equatable {
     var subtitle: String {
         switch self {
         case .imageCleanup:
-            return "Duplicates, similar shots, blur, old screenshots"
+            return "Duplicate & similar shots, blur, old screenshots"
         case .videoCleanup:
             return "All your videos, largest first"
         case .duplicateContacts:
