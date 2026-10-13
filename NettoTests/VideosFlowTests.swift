@@ -539,7 +539,7 @@ struct VideosFlowTests {
                 datasetSignature: signature,
                 bytes: ["video-03": 1_600_000_000],
                 total: VideosFixture.videos.count,
-                unavailableCount: 2
+                unavailableIDs: ["video-04", "video-05"]
             )
         )
         let measuringRecords = env.videoRecordsForDisplay
@@ -728,12 +728,12 @@ struct VideosFlowTests {
         #expect(env.videoSizeResolution == .idle)
     }
 
-    // MARK: Scan-job coordination (Phase B)
+    // MARK: Scan-job coordination
 
-    /// Video sizing is nonessential detail work: while a heavy pass owns the pipeline and
-    /// the cores, both entry points refuse the measurement outright — not queued, not
-    /// half-started.
-    @Test func measurementWaitsWhileAHeavyPassIsRunning() {
+    /// Video sizing is I/O-bound over bounded batches: it runs *alongside* heavy passes —
+    /// both entry points start it outright (previously both refused while a pass ran,
+    /// which starved the Video Cleanup screen forever under chained passes).
+    @Test func measurementRunsAlongsideAHeavyPass() async {
         let withSimilarity = makeVideoEnv().env
         withSimilarity.analysisState = .running(PhotoAnalysisProgress(
             stage: .preparing,
@@ -742,7 +742,7 @@ struct VideosFlowTests {
         ))
         withSimilarity.startVideoSizeResolution()
         withSimilarity.resumeVideoSizeMeasurement()
-        #expect(withSimilarity.videoSizeResolution == .idle)
+        #expect(withSimilarity.videoSizeResolution.isMeasuring)
 
         let withBlur = makeVideoEnv().env
         withBlur.blurAnalysisState = .running(BlurAnalysisProgress(
@@ -751,12 +751,17 @@ struct VideosFlowTests {
         ))
         withBlur.startVideoSizeResolution()
         withBlur.resumeVideoSizeMeasurement()
-        #expect(withBlur.videoSizeResolution == .idle)
+        #expect(withBlur.videoSizeResolution.isMeasuring)
+
+        await waitForSettled(withSimilarity)
+        #expect(isSettled(withSimilarity.videoSizeResolution))
+        await waitForSettled(withBlur)
+        #expect(isSettled(withBlur.videoSizeResolution))
     }
 
-    /// The view observes each pass's `isRunning` flag flipping to false and issues the
-    /// resume — the kept progress continues from where the yield left it.
-    @Test func measurementStartsOnceThePassFinishes() async {
+    /// The measurement settles while the pass is *still* running — it no longer waits for
+    /// a terminal flip that a chained pass never reached.
+    @Test func measurementDoesNotWaitForAPassToFinish() async {
         let env = makeVideoEnv().env
         env.analysisState = .running(PhotoAnalysisProgress(
             stage: .preparing,
@@ -764,18 +769,17 @@ struct VideosFlowTests {
             totalUnits: 10
         ))
         env.startVideoSizeResolution()
-        #expect(env.videoSizeResolution == .idle) // refused while the pass runs
-
-        env.analysisState = .completed(Fixtures.analysisResult) // the pass finished
-        env.resumeVideoSizeMeasurement() // VideosView's onChange observer
+        #expect(env.videoSizeResolution.isMeasuring)
 
         await waitForSettled(env)
         #expect(isSettled(env.videoSizeResolution))
+        #expect(env.analysisState.isRunning) // the pass never finished during this test
     }
 
-    /// Starting similarity yields an in-flight measurement: the partial progress is kept as
-    /// a settled state (never discarded) and the run owns the pipeline from here.
-    @Test func startingSimilarityYieldsAnInFlightMeasurement() async {
+    /// Starting similarity does not cancel or yield an in-flight measurement: it keeps
+    /// filling its batches and settles on its own (previously every pass start cancelled
+    /// the run and left its partial progress parked).
+    @Test func startingSimilarityKeepsAnInFlightMeasurementRunning() async {
         let provider = RecordingSizeProvider(
             sizes: VideosFixture.measuredBytes,
             delayNanoseconds: 80_000_000
@@ -786,12 +790,14 @@ struct VideosFlowTests {
 
         env.startSimilarityAnalysis()
 
-        #expect(!env.videoSizeResolution.isMeasuring)
+        #expect(env.videoSizeResolution.isMeasuring) // not cancelled, not settled by the pass
+        await waitForSettled(env)
         guard case .settled(let measurement) = env.videoSizeResolution else {
-            Issue.record("expected a settled partial measurement, got \(env.videoSizeResolution)")
+            Issue.record("expected a settled measurement, got \(env.videoSizeResolution)")
             return
         }
         #expect(measurement.total > 0)
+        #expect(measurement.measuredCount == VideosFixture.measuredBytes.count)
         env.cancelSimilarityAnalysis()
     }
 
@@ -1389,6 +1395,193 @@ struct VideoSizeDeadlineTests {
         #expect(value == nil)
         // Let the late callback land, proving it neither crashed nor double-resumed.
         try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+}
+
+// MARK: - Video size ladder (probe order, honesty, short-circuiting)
+
+/// The rewritten measurement ladder: first measured bytes win, proven-remote content never
+/// enters the stalling editing-input race, zero is never a size, and every identifier
+/// resolves to exactly one honest outcome. Probes are scripted closures — no PhotoKit,
+/// no photo library, fully deterministic.
+struct VideoSizeLadderTests {
+    /// Append-only step recorder for asserting probe order (probe closures are
+    /// `@Sendable`, so the shared log locks).
+    private final class StepLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [String] = []
+
+        func append(_ step: String) {
+            lock.lock()
+            storage.append(step)
+            lock.unlock()
+        }
+
+        var steps: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
+
+    @Test func firstMeasuredProbeWinsAndLaterProbesNeverRun() async {
+        let log = StepLog()
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { id in
+                log.append("avCurrent(\(id))")
+                return .measured(111)
+            },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .measured(999) },
+            resourceBytes: { _ in log.append("resource"); return .measured(999) },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) },
+            imageDataBytes: { _ in log.append("imageData"); return .measured(999) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .measured(111))
+        #expect(log.steps == ["avCurrent(video-1)"])
+    }
+
+    @Test func anEditedVideoFallsThroughToTheOriginalFile() async {
+        // `.current` renders an edited video as an AVComposition (no file URL → no answer);
+        // `.original` is the pre-iOS 27 answer and carries the file.
+        let log = StepLog()
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .measured(500) },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .measured(500))
+        #expect(log.steps == ["avCurrent", "avOriginal"])
+    }
+
+    @Test func unreadableContentURLsFallThroughToThePhotosMetadataCount() async {
+        // Neither AV URL is stat-able (sandbox, composition): Photos' own dataSize answers,
+        // and the editing-input race is never entered.
+        let log = StepLog()
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .noAnswer },
+            resourceBytes: { _ in log.append("resource"); return .measured(4_242) },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(999) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .measured(4_242))
+        #expect(log.steps == ["avCurrent", "avOriginal", "resource"])
+    }
+
+    @Test func aProvenRemoteVideoNeverEntersTheStallingEditingInputRace() async {
+        // PhotoKit affirmatively said "not local": the ladder skips the callback that has
+        // been observed to stall indefinitely for such assets — and answers unavailable,
+        // never a fabricated size.
+        let log = StepLog()
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { _ in log.append("avCurrent"); return .notLocal },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .noAnswer },
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
+            editingInputBytes: { _ in log.append("editingInput"); return .measured(7) },
+            imageDataBytes: { _ in log.append("imageData"); return .measured(7) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .unavailable)
+        #expect(log.steps == ["avCurrent", "avOriginal", "resource"])
+    }
+
+    @Test func thePhotoMetadataCountStillAnswersForARemoteAsset() async {
+        // data is only in iCloud, but Photos already knows its byte count: metadata is
+        // not a download, so it may answer where no local URL exists.
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { _ in .notLocal },
+            avOriginalBytes: { _ in .notLocal },
+            resourceBytes: { _ in .measured(8_888) },
+            editingInputBytes: { _ in .measured(1) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .measured(8_888))
+    }
+
+    @Test func imageBytesAreTheLastResortWhenEveryFileAnswerIsSilent() async {
+        let log = StepLog()
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { _ in log.append("avCurrent"); return .noAnswer },
+            avOriginalBytes: { _ in log.append("avOriginal"); return .noAnswer },
+            resourceBytes: { _ in log.append("resource"); return .noAnswer },
+            editingInputBytes: { _ in log.append("editingInput"); return .noAnswer },
+            imageDataBytes: { _ in log.append("imageData"); return .measured(12_345) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "photo-1", probes: probes)
+
+        #expect(outcome == .measured(12_345))
+        #expect(
+            log.steps == ["avCurrent", "avOriginal", "resource", "editingInput", "imageData"]
+        )
+    }
+
+    @Test func aMeasuredZeroIsNeverReportedAsASize() async {
+        // A genuinely empty file is not a measurement — silence everywhere is honest.
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { _ in .measured(0) },
+            avOriginalBytes: { _ in .measured(0) },
+            resourceBytes: { _ in .measured(0) },
+            editingInputBytes: { _ in .measured(0) },
+            imageDataBytes: { _ in .measured(0) }
+        )
+
+        let outcome = await PhotoKitAssetSizeProvider.ladder(for: "video-1", probes: probes)
+
+        #expect(outcome == .unavailable)
+    }
+
+    @Test func everyRequestedIdentifierResolvesToExactlyOneOutcome() async {
+        // Default probes answer nothing: every id must still appear — as unavailable,
+        // never missing (the class of bug that left the screen at "0 of N").
+        let provider = PhotoKitAssetSizeProvider(probes: .init())
+        let ids = (0..<9).map { "id-\($0)" } // more than one batch at the default width
+
+        let outcomes = await provider.outcomes(for: ids)
+
+        #expect(Set(outcomes.keys) == Set(ids))
+        for id in ids {
+            #expect(outcomes[id] == .unavailable)
+        }
+        #expect(await provider.outcomes(for: []).isEmpty) // no work, no entries
+    }
+
+    @Test func mixedProbeAnswersPartitionTheBatchIntoMeasuredAndUnavailable() async {
+        let probes = PhotoKitAssetSizeProvider.Probes(
+            avCurrentBytes: { id in
+                id == "local-1" ? .measured(100) : .notLocal
+            }
+        )
+        let provider = PhotoKitAssetSizeProvider(probes: probes)
+
+        let outcomes = await provider.outcomes(for: ["local-1", "cloud-2", "cloud-3"])
+
+        #expect(outcomes["local-1"] == .measured(100))
+        #expect(outcomes["cloud-2"] == .unavailable)
+        #expect(outcomes["cloud-3"] == .unavailable)
+        #expect(outcomes.count == 3)
+    }
+
+    @Test func sizesOnlyReportMeasuredEntries() async {
+        let provider = PhotoKitAssetSizeProvider(
+            probes: .init(avCurrentBytes: { $0 == "x" ? .measured(50) : .noAnswer })
+        )
+
+        let sizes = await provider.sizes(for: ["x", "y"])
+
+        #expect(sizes == ["x": 50]) // absent means unknown — never 0
     }
 }
 

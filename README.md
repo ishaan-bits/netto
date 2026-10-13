@@ -145,9 +145,11 @@ Scans of tens of thousands of assets additionally run under four load-shaping ru
   floor 1), and critical pressure pauses batch workers until it eases. Each pool floors
   at 1, so progress continues at every level.
 - **One heavy pass at a time** — a similarity run or sharpness pass owns the analysis
-  pipeline: the other refuses to start, video-size measurement refuses to start (and an
-  in-flight measurement yields, keeping its partial progress as a settled snapshot), and
-  both the similarity and sharpness `isRunning` flags falling to false resume it.
+  pipeline: the other refuses to start, and both the similarity and sharpness `isRunning`
+  flags falling to false drive the M10 queue. Video-size measurement is deliberately *not*
+  part of this exclusivity: it is I/O-bound over its own bounded, thermal-aware batches
+  and runs alongside passes (it used to refuse to start — and every pass start used to
+  cancel an in-flight run — which starved the Video Cleanup screen forever; see M16).
   Catalog building and similarity analysis remain mutually exclusive as before.
 
 ### Interrupted-run resilience (Phase C)
@@ -501,6 +503,48 @@ runs that queued behind each other, so a scan only ever advanced one of them.
   the sharpness row keeps reporting real counted progress). No wall-clock figure is
   claimed for a physical device; the Simulator end-to-end validation is the only timing
   evidence, and it is not representative of device performance.
+
+### Video Cleanup: measurement that actually runs (M16)
+
+On a real device the Video Cleanup screen showed "0 bytes measured · 7,113 size
+unavailable" for every video, with no progress panel ever appearing — while several
+gigabytes sat on the phone. Root cause, proven in code and in a captured recording:
+video-size measurement was *refused* while any analysis pass ran and *cancelled* by every
+pass start (`prepareSimilarityRun`/`prepareBlurRun`), and only a visible screen's
+observer restarted it — so a chain of passes (fingerprinting → blur, M10's queue) kept
+it parked at `.idle` forever, and the summary line still claimed a measurement that
+never ran.
+
+- **Measurement coexists with analysis passes** — the two analysis-state guards in
+  `resumeVideoSizeMeasurement` and the cancels in both prepare functions are gone:
+  sizing is I/O-bound over its own bounded, thermal-aware batches, so it runs
+  alongside a pass instead of being starved by one. Cancelled only by the user
+  (Rescan, the progress panel), backgrounding, dataset change, and deletion.
+- **An ordered probe ladder replaces the single-path provider** —
+  `PhotoKitAssetSizeProvider` now asks five probes in order, first answer wins, every
+  step deadline-bounded, network access disabled everywhere (nothing is ever downloaded
+  to measure): `requestAVAsset(.current)` → stat; `requestAVAsset(.original)` → stat
+  (the edited-video answer); `PHAssetResource.dataSize` (iOS 27+ Photos metadata —
+  synchronous and sandbox-independent); `requestContentEditingInput` → stat —
+  *skipped when a probe already proved the content is remote*, because that callback has
+  been observed to stall for such assets (the deadline is a backstop, not the strategy);
+  and `requestImageDataAndOrientation` → byte count for photos with no file URL at all.
+  A measured zero is never a size; a genuinely empty file ends `.unavailable`. Probes are
+  injectable (`Probes`), so the ladder and the batching engine are tested with scripted
+  answers and no PhotoKit. Validated end-to-end on the iOS 27 simulator's seeded library
+  (3/3 videos and a photo measured, including through the Photos-metadata path).
+- **Attempted vs untouched, honestly named** — `Measurement` now carries the ids the run
+  *attempted* and could not measure (`unavailableIDs`, seeded across a resumed run,
+  never persisted — a relaunch retries them). The screen only says "Size unavailable —
+  not stored locally" (warning) for those; a row nothing has tried yet says "Size not
+  measured yet". The unknowns' section says "Sizes not measured yet" until a failure is
+  proven, then "iCloud / size unavailable"; the summary line says "sizes not measured
+  yet" instead of the old fabricated "0 bytes measured · N size unavailable"; and the
+  dashboard status line splits "unavailable" from still-"pending" sizes.
+- **The yield tests inverted** — the three tests that *encoded* the starvation (measurement
+  refused while a pass runs; started only after a terminal flip; cancelled by a pass
+  start) now assert the opposite: measurement runs alongside a pass, settles while a
+  pass is still running, and keeps filling when similarity starts.
 
 ## Privacy
 

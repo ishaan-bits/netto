@@ -6,9 +6,10 @@ import SwiftUI
 /// - **Measured first.** Videos whose exact local file size is known are listed largest
 ///   first. Sizes come only from the shared size provider: nothing is inferred from
 ///   dimensions, duration, thumbnails, or any fabricated estimate.
-/// - **Size unavailable below.** A video whose bytes could not be measured locally (it
-///   has no file on this iPhone — typically it lives in iCloud) is listed in its own
-///   clearly-labelled section after every measured video — never ranked as zero.
+/// - **Unknowns below, honestly labelled.** Videos whose size is unknown are listed after
+///   every measured video — never ranked as zero. The section says "Sizes not measured yet"
+///   until an attempt has actually failed, then "iCloud / size unavailable" for the ids the
+///   run tried and could not measure — a row never claims a failure it has not earned.
 /// - **Scans automatically, keeps its results.** Measurement starts when the screen
 ///   appears and continues from whatever is already measured — opening the screen never
 ///   re-measures known sizes, and the completed sizes are persisted (checkpoint) so they
@@ -64,9 +65,9 @@ struct VideoCleanupView: View {
             .onChange(of: env.photoPermissionState) { _, _ in
                 env.startVideoSizeResolution()
             }
-            // Measurement yields to a heavy pass and resumes when it finishes — kept
-            // honest here so a scan finishing while this screen is open restarts the
-            // measurement without any user action.
+            // Belt-and-braces: measurement no longer yields to analysis passes (it runs
+            // alongside them), but if it was ever left paused, a pass finishing restarts
+            // it without any user action.
             .onChange(of: env.analysisState.isRunning) { _, running in
                 if !running { env.resumeVideoSizeMeasurement() }
             }
@@ -186,6 +187,12 @@ struct VideoCleanupView: View {
         // order — the counts all come from the same list.
         let known = records.filter(\.isSizeKnown)
         let unknown = records.filter { !$0.isSizeKnown }
+        // Which unknowns were actually *attempted* (this dataset's failures) — unknowns
+        // nothing has tried yet claim "not measured", never "unavailable".
+        let attemptedIDs = env.videoSizeResolution.isCurrent(for: env.videoDatasetSignature)
+            ? env.videoSizeResolution.measurement?.unavailableIDs ?? []
+            : []
+        let attemptedCount = unknown.filter { attemptedIDs.contains($0.localIdentifier) }.count
         return ScrollView {
             VStack(alignment: .leading, spacing: NettoLayout.Spacing.lg) {
                 if VideosPresentation.showsLimitedAccessNotice(permission: env.photoPermissionState) {
@@ -207,11 +214,17 @@ struct VideoCleanupView: View {
                 }
 
                 if !known.isEmpty {
-                    section("Largest first", records: known, unknownSize: false)
+                    section("Largest first", records: known, attemptedIDs: [])
                 }
                 if !unknown.isEmpty {
-                    section("iCloud / size unavailable", records: unknown, unknownSize: true)
-                    cloudNote
+                    section(
+                        VideosPresentation.videoUnknownSectionTitle(attempted: attemptedCount),
+                        records: unknown,
+                        attemptedIDs: attemptedIDs
+                    )
+                    if attemptedCount > 0 {
+                        cloudNote
+                    }
                 }
             }
             .padding(NettoLayout.Spacing.lg)
@@ -239,13 +252,18 @@ struct VideoCleanupView: View {
     }
 
     private func summaryHeader(known: [PhotoAssetRecord], unknown: [PhotoAssetRecord]) -> some View {
-        let totalBytes = known.reduce(Int64(0)) { $0 + ($1.sizeInBytes ?? 0) }
+        let summaryLine = VideosPresentation.videoCleanupSummaryLine(
+            known: known,
+            unknown: unknown,
+            resolution: env.videoSizeResolution,
+            datasetSignature: env.videoDatasetSignature
+        )
         return VStack(alignment: .leading, spacing: NettoLayout.Spacing.xxs) {
             Text("\(known.count + unknown.count) videos")
                 .font(NettoType.metricNumber)
                 .monospacedDigit()
                 .foregroundStyle(NettoColor.textPrimary)
-            Text("\(ByteFormat.string(totalBytes)) measured · \(unknown.count) size unavailable")
+            Text(summaryLine)
                 .font(NettoType.caption)
                 .foregroundStyle(NettoColor.textSecondary)
         }
@@ -253,7 +271,11 @@ struct VideoCleanupView: View {
         .accessibilityIdentifier("videoCleanupSummary")
     }
 
-    private func section(_ title: String, records: [PhotoAssetRecord], unknownSize: Bool) -> some View {
+    private func section(
+        _ title: String,
+        records: [PhotoAssetRecord],
+        attemptedIDs: Set<String>
+    ) -> some View {
         VStack(alignment: .leading, spacing: NettoLayout.Spacing.sm) {
             Text(title)
                 .font(NettoType.sectionTitle)
@@ -262,7 +284,7 @@ struct VideoCleanupView: View {
                 ForEach(records, id: \.localIdentifier) { record in
                     VideoCleanupRow(
                         record: record,
-                        unknownSize: unknownSize,
+                        attempted: attemptedIDs.contains(record.localIdentifier),
                         isSelected: env.videoSelection.isSelected(record.localIdentifier),
                         store: env.thumbnails,
                         toggle: {
@@ -306,10 +328,12 @@ struct VideoCleanupView: View {
 }
 
 /// One video row: thumbnail, duration, honest size, and the selection check. A measured
-/// size shows its exact bytes; an unmeasurable one says so plainly and is never zero.
+/// size shows its exact bytes; an attempted-but-unmeasurable one says so plainly (warning);
+/// an untouched one says it has not been measured yet — never zero, never a failure it
+/// has not earned.
 private struct VideoCleanupRow: View {
     let record: PhotoAssetRecord
-    let unknownSize: Bool
+    let attempted: Bool
     let isSelected: Bool
     let store: ThumbnailStore
     let toggle: () -> Void
@@ -329,9 +353,9 @@ private struct VideoCleanupRow: View {
                     Text(VideosPresentation.durationText(record.duration))
                         .font(NettoType.secondaryBody.weight(.semibold))
                         .foregroundStyle(NettoColor.textPrimary)
-                    Text(sizeText)
+                    Text(caption.text)
                         .font(NettoType.caption)
-                        .foregroundStyle(unknownSize ? NettoColor.warning : NettoColor.textSecondary)
+                        .foregroundStyle(caption.isWarning ? NettoColor.warning : NettoColor.textSecondary)
                     if let date = record.creationDate {
                         Text(date.formatted(date: .abbreviated, time: .omitted))
                             .font(NettoType.caption)
@@ -358,11 +382,8 @@ private struct VideoCleanupRow: View {
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
-    private var sizeText: String {
-        if let bytes = record.sizeInBytes {
-            return ByteFormat.string(bytes)
-        }
-        return "Size unavailable — not stored locally"
+    private var caption: (text: String, isWarning: Bool) {
+        VideosPresentation.videoCleanupSizeCaption(bytes: record.sizeInBytes, attempted: attempted)
     }
 }
 

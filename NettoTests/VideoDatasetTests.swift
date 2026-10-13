@@ -306,7 +306,7 @@ struct VideoDatasetTests {
             datasetSignature: fixtureSignature,
             bytes: ["video-01": 1],
             total: 6,
-            unavailableCount: 2
+            unavailableIDs: ["video-04", "video-05"]
         )
         let phase = VideosPresentation.phase(
             permission: .authorized,
@@ -390,7 +390,8 @@ struct VideoDatasetTests {
             datasetSignature: fixtureSignature
         )
         #expect(partialText.hasPrefix("6 videos · measured "))
-        #expect(partialText.hasSuffix("1 size pending"))
+        // video-06 was attempted and failed: named as unavailable, not lumped into pending.
+        #expect(partialText.hasSuffix("1 size unavailable"))
         var allSix = VideosFixture.measuredBytes
         allSix["video-06"] = 50_000_000
         let full = VideoSizeResolution.settled(
@@ -434,7 +435,7 @@ struct VideoDatasetTests {
                 datasetSignature: fixtureSignature,
                 bytes: ["video-01": 1],
                 total: 6,
-                unavailableCount: 2
+                unavailableIDs: ["video-02", "video-04"]
             )
         )
         let text = VideosPresentation.statusText(
@@ -442,6 +443,117 @@ struct VideoDatasetTests {
             datasetSignature: fixtureSignature
         )
         #expect(text == "Measuring sizes · 1 of 6 videos… · 2 unavailable")
+    }
+
+    @Test func statusTextSplitsAttemptedFailuresFromStillPendingSizes() {
+        // A mixed remainder: attempted failures are "unavailable", untouched ids stay
+        // "pending" — never conflated in either direction.
+        let catalog = CatalogScanState.completed(VideosFixture.completed)
+        var fourBytes = VideosFixture.measuredBytes
+        fourBytes.removeValue(forKey: "video-05") // video-05 not yet attempted → pending
+        let mixed = VideoSizeResolution.settled(
+            VideoSizeResolution.Measurement(
+                datasetSignature: fixtureSignature,
+                bytes: fourBytes, // 4 measured, video-06 attempted-and-failed, video-05 pending
+                total: 6,
+                unavailableIDs: ["video-06"]
+            )
+        )
+        let text = VideosPresentation.statusText(
+            permission: .authorized, catalog: catalog, resolution: mixed,
+            datasetSignature: fixtureSignature
+        )
+        #expect(text.hasPrefix("6 videos · measured "))
+        #expect(text.contains("1 size unavailable"))
+        #expect(text.contains("1 size pending"))
+    }
+
+    // MARK: Video Cleanup summary honesty
+
+    @Test func cleanupSummarySaysNotMeasuredBeforeAnythingRuns() {
+        // Idle / no current measurement: the screen must not claim
+        // "0 bytes measured · N size unavailable" — that asserted a run that never
+        // happened (the starved-measurement failure).
+        let line = VideosPresentation.videoCleanupSummaryLine(
+            known: [],
+            unknown: VideosFixture.videos,
+            resolution: .idle,
+            datasetSignature: fixtureSignature
+        )
+        #expect(line == "sizes not measured yet")
+
+        let stale = VideosPresentation.videoCleanupSummaryLine(
+            known: [],
+            unknown: VideosFixture.videos,
+            resolution: VideosFixture.settledPartial,
+            datasetSignature: "another-dataset"
+        )
+        #expect(stale == "sizes not measured yet")
+    }
+
+    @Test func cleanupSummarySplitsAttemptedFailuresFromUntouchedOnes() {
+        let known = VideosFixture.videos.compactMap { record -> PhotoAssetRecord? in
+            guard let bytes = VideosFixture.measuredBytes[record.localIdentifier] else {
+                return nil
+            }
+            return record.resolvingSize(bytes)
+        }
+        let unknown = VideosFixture.videos.filter {
+            VideosFixture.measuredBytes[$0.localIdentifier] == nil
+        } // [video-06]
+
+        // Settled fixture: video-06 was attempted and failed.
+        let attemptedLine = VideosPresentation.videoCleanupSummaryLine(
+            known: known,
+            unknown: unknown,
+            resolution: VideosFixture.settledPartial,
+            datasetSignature: fixtureSignature
+        )
+        #expect(attemptedLine.contains("measured"))
+        #expect(attemptedLine.contains("1 size unavailable"))
+        #expect(!attemptedLine.contains("not measured"))
+        #expect(!attemptedLine.hasPrefix("0 ")) // no zero-measurement claim
+
+        // The same bytes, but video-06 was never attempted: pending, never "unavailable".
+        let untouched = VideoSizeResolution.settled(
+            VideoSizeResolution.Measurement(
+                datasetSignature: fixtureSignature,
+                bytes: VideosFixture.measuredBytes,
+                total: 6
+            )
+        )
+        let pendingLine = VideosPresentation.videoCleanupSummaryLine(
+            known: known,
+            unknown: unknown,
+            resolution: untouched,
+            datasetSignature: fixtureSignature
+        )
+        #expect(pendingLine.contains("measured"))
+        #expect(pendingLine.contains("1 size not measured"))
+        #expect(!pendingLine.contains("unavailable"))
+    }
+
+    @Test func rowCaptionsSeparateMeasuredAttemptedAndUntouched() {
+        let measured = VideosPresentation.videoCleanupSizeCaption(bytes: 240_000_000, attempted: false)
+        #expect(measured.text == ByteFormat.string(240_000_000))
+        #expect(!measured.isWarning)
+
+        let failed = VideosPresentation.videoCleanupSizeCaption(bytes: nil, attempted: true)
+        #expect(failed.text == "Size unavailable — not stored locally")
+        #expect(failed.isWarning)
+
+        let untouched = VideosPresentation.videoCleanupSizeCaption(bytes: nil, attempted: false)
+        #expect(untouched.text == "Size not measured yet")
+        #expect(!untouched.isWarning)
+    }
+
+    @Test func unknownSectionTitleNamesICloudOnlyAfterAnAttempt() {
+        #expect(
+            VideosPresentation.videoUnknownSectionTitle(attempted: 0) == "Sizes not measured yet"
+        )
+        #expect(
+            VideosPresentation.videoUnknownSectionTitle(attempted: 3) == "iCloud / size unavailable"
+        )
     }
 
     @Test func statusTextCoversEmptyPermissionAndScanStates() {

@@ -1226,15 +1226,15 @@ final class AppEnvironment {
         syncBackgroundTask()
     }
 
-    /// Common setup for a similarity run: yields nonessential work, supersedes any prepared
-    /// plan, claims a fresh generation and selection, resets the progress display, and moves
-    /// `analysisState` to `.running(.preparing)`. Leaves `catalogTask` cancelled so this run
-    /// owns the single library enumeration.
+    /// Common setup for a similarity run: supersedes any prepared plan, claims a fresh
+    /// generation and selection, resets the progress display, and moves `analysisState`
+    /// to `.running(.preparing)`. Leaves `catalogTask` cancelled so this run owns the
+    /// single library enumeration.
     private func prepareSimilarityRun() {
-        // Video sizes are nonessential detail work: a run about to own the thumbnail
-        // pipeline and the cores yields the measurement (its progress is kept as a settled,
-        // partial state and resumes when the run finishes — see VideosView's observers).
-        cancelVideoSizeResolution()
+        // Video-size measurement is deliberately untouched here: it is I/O-bound over
+        // its own bounded batches and coexists with a pass (the dataset a pass walks
+        // does not change), so starting an analysis no longer starves it — the failure
+        // mode where chained passes left the Video Cleanup screen forever unmeasured.
         // A fresh analysis supersedes any prepared plan.
         planBuildGeneration += 1
         applyDeletion(.noSelection)
@@ -1271,7 +1271,6 @@ final class AppEnvironment {
     /// state flip happens here (at admission) so the Potentially Blurry screen shows the
     /// session immediately; its first real counts arrive when the pass begins.
     private func prepareBlurRun() {
-        cancelVideoSizeResolution()
         planBuildGeneration += 1
         applyDeletion(.noSelection)
         // A fresh pass measures the *current* catalog, so any removals recorded against a
@@ -2624,13 +2623,13 @@ final class AppEnvironment {
     /// sizes are resolved separately for the reviewed subset at prepare time. Safe to call
     /// repeatedly: while a run is in flight nothing restarts, and a fully measured dataset
     /// settles again without calling the provider.
+    ///
+    /// Coexists with analysis passes: sizing is I/O-bound over its own bounded batches, so it
+    /// is *not* deferred while a pass runs — deferring it was the failure that left the Video
+    /// Cleanup screen unmeasured forever under chained passes (every pass start also used to
+    /// cancel it, and only a visible screen's observer restarted it).
     func resumeVideoSizeMeasurement() {
         guard !videoSizeResolution.isMeasuring else { return }
-        // Heavy passes take the cores and the thumbnail pipeline; video measurement is
-        // nonessential detail work and waits for them (VideosView restarts it when a pass
-        // finishes, or the user taps "Measure Sizes").
-        guard !analysisState.isRunning else { return }
-        guard !blurAnalysisState.isRunning else { return }
         guard photoPermissionState.isUsable else { return }
         guard case .completed(let catalog) = catalogState else { return }
 
@@ -2652,8 +2651,13 @@ final class AppEnvironment {
             return
         }
         var measuredBytes: [String: Int64]
+        var unavailableIDs: Set<String> = []
         if videoSizeResolution.isCurrent(for: signature) {
             measuredBytes = videoSizeResolution.bytes // resume: keep what this dataset already measured
+            // …and keep its known failures: a video that could not be measured stays
+            // marked unavailable until a later attempt measures it (the fingerprint
+            // match guarantees these ids still belong to this dataset).
+            unavailableIDs = videoSizeResolution.measurement?.unavailableIDs ?? []
         } else {
             measuredBytes = [:] // another dataset's bytes are never mixed into this one
         }
@@ -2700,7 +2704,8 @@ final class AppEnvironment {
             VideoSizeResolution.Measurement(
                 datasetSignature: signature,
                 bytes: measuredBytes,
-                total: total
+                total: total,
+                unavailableIDs: unavailableIDs
             )
         )
 
@@ -2709,7 +2714,7 @@ final class AppEnvironment {
             guard let self else { return }
             let batchSize = VideoSizeResolution.measurementBatchSize
             var pending = Array(targets)
-            var unavailableCount = 0
+            var knownUnavailable = unavailableIDs
             var lastPublish = ContinuousClock.now
             while !pending.isEmpty {
                 let batch = Array(pending.prefix(batchSize))
@@ -2726,9 +2731,11 @@ final class AppEnvironment {
                     switch outcomes[identifier] {
                     case .measured(let size):
                         measuredBytes[identifier] = size
+                        knownUnavailable.remove(identifier)
                     case .unavailable, nil:
-                        // Never counted as measured, never zero — only as attempted.
-                        unavailableCount += 1
+                        // Never counted as measured, never zero — recorded as an
+                        // attempted-and-failed id the UI may call "unavailable".
+                        knownUnavailable.insert(identifier)
                     }
                 }
                 // Coalesced publishes: a cloud-only library resolves batches in
@@ -2742,7 +2749,7 @@ final class AppEnvironment {
                             datasetSignature: signature,
                             bytes: measuredBytes,
                             total: total,
-                            unavailableCount: unavailableCount
+                            unavailableIDs: knownUnavailable
                         )
                     )
                 }
@@ -2753,7 +2760,7 @@ final class AppEnvironment {
                     datasetSignature: signature,
                     bytes: measuredBytes,
                     total: total,
-                    unavailableCount: unavailableCount
+                    unavailableIDs: knownUnavailable
                 )
             )
             self.videoSizeTask = nil

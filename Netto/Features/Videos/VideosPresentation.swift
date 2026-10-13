@@ -152,14 +152,23 @@ enum VideosPresentation {
             guard measurement.isPartial else {
                 return "\(countText) · \(sizeText)"
             }
-            let pending = measurement.total - measurement.measuredCount
-            let pendingText = "\(pending) \(pending == 1 ? "size" : "sizes") pending"
-            // Nothing measured yet: naming a zero total would claim a measurement that never
-            // happened — the pending count alone is the honest state.
-            guard measurement.measuredCount > 0 else {
-                return "\(countText) · \(pendingText)"
+            // Pending means "not yet attempted": attempted-but-unmeasurable sizes are
+            // named as unavailable instead of being folded into the pending figure.
+            let unavailableCount = measurement.unavailableCount
+            let pending = max(0, measurement.total - measurement.measuredCount - unavailableCount)
+            var parts = [countText]
+            // Nothing measured yet: naming a zero total would claim a measurement that
+            // never happened — the pending count alone is the honest state.
+            if measurement.measuredCount > 0 {
+                parts.append(sizeText)
             }
-            return "\(countText) · \(sizeText) · \(pendingText)"
+            if unavailableCount > 0 {
+                parts.append("\(unavailableCount) \(unavailableCount == 1 ? "size" : "sizes") unavailable")
+            }
+            if pending > 0 {
+                parts.append("\(pending) \(pending == 1 ? "size" : "sizes") pending")
+            }
+            return parts.joined(separator: " · ")
         }
     }
 
@@ -185,6 +194,67 @@ enum VideosPresentation {
             message += " (\(unavailable) unavailable)"
         }
         return message
+    }
+
+    /// The Video Cleanup summary line — honest about whether measurement has even run.
+    ///
+    /// - No current measurement (never started, or another dataset's fingerprint): the
+    ///   screen says so instead of claiming "0 bytes measured · N size unavailable" —
+    ///   which asserted a measurement that had been starved and never attempted.
+    /// - A current measurement splits the unknowns by *attempt*: failed-and-known ids are
+    ///   "unavailable", the rest are "not measured", and measured bytes are only summed
+    ///   from records that actually have sizes.
+    static func videoCleanupSummaryLine(
+        known: [PhotoAssetRecord],
+        unknown: [PhotoAssetRecord],
+        resolution: VideoSizeResolution,
+        datasetSignature: String
+    ) -> String {
+        guard !datasetSignature.isEmpty,
+              resolution.isCurrent(for: datasetSignature),
+              let measurement = resolution.measurement else {
+            return "sizes not measured yet"
+        }
+        let attempted = unknown.filter {
+            measurement.unavailableIDs.contains($0.localIdentifier)
+        }.count
+        let pending = unknown.count - attempted
+        let totalBytes = known.reduce(Int64(0)) { $0 + ($1.sizeInBytes ?? 0) }
+
+        var parts: [String] = []
+        if measurement.measuredCount > 0 {
+            parts.append("\(ByteFormat.string(totalBytes)) measured")
+        }
+        if attempted > 0 {
+            parts.append("\(attempted) \(attempted == 1 ? "size" : "sizes") unavailable")
+        }
+        if pending > 0 {
+            parts.append("\(pending) \(pending == 1 ? "size" : "sizes") not measured")
+        }
+        guard !parts.isEmpty else { return "sizes not measured yet" }
+        return parts.joined(separator: " · ")
+    }
+
+    /// One row's size caption and whether it is the warning state. "Size unavailable" is
+    /// reserved for ids the run actually *attempted* — a row nothing has tried yet says
+    /// "not measured", never a failure it has not earned.
+    static func videoCleanupSizeCaption(
+        bytes: Int64?,
+        attempted: Bool
+    ) -> (text: String, isWarning: Bool) {
+        if let bytes {
+            return (ByteFormat.string(bytes), false)
+        }
+        if attempted {
+            return ("Size unavailable — not stored locally", true)
+        }
+        return ("Size not measured yet", false)
+    }
+
+    /// The unknowns' section title: names iCloud only once a failure is proven by an
+    /// attempt; before that the section simply says the sizes have not been measured.
+    static func videoUnknownSectionTitle(attempted: Int) -> String {
+        attempted > 0 ? "iCloud / size unavailable" : "Sizes not measured yet"
     }
 
     /// The inventory summary lines — enumeration's counts first, always, then honest
@@ -289,12 +359,14 @@ enum VideosFixture {
         "video-05": 4_500_000,
     ]
 
-    /// A settled, partial measurement over `completed` (one video's size still unknown).
+    /// A settled, partial measurement over `completed` — `video-06` was attempted and
+    /// could not be measured (the honest shape of a finished run over fixture data).
     static let settledPartial = VideoSizeResolution.settled(
         VideoSizeResolution.Measurement(
             datasetSignature: VideoDataset.signature(in: completed),
             bytes: measuredBytes,
-            total: videos.count
+            total: videos.count,
+            unavailableIDs: ["video-06"]
         )
     )
 
